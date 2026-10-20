@@ -1,0 +1,9 @@
+node_modules/
+.build/
+dist/
+validation/
+public/generated/
+public/wasm/
+**/__pycache__/
+*.log
+.DS_Store

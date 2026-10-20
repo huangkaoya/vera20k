@@ -1,0 +1,200 @@
+[package]
+name = "vera20k"
+version = "0.1.0"
+edition = "2024"
+description = "Vera20k Engine — a from-scratch Rust engine for Red Alert 2: Yuri's Revenge"
+autobins = false
+# Shipped as release builds (.github/workflows/release.yml), never on crates.io.
+publish = false
+
+# Two crates so an edit recompiles only its own crate's incremental graph:
+# `vera20k-core` (src/Cargo.toml: util, assets, rules, map, sim, net and the
+# headless scenario) and this package, the client (app, render, ui, audio,
+# asset tools and the game binary). The core manifest sits in `src/`, so rustc
+# still names every source file `src/...`.
+[workspace]
+members = ["src"]
+# Plain `cargo build`/`cargo test --lib` cover both crates.
+default-members = [".", "src"]
+
+# Main game client
+[[bin]]
+name = "vera20k"
+path = "src/main.rs"
+
+# Headless, JSON-emitting asset browser for automated callers.
+[[bin]]
+name = "asset"
+path = "src/bin/asset.rs"
+
+[[bin]]
+name = "extract-ini"
+path = "src/bin/extract-ini.rs"
+
+# Synthetic telemetry fixture; normal game integration is the vera20k binary.
+[[bin]]
+name = "telemetry-serve"
+path = "src/bin/telemetry-serve.rs"
+required-features = ["telemetry-dashboard"]
+
+[features]
+# Development builds carry the Ctrl+Shift dev chord. The release workflow builds
+# with `--no-default-features`, so shipped binaries do not.
+default = ["dev-overlays"]
+# The Ctrl+Shift dev chord: renderer-native diagnostic overlays (grid, heightmap,
+# pathgrid, foot path, fog), the debug pause and quicksave/quickload. Captures
+# rely on it (literal Ctrl+Shift+M/N quicksave/quickload).
+dev-overlays = ["vera20k-core/dev-overlays"]
+# Optional read-only local browser dashboard, absent from default/shipping builds.
+telemetry-dashboard = ["vera20k-core/telemetry", "dep:getrandom", "dep:sha1"]
+# Explicit offline trainer and per-unit event hooks. Never enabled by the
+# dashboard alone or the default/shipping feature set.
+debug-tools = ["telemetry-dashboard", "dev-overlays", "vera20k-core/debug-tools"]
+
+[dependencies]
+# The GPU-free engine. Its dev features follow this package's.
+vera20k-core = { path = "src" }
+
+# OS session credentials and RFC6455 handshake; no simulation RNG or command intake.
+getrandom = { version = "=0.3.4", optional = true }
+sha1 = { version = "=0.10.6", optional = true }
+
+# --- GPU rendering ---
+wgpu = "27"
+# winit 0.30 is the latest stable. 0.31 is still in beta.
+# Uses the ApplicationHandler trait pattern (deferred window creation).
+winit = "0.30"
+# raw-window-handle + windows-sys let us clip the OS cursor to the game window
+# with the Win32 ClipCursor API . That is reliable on frameless
+# windows, where winit's CursorGrabMode::Confined mis-computes the clip rect and
+# pins the pointer in place ("mouse won't move").
+raw-window-handle = "0.6"
+# `Win32_UI_WindowsAndMessaging` covers ClipCursor/GetClientRect;
+# `Win32_Graphics_Gdi` adds ClientToScreen (maps the client rect into screen coords).
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+# bytemuck enables safe transmutation of structs to GPU-friendly byte slices.
+bytemuck = { version = "1", features = ["derive"] }
+
+# --- Shared with vera20k-core ([workspace.dependencies]) ---
+glam = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+# --- Image processing ---
+# Used for texture atlas creation and debug image output, not for asset parsing.
+# Only PNG (every image written) and ICO (the window icon) are enabled: the default
+# formats compile an AV1 encoder (rav1e) and EXR, TIFF, WebP, GIF, JPEG and QOI
+# codecs that nothing reads or writes.
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+# --- Audio ---
+# rodio is the standard Rust audio playback crate, maintained by the rust-audio org
+# (same team behind cpal). Covers all RA2 needs: SFX, music, volume control.
+# Playback only: the engine decodes its own audio and hands rodio PCM buffers, so
+# rodio's decoders (symphonia), dither and microphone recording stay off.
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
+
+[target.'cfg(unix)'.dependencies]
+# Continuing presentation uptime across saved-game process restarts. The
+# existing core dependency already pins the same libc version in Cargo.lock.
+libc = "0.2"
+
+# --- macOS application icon ---
+# macOS has no per-window icon; the Dock shows NSApplication's icon image, which
+# `app::window_icon` sets at startup. objc2 0.6 and Foundation 0.3 are the
+# versions already in the lock (via cpal), and AppKit 0.3 matches them; default
+# features are off because they enable every AppKit framework class.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
+[dev-dependencies]
+# Client tests use core's test fixtures and helpers.
+vera20k-core = { path = "src", features = ["test-support"] }
+
+# Dependencies both crates use, declared once so they cannot drift apart.
+[workspace.dependencies]
+# glam provides fast vector/matrix math for rendering (screen coords, camera).
+glam = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# thiserror for structured library errors (AssetError, RulesError, etc.)
+thiserror = "2"
+# anyhow for application-level error propagation (main.rs, app facade)
+anyhow = "1"
+log = "0.4"
+
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+# A side effect inside `debug_assert!` vanishes from release builds. This
+# hid every scheduler anim (wakes, explosions) in shipped binaries for weeks.
+debug_assert_with_mut_call = "deny"
+# Native ports keep gamemd's inputs explicit (the object, its rules and the
+# world state the body reads) instead of bundling them into one-use structs.
+too_many_arguments = "allow"
+
+# --- Build speed ---
+# Optimize all code at opt-level 1 in dev builds. The game rebuilds sprite
+# instances, sorts them, and iterates over thousands of cells every frame —
+# unoptimized Rust is 10-50x slower than opt-level 1.
+[profile.dev]
+opt-level = 1
+# Emit line-table debuginfo only (keeps panic/backtrace line numbers) instead of
+# full debuginfo. On Windows/MSVC, PDB generation dominates link time once codegen
+# is cheap at opt-level 1, so this is the biggest safe build-speed win. Reversible;
+# does not affect runtime behavior or lockstep determinism.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+# `cargo test` inherits the dev profile (dependencies stay at opt-level 1) but
+# compiles both workspace crates unoptimized. Measured on an M4 Mac mini on
+# 2026-09-26: incremental lib test builds fell from 78-117 s to 24-59 s, while
+# the full lib suite's run time rose from 12 s to 55-93 s. Run timing
+# benchmarks with --release.
+[profile.test]
+opt-level = 0
+
+# Test builds of the client crate carry no debug info. On macOS a test
+# executable with line tables keeps every compiler object it was linked from
+# (split-debuginfo "unpacked"), and the cache retention in tools/ must protect
+# them: on 2026-10-20 client test builds kept about 220 MiB each, 2.8 GiB across
+# the live caches. Without debug info rustc deletes them after linking; in the
+# same trial on the core test build, one-line edits rebuilt in 21.7-25.5 s
+# against 22.7-29.6 s with line tables. Symbol tables remain, so backtraces
+# still name client functions (MSVC still writes a PDB), without file and line.
+# The core crate keeps its line tables: its RNG draw traces name `src/...rs:line`
+# frames (sim::rng tests), and its test builds keep about 1 GiB of objects for it.
+# Dependencies keep the dev settings, so test and dev builds share them.
+[profile.test.package.vera20k]
+debug = false
+
+# Play-tests and captures after an edit: release optimization, but the
+# workspace crates compile incrementally, so rustc splits each into 256 codegen
+# units and reuses those an edit leaves unchanged. Measured on an M4 Mac mini on
+# 2026-10-16: after a one-line edit the game rebuilt in about 31 s (sim file) or
+# 10 s (ui file) instead of 64 s or 36 s, with the same sim-bench state hash and
+# tick time. Keep timing and performance numbers on --release. Capping it at 16
+# codegen units rebuilt ui edits in 25 s. `lto = false` pins release's thin
+# local LTO: with `lto = "off"`, sim edits rebuilt in 23 s but the median
+# sim-bench tick took 65% longer.
+[profile.fast]
+inherits = "release"
+lto = false
+incremental = true
+
+# Published builds (.github/workflows/release.yml): whole-program optimization
+# across every crate, compiled as one unit. It rebuilds everything for this
+# profile and links slowly, so day-to-day timing stays on --release and play on
+# `fast`.
+[profile.shipping]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

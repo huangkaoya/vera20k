@@ -1,0 +1,656 @@
+//! DisplayClass lifecycle queries. The vectors belong to ObjectSubstrate;
+//! queries borrow the object stores without copying coordinates. Ground
+//! comparisons read kept sort keys (`ground_keys`), forgotten from the entity
+//! and anim touch logs before each scan. Ground rendering and entity picking
+//! consume the retained vectors. Upper-layer GPU interleaving and remaining
+//! locomotor resubmission writers are still open.
+//! Native query/membership comparisons: tools/spatial_oracle/display_non_entity.json.
+
+use super::Simulation;
+use super::display_layers::DisplayLayer;
+use super::ground_keys::{GroundSortKeys, KeptSortKey, ReadContext};
+use crate::map::entities::EntityCategory;
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::rules::locomotor_type::LocomotorKind;
+use crate::rules::ruleset::RuleSet;
+use crate::sim::game_entity::GameEntity;
+use crate::sim::intern::StringInterner;
+use crate::sim::movement::ground_pose::{building_render_order_parts, position_world_coord};
+use crate::sim::terrain_object::TerrainObjectStore;
+use crate::sim::world::ObjectSubstrate;
+
+/// Foot4DB7E0 / Aircraft41ADC0 dispatch to the active locomotor. Fly4CFCF0
+/// reads physical GetHeight, Jumpjet54B8D0 additionally reads structural
+/// bridge, falling, its owner's virtual +54 (IsHighFlying,
+/// [`is_high_flying`]) and its linked +2C height. Ground movers do not query
+/// height. No terrain is a headless compatibility case, not native proof.
+///
+/// [`is_high_flying`]: crate::sim::movement::air_movement::is_high_flying
+pub(crate) fn entity_layer(
+    entity: &GameEntity,
+    terrain: Option<&ResolvedTerrainGrid>,
+    rules: Option<(&RuleSet, &crate::sim::intern::StringInterner)>,
+) -> DisplayLayer {
+    let kind = entity.locomotor.as_ref().map(|l| l.active_kind());
+    if entity.category() != EntityCategory::Structure {
+        // Rocket In_Which_Layer (`0x00663460`) answers the Air layer.
+        if kind == Some(LocomotorKind::Rocket) {
+            return DisplayLayer::AIR;
+        }
+        if !matches!(kind, Some(LocomotorKind::Fly | LocomotorKind::Jumpjet)) {
+            return DisplayLayer::GROUND;
+        }
+        if kind == Some(LocomotorKind::Fly) {
+            return if crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0 {
+                DisplayLayer::TOP
+            } else {
+                DisplayLayer::GROUND
+            };
+        }
+    }
+    let raw = position_world_coord(&entity.position);
+    let height = crate::sim::movement::air_movement::current_fly_height(entity, terrain);
+    let mut adjusted_height = height;
+    if kind == Some(LocomotorKind::Jumpjet) && !entity.on_bridge() {
+        // This map lookup precedes the high-flying gate even when +74 is false.
+        let flags = terrain.map_or(0, |terrain| {
+            let cell = terrain.native_cell_identity(((raw.x / 256) as i16, (raw.y / 256) as i16));
+            terrain.native_cell_flags(cell)
+        });
+        if flags & 0x100 != 0
+            && height >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
+            && !entity.is_falling_down()
+        {
+            adjusted_height = height.wrapping_sub(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
+        }
+    }
+    // The owner's +54 (Foot4DE620 -> Object5F6B90, Aircraft41B920).
+    if !crate::sim::movement::air_movement::is_high_flying(entity, terrain, rules)
+        || adjusted_height == 0
+    {
+        return DisplayLayer::GROUND;
+    }
+    let cruise_height = if kind == Some(LocomotorKind::Jumpjet) {
+        entity
+            .locomotor
+            .as_ref()
+            .and_then(|l| l.jumpjet_runtime())
+            .expect("active Jumpjet owns its runtime")
+            .params()
+            .height()
+    } else {
+        // Object5F4260 uses Rules+420, not FlightLevel or a type's height.
+        rules.map_or(400, |(rules, _)| rules.general.display_cruise_height)
+    };
+    DisplayLayer::for_object(true, || adjusted_height, cruise_height)
+}
+
+fn entity_sort_key(
+    entity: &GameEntity,
+    object: Option<&crate::rules::object_type::ObjectType>,
+) -> i32 {
+    let raw = position_world_coord(&entity.position);
+    let (coord, adjust) = if entity.category() == EntityCategory::Structure {
+        building_render_order_parts(
+            raw,
+            object.is_some_and(|object| object.turret_anim_is_voxel),
+            object.is_some_and(|object| object.gate),
+        )
+    } else {
+        (raw, 0)
+    };
+    coord.x.wrapping_add(coord.y).wrapping_add(adjust)
+}
+
+/// Ground comparisons read the live receiver each time (5F6220), independently
+/// of Logic membership; the kept keys return what that read would. Air,
+/// Surface and Top insertions never call GetYSort.
+struct GroundSortView<'a> {
+    entities: &'a crate::sim::entity_store::EntityStore,
+    anims: &'a crate::sim::anim_class::AnimStore,
+    particles: &'a crate::sim::particles::ParticleSystemStore,
+    terrain: &'a std::collections::BTreeMap<u64, crate::sim::terrain_object::TerrainObjectState>,
+    interner: &'a crate::sim::intern::StringInterner,
+    rules: Option<&'a RuleSet>,
+}
+
+/// Each read says what it may keep: the key of an entity, an unattached anim
+/// or a terrain object until the object is forgotten (a Building's key also
+/// reads the rules, which the read context covers), an attached anim's own
+/// term (its owner's is kept per owner), and
+/// nothing for particle systems, whose AI moves them without a touch log.
+impl GroundSortKeys for GroundSortView<'_> {
+    fn read(&self, id: u64) -> (i32, KeptSortKey) {
+        if let Some(entity) = self.entities.get(id) {
+            // Only BuildingClass GetYSort reads type terms. Every sort pass
+            // and Ground insert evaluates this; the handle hop never allocates.
+            let object = (entity.category() == EntityCategory::Structure)
+                .then(|| {
+                    self.rules
+                        .and_then(|rules| self.interner.object_type(entity.type_ref(), rules))
+                })
+                .flatten();
+            let key = entity_sort_key(entity, object);
+            return (key, KeptSortKey::Key(key));
+        }
+        if let Some(system) = self.particles.get(id) {
+            // ParticleSystem VT7EFB9C: +AC ->41BE00 ->+48 ->5F65A0,
+            // +B8 ->5F6BD0. Attachment updates coords in its AI, not here.
+            let key = system.coords().x.wrapping_add(system.coords().y);
+            return (key, KeptSortKey::Unknown);
+        }
+        if let Some(anim) = self.anims.get(id) {
+            // Anim422BC0 -> Object5F6BD0 -> GetCoords422BE0, then retained
+            // instance+104. Type changes do not recopy this constructor field.
+            let key = crate::sim::anim_class::anim_display_sort_key(anim, self.entities);
+            let kept = match anim.owner_entity() {
+                Some(owner) => KeptSortKey::Attached {
+                    own: crate::sim::anim_class::anim_own_sort_term(anim),
+                    owner,
+                },
+                None => KeptSortKey::Key(key),
+            };
+            return (key, kept);
+        }
+        if let Some(terrain) = self.terrain.get(&id) {
+            // Terrain VT7F522C inherits Object GetYSort5F6BD0: retained
+            // GetCoords XY, independent of presentation lift. Terrain has
+            // no runtime relocation writer, so the Ground key can be kept.
+            let coord = terrain.world_coord();
+            let key = coord.x.wrapping_add(coord.y);
+            return (key, KeptSortKey::Key(key));
+        }
+        panic!("unrepresented Ground display identity {id}");
+    }
+
+    /// A dangling owner adds nothing (`anim_world_coords`).
+    fn owner_term(&self, owner: u64) -> i32 {
+        self.entities
+            .get(owner)
+            .map_or(0, crate::sim::anim_class::anim_owner_sort_term)
+    }
+}
+
+impl Simulation {
+    pub(crate) fn submit_object_display(
+        world_interner: &StringInterner,
+        terrain_objects: &TerrainObjectStore,
+        substrate: &mut ObjectSubstrate,
+        id: u64,
+        layer: DisplayLayer,
+        rules: Option<&RuleSet>,
+    ) {
+        if layer == DisplayLayer::GROUND {
+            substrate.forget_changed_ground_keys(rules);
+        }
+        let view = GroundSortView {
+            entities: &substrate.entities,
+            anims: &substrate.anims,
+            particles: &substrate.particle_systems,
+            terrain: terrain_objects.objects(),
+            interner: &*world_interner,
+            rules,
+        };
+        substrate.display.submit(id, Some(layer), &view);
+    }
+
+    pub(super) fn submit_entity_display(
+        interner: &StringInterner,
+        terrain_objects: &TerrainObjectStore,
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        rules: Option<&RuleSet>,
+        terrain: Option<&ResolvedTerrainGrid>,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
+            return;
+        };
+        let layer = entity_layer(
+            entity,
+            terrain.or(resolved_terrain.as_ref()),
+            rules.map(|rules| (rules, interner)),
+        );
+        Self::submit_object_display(interner, terrain_objects, substrate, id, layer, rules);
+    }
+
+    pub(crate) fn entity_display_layer(
+        &self,
+        id: u64,
+        rules: Option<&RuleSet>,
+    ) -> Option<DisplayLayer> {
+        self.substrate.entities.get(id).map(|entity| {
+            entity_layer(
+                entity,
+                self.resolved_terrain.as_ref(),
+                rules.map(|rules| (rules, &self.interner)),
+            )
+        })
+    }
+
+    /// Resubmit `id`'s display from its current state, as a native
+    /// resubmission site does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resubmit_entity_display_for_test(&mut self, id: u64) {
+        Self::submit_entity_display(
+            &self.interner,
+            &self.terrain_objects,
+            &mut self.substrate,
+            &self.resolved_terrain,
+            id,
+            None,
+            None,
+        );
+    }
+
+    /// Jumpjet54AECB/54AED1 captures the live query before Process.54B16F
+    /// checks alive, then54B17F compares the new answer with that capture,
+    /// not Object+94. Fly has different explicit resubmission sites and must
+    /// not be normalized here by a generic per-frame layer/cache comparison.
+    pub(super) fn complete_jumpjet_display_process(
+        interner: &StringInterner,
+        terrain_objects: &TerrainObjectStore,
+        substrate: &mut ObjectSubstrate,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        before: DisplayLayer,
+        rules: Option<&RuleSet>,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
+            return;
+        };
+        if entity.lifecycle.object_alive()
+            && entity_layer(
+                entity,
+                resolved_terrain.as_ref(),
+                rules.map(|rules| (rules, interner)),
+            ) != before
+        {
+            Self::submit_entity_display(
+                interner,
+                terrain_objects,
+                substrate,
+                resolved_terrain,
+                id,
+                rules,
+                None,
+            );
+        }
+    }
+
+    pub(super) fn sort_display_ground(
+        world_interner: &StringInterner,
+        terrain_objects: &TerrainObjectStore,
+        substrate: &mut ObjectSubstrate,
+        rules: Option<&RuleSet>,
+    ) {
+        substrate.forget_changed_ground_keys(rules);
+        let view = GroundSortView {
+            entities: &substrate.entities,
+            anims: &substrate.anims,
+            particles: &substrate.particle_systems,
+            terrain: terrain_objects.objects(),
+            interner: world_interner,
+            rules,
+        };
+        substrate.display.sort_ground_pass(&view);
+    }
+}
+
+impl crate::sim::world::ObjectSubstrate {
+    /// Forget the kept Ground keys whose inputs the entity and anim stores
+    /// handed out mutably since the last Ground scan, and all of them when
+    /// the rules differ from those they were read under.
+    fn forget_changed_ground_keys(&mut self, rules: Option<&RuleSet>) {
+        let context = ReadContext {
+            rules: rules.map(RuleSet::serial),
+        };
+        let entities = self
+            .entities
+            .take_touched(crate::sim::entity_store::TouchReader::GroundKeys);
+        let anims = self
+            .anims
+            .take_touched(crate::sim::anim_class::AnimTouchReader::GroundKeys);
+        self.display
+            .forget_changed_ground_keys(context, [entities, anims]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::ini_parser::IniFile;
+    use crate::sim::movement::locomotor::LocomotorState;
+    use crate::util::fixed_math::SimFixed;
+
+    #[test]
+    fn building_rules_key_terms_feed_display_submission() {
+        // Building459EF0 subtracts128 from X/Y; GetYSort449410 independently
+        // adds32 for TurretAnimIsVoxel and subtracts16 for Gate. Keep these
+        // regressions at the authority, not in the presentation planner.
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[BuildingTypes]\n0=NORMAL\n1=TURRET\n2=GATE\n3=BOTH\n\
+             [NORMAL]\nStrength=100\n[TURRET]\nStrength=100\nTurretAnimIsVoxel=yes\n\
+             [GATE]\nStrength=100\nGate=yes\n\
+             [BOTH]\nStrength=100\nTurretAnimIsVoxel=yes\nGate=yes\n",
+        ))
+        .unwrap();
+        let mut sim = Simulation::new();
+        let owner = sim.interner.intern("Americans");
+        for (index, (name, expected)) in [
+            ("NORMAL", 7680),
+            ("TURRET", 7712),
+            ("GATE", 7664),
+            ("BOTH", 7696),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as u64 + 1;
+            let mut entity = GameEntity::new_at_frame_zero_for_test(
+                id,
+                10,
+                20,
+                13,
+                0,
+                owner,
+                crate::sim::combat::Health::new(100),
+                sim.interner.intern(name),
+                EntityCategory::Structure,
+                0,
+                5,
+                false,
+            );
+            entity.position.set_sub_x_for_test(SimFixed::from_num(128));
+            entity.position.set_sub_y_for_test(SimFixed::from_num(128));
+            assert_eq!(
+                entity_sort_key(&entity, rules.object(name)),
+                expected,
+                "{name}"
+            );
+            sim.substrate.entities.insert(entity);
+            Simulation::submit_object_display(
+                &sim.interner,
+                &sim.terrain_objects,
+                &mut sim.substrate,
+                id,
+                DisplayLayer::GROUND,
+                Some(&rules),
+            );
+        }
+        assert_eq!(
+            sim.display_layers().members(DisplayLayer::GROUND),
+            [3, 1, 4, 2]
+        );
+    }
+
+    #[test]
+    fn entity_layer_matches_original_queries() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/display_entity_layer.json",
+        ))
+        .unwrap();
+        assert_eq!(rows.len(), 88);
+        for row in rows {
+            let input = &row["input"];
+            let name = input["name"].as_str().unwrap();
+            let mut sim = Simulation::new();
+            let kind = input["kind"].as_str().unwrap();
+            super::super::lifecycle_tests::insert_entity(
+                &mut sim,
+                1,
+                if kind == "building" {
+                    EntityCategory::Structure
+                } else {
+                    EntityCategory::Unit
+                },
+            );
+            let entity = sim.substrate.entities.get_mut(1).unwrap();
+            entity.position.set_rx_for_test(10);
+            entity.position.set_ry_for_test(10);
+            entity.position.set_sub_x_for_test(SimFixed::from_num(128));
+            entity.position.set_sub_y_for_test(SimFixed::from_num(128));
+            entity
+                .position
+                .set_exact_z_leptons_for_test(Some(input["z"].as_i64().unwrap() as i32));
+            entity
+                .lifecycle
+                .set_cell_marked_for_test(input["marked"].as_bool().unwrap_or(true));
+            entity.set_on_bridge(input["on_bridge"].as_bool().unwrap_or(false));
+            entity.set_falling_down_for_test(input["falling"].as_bool().unwrap_or(false));
+            let loco_kind = match kind {
+                "walk" => Some(LocomotorKind::Walk),
+                "drive" => Some(LocomotorKind::Drive),
+                "fly" => Some(LocomotorKind::Fly),
+                "jumpjet" => Some(LocomotorKind::Jumpjet),
+                "building" => None,
+                _ => panic!("unexpected {kind}"),
+            };
+            entity.locomotor = loco_kind.map(LocomotorState::for_test_kind);
+            if let Some(runtime) = entity
+                .locomotor
+                .as_mut()
+                .and_then(|l| l.jumpjet_runtime_mut())
+            {
+                let mut params = runtime.params();
+                params.set_height_for_test(input["linked_height"].as_i64().unwrap_or(500) as i32);
+                *runtime = runtime.clone().with_params_for_test(params);
+            }
+            let mut cell = super::super::common_raw_test_terrain_cell(
+                10,
+                10,
+                input["level"].as_u64().unwrap_or(0) as u8,
+                input["bridge"].as_bool().unwrap_or(false),
+            );
+            cell.slope_type = input["slope"].as_u64().unwrap_or(0) as u8;
+            // from_cells uses dense row-major slots, not the cell's coordinates
+            // to index a sparse vector. The native fixture asserts real10,10.
+            let mut cells = (0..16)
+                .flat_map(|y| {
+                    (0..16).map(move |x| super::super::common_raw_test_terrain_cell(x, y, 0, false))
+                })
+                .collect::<Vec<_>>();
+            cells[10 * 16 + 10] = cell;
+            let terrain = ResolvedTerrainGrid::from_cells(16, 16, cells);
+            // Exercise the independent section reader, including no General.
+            let ini = format!(
+                "[JumpjetControls]\nCruiseHeight={}\n",
+                input["global_cruise_height"].as_i64().unwrap_or(400)
+            );
+            let rules = RuleSet::from_ini(&IniFile::from_str(&ini)).unwrap();
+            assert_eq!(
+                entity_layer(entity, Some(&terrain), Some((&rules, &sim.interner))),
+                DisplayLayer::from_index(row["layer"].as_u64().unwrap() as u8).unwrap(),
+                "{name}"
+            );
+            // Place_Down and Pick_Up ask this query: a list exactly when the
+            // native answer is Ground, then the OnBridge one.
+            assert_eq!(
+                crate::sim::occupancy::cell_list_layer_for_entity(entity, Some(&terrain)),
+                (row["layer"] == 2).then_some(if entity.on_bridge() {
+                    crate::sim::movement::locomotor::MovementLayer::Bridge
+                } else {
+                    crate::sim::movement::locomotor::MovementLayer::Ground
+                }),
+                "{name}: cell list"
+            );
+        }
+    }
+
+    /// Kept Ground keys through the production entry points. Units move by
+    /// `get_mut`, the anims attached to them follow,
+    /// anims move by themselves, members leave and rejoin, and scans switch
+    /// between rules and none and follow a type handle rebuild. Before each
+    /// scan the display is copied through its saved form, which keeps
+    /// nothing, and the copy repeats the scan reading every key live: both
+    /// must order Ground alike.
+    #[test]
+    fn kept_ground_keys_follow_moving_owners_through_production_entry_points() {
+        use super::super::display_layers::DisplayLayers;
+        use crate::rules::art_data::ArtRegistry;
+        use crate::sim::anim_class::AnimWorldCoord;
+        use crate::sim::combat::Health;
+        use crate::sim::components::AnimClassSpawnDescriptor;
+
+        let mut rules = RuleSet::from_ini(&IniFile::from_str(
+            "[BuildingTypes]\n0=GATE\n[GATE]\nStrength=100\nGate=yes\n\
+             [General]\nDamageFireTypes=\n\
+             [AudioVisual]\nConditionYellow=50%\nConditionRed=25%\n",
+        ))
+        .unwrap();
+        let mut art = ArtRegistry::from_ini(&IniFile::from_str("[SPARK]\nLayer=Ground\n"));
+        art.bind_anim_frame_count_for_test("SPARK", 8);
+        rules.replace_art_registry_for_test(art);
+        let mut sim = Simulation::new();
+        let house = sim.interner.intern("Americans");
+        let unit_type = sim.interner.intern("MTNK");
+        let gate_type = sim.interner.intern("GATE");
+        let spark = sim.interner.intern("SPARK");
+        let mut units = Vec::new();
+        for index in 0..5u16 {
+            let id = sim.substrate.allocate_stable_id();
+            let (category, type_ref) = if index == 4 {
+                (EntityCategory::Structure, gate_type)
+            } else {
+                (EntityCategory::Unit, unit_type)
+            };
+            let mut entity = GameEntity::new_at_frame_zero_for_test(
+                id,
+                10 + index,
+                13 - index,
+                0,
+                0,
+                house,
+                Health::new(100),
+                type_ref,
+                category,
+                0,
+                5,
+                false,
+            );
+            entity.position.set_sub_x_for_test(SimFixed::from_num(128));
+            entity.position.set_sub_y_for_test(SimFixed::from_num(128));
+            sim.substrate.entities.insert(entity);
+            Simulation::submit_object_display(
+                &sim.interner,
+                &sim.terrain_objects,
+                &mut sim.substrate,
+                id,
+                DisplayLayer::GROUND,
+                Some(&rules),
+            );
+            units.push(id);
+        }
+        let mut anims = Vec::new();
+        for index in 0..8i32 {
+            let id = sim
+                .spawn_anim_at_world(
+                    &rules,
+                    AnimClassSpawnDescriptor::new(spark, 0, 0, SimFixed::ZERO, SimFixed::ZERO, 0),
+                    AnimWorldCoord {
+                        x: 2600 + index * 97,
+                        y: 3300 - index * 61,
+                        z: 0,
+                    },
+                )
+                .unwrap();
+            // Two anims on each of the first three units; two stay free.
+            if index < 6 {
+                assert!(sim.set_anim_owner_object(id, Some(units[index as usize / 2]), &rules));
+            }
+            assert_eq!(
+                sim.substrate.display.layer_of(id),
+                Some(DisplayLayer::GROUND)
+            );
+            anims.push(id);
+        }
+        let copy = |display: &DisplayLayers| -> DisplayLayers {
+            serde_json::from_str(&serde_json::to_string(display).unwrap()).unwrap()
+        };
+        let live = |sim: &Simulation, rules: Option<&RuleSet>, id: u64| {
+            GroundSortView {
+                entities: &sim.substrate.entities,
+                anims: &sim.substrate.anims,
+                particles: &sim.substrate.particle_systems,
+                terrain: sim.terrain_objects.objects(),
+                interner: &sim.interner,
+                rules,
+            }
+            .read(id)
+            .0
+        };
+        let mut state: u64 = 0x5EED;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        for step in 0..400 {
+            let delta = (next(9) as i32 - 4) * 48;
+            match next(7) {
+                0 => {
+                    let unit = units[next(4) as usize];
+                    let entity = sim.substrate.entities.get_mut(unit).unwrap();
+                    entity
+                        .position
+                        .set_sub_x_for_test(SimFixed::from_num((128 + delta).rem_euclid(256)));
+                    entity
+                        .position
+                        .set_ry_for_test((entity.position.ry() as i32 + delta.signum()) as u16);
+                }
+                1 => {
+                    let unit = units[next(4) as usize];
+                    let entity = sim.substrate.entities.get_mut(unit).unwrap();
+                    entity
+                        .position
+                        .set_rx_for_test((entity.position.rx() as i32 - delta.signum()) as u16);
+                    entity
+                        .position
+                        .set_sub_y_for_test(SimFixed::from_num((128 - delta).rem_euclid(256)));
+                }
+                2 => {
+                    let anim = anims[next(8) as usize];
+                    sim.substrate
+                        .anims
+                        .get_mut(anim)
+                        .unwrap()
+                        .world_coord_mut_for_test()
+                        .x += delta;
+                }
+                3 => {
+                    let anim = anims[next(8) as usize];
+                    let mut expected = copy(&sim.substrate.display);
+                    sim.substrate.display.remove(anim);
+                    sim.submit_anim_display(anim, Some(&rules));
+                    expected.remove(anim);
+                    expected.submit(anim, Some(DisplayLayer::GROUND), &|id| {
+                        live(&sim, Some(&rules), id)
+                    });
+                    assert_eq!(
+                        sim.substrate.display.members(DisplayLayer::GROUND),
+                        expected.members(DisplayLayer::GROUND),
+                        "step {step}: rejoin {anim}"
+                    );
+                }
+                4 => sim.resolve_type_handles(&rules),
+                _ => {
+                    let scan_rules = (next(3) != 0).then_some(&rules);
+                    let mut expected = copy(&sim.substrate.display);
+                    Simulation::sort_display_ground(
+                        &sim.interner,
+                        &sim.terrain_objects,
+                        &mut sim.substrate,
+                        scan_rules,
+                    );
+                    expected.sort_ground_pass(&|id| live(&sim, scan_rules, id));
+                    assert_eq!(
+                        sim.substrate.display.members(DisplayLayer::GROUND),
+                        expected.members(DisplayLayer::GROUND),
+                        "step {step}: sort"
+                    );
+                }
+            }
+        }
+    }
+}

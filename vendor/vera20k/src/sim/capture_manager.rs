@@ -1,0 +1,1259 @@
+//! `CaptureManagerClass`: mind control (Yuri, Yuri Prime, Psychic Commando,
+//! Mastermind, Psychic Tower).
+//!
+//! Native owner: one manager per Techno whose weapon 0 carries a
+//! `MindControl=` warhead (`TechnoClass::Init_Managers @ 0x006F4090..
+//! 0x006F40F2`, `TechnoClass+0x2BC`; ctor `0x004717D0(owner, Damage,
+//! InfiniteMindControl)`). The firer's Inviso `[PsychicControl]` shot reaches
+//! the MindControl arm of `BulletClass::DetonateAtCoord` (`0x0046920B..
+//! 0x0046933E`), which calls [`Simulation::capture_unit`] on the bullet's own
+//! target. The victim holds only the back-link [`MindControlLink`]
+//! (`TechnoClass+0x2C0` MindControlledBy, `+0x2C8` its ring anim); the
+//! controller owns the ordered nodes and every state change.
+//!
+//! Releases (`FreeUnit @ 0x00471FF0`, through `FreeAll @ 0x00472140`): the
+//! controller's death arm (`TechnoClass::ReceiveDamage @ 0x00702112`; the
+//! later `BuildingClass::ReceiveDamage` FreeAll at `0x004424F9` finds the
+//! manager already empty), Foot UnInit (`0x004DE5DD`), a drain link
+//! installed on it (`0x0070FDBD`), a Psychic Tower going offline (the
+//! `0x004549B0` off edge, FreeAll at `0x00454B47`), which a sale reaches
+//! because Selling ends Is_Operational (`0x004555D0`) before the tower is
+//! removed, CaptureUnit's single-victim replacement (`0x00471D98`), a Chrono
+//! beam's warp start on the controller (`TemporalClass::InitiateWarp @
+//! 0x0071AF48`), and a captive boarding a building or transport (the
+//! PerCellProcess sites `0x0051A2DA`, `0x0051A438`, `0x0073A2CD`,
+//! `0x0073A72B`). A victim's own
+//! death only drops its node (`TechnoClass::PointerExpired @ 0x00707B14` ->
+//! `0x00471F90`): no owner change, no sound, no draw. The victim's
+//! `+0x2C0` also bars deploying an MCV (`0x00700ED0`) and repacking a
+//! Construction Yard (`0x00449C15`, `0x0044F614`).
+//!
+//! Scenario draws: DecideUnitFate takes one `RandomRanged(1, 100)` when the
+//! object's current house is not human (`0x004724F2`); a Mastermind's damaging
+//! overload check takes five pairs of `RandomRanged(-200, 200)` and, while it
+//! survives above the first row, one `RandomRanged(0, 100)`.
+//!
+//! Evidence: control flow and ordering read from the disassembly at the
+//! addresses cited here, with Ghidra plates on the functions. Native
+//! execution (`tools/spatial_oracle/`, compared in the `native_` tests):
+//! `capture_decide_fate.py` runs the original DecideUnitFate (reasons and
+//! their boundaries, the draw, the choice walk; every row compared);
+//! `capture_overload_update.py` the original constructor and overload Update
+//! frame by frame (the frames that check, the damage amount, the voice
+//! latch and where it plays, the spark offsets and draws, the lean draw;
+//! the ReceiveDamage arguments are recorded natively and mirrored at the
+//! call site, not observed on the Rust side); `capture_ring_height.py` the
+//! static initializer behind a building ring's height. Retail data: `[Controller]`,
+//! `[ControllerBuilding]`, `[PsychicControl]` (Inviso), `[CombatDamage]
+//! Overload*=`, `[General] AICapture*=`.
+//!
+//! The Psychic Dominator's strike (`PsyDom::MindControlArea @ 0x0053B080`,
+//! `superweapon::psychic_dominator`) captures through
+//! [`Simulation::perma_capture`]: no manager holds the object, its permanent
+//! byte `+0x2C4` stays set, and IsMindControlled reads it with `+0x2C0`.
+//!
+//! DrawLinks472160 reads each retained node timer and the existing selection
+//! state. Tactical presentation consumes the shared GetFLH/live coordinates.
+//!
+//! RESIDUALS:
+//! - An expired ring anim clears the victim's `+0x2C8` natively
+//!   (`TechnoClass::PointerExpired @ 0x00707946`, `0x0071043D`); VERA clears
+//!   the link only in FreeUnit, so a ring that ran out of loops leaves a
+//!   stale anim id in the persisted and hashed link. Harmless while stable
+//!   ids are never reused.
+//! - A type's `MindClearedSound=` naming an unknown sound is -1 natively and
+//!   FreeUnit falls back to the global (`0x00472057`); VERA keeps the name
+//!   and plays nothing. No stock type authors the key.
+//! - `AICaptureWoundedMark=` is read natively as a double and stored with
+//!   `FSTP float` under the process chop control word (`0x00670504..
+//!   0x00670509`); VERA parses to the nearest `f32`. Equal for stock `.25`;
+//!   an authored mark can differ by one ulp.
+//! - A crushed controller frees its victims at the crush call (`0x007418E5`,
+//!   before Record_The_Kill); VERA frees them in the crushed object's UnInit
+//!   a moment later in the same frame.
+
+use crate::sim::world::FrameEffects;
+use serde::{Deserialize, Serialize};
+
+use crate::map::entities::EntityCategory;
+use crate::rules::mind_control_rules::CaptureReason;
+use crate::rules::object_type::ObjectType;
+use crate::rules::overlay_types::OverlayTypeRegistry;
+use crate::rules::ruleset::RuleSet;
+use crate::sim::anim_class::{AnimId, AnimWorldCoord};
+use crate::sim::game_entity::GameEntity;
+use crate::sim::intern::InternedId;
+use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::world::{SimSoundEvent, Simulation};
+
+/// The manager constructor's overload check countdown (`+0x4C = 30`).
+const OVERLOAD_FIRST_CHECK_FRAMES: i32 = 30;
+/// `AnimClass(type, coord, 0, 1, 0x600, 0, 0)` at `0x00471F1D`.
+const RING_ANIM_DRAW_FLAGS: u32 = 0x600;
+/// A building victim's ring ZAdjust (`anim+0x100 = -1024`, `0x00471F66`).
+const BUILDING_RING_Z_ADJUST: i32 = -1024;
+
+/// One `ControlNode` (`operator new(0x14)`): the victim and the house it had
+/// before the capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ControlNode {
+    /// `+0x0` the controlled Techno.
+    victim: u64,
+    /// `+0x4` its house before the capture; FreeUnit restores it.
+    original_owner: InternedId,
+    /// Node+8/+10: capture471E3A..471E57 starts the Rules+310 countdown.
+    line_timer: crate::sim::timer::CdTimer,
+}
+
+/// Retained `CaptureManagerClass` fields; the owner (`+0x48`) is the entity
+/// storing this value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CaptureManagerState {
+    /// `+0x3C` weapon 0's signed `Damage=`: the link limit.
+    max_control: i32,
+    /// `+0x40` `InfiniteMindControl=`: no capacity gate; only such a manager
+    /// overloads.
+    infinite: bool,
+    /// `+0x24` the ControlNode vector, in native order.
+    nodes: Vec<ControlNode>,
+    /// `+0x41` the overload voice played this overload episode.
+    overload_sound_played: bool,
+    /// `+0x4C` frames until the next overload check.
+    overload_countdown: i32,
+    /// `+0x44` positive countdown selecting the active overload pip.
+    /// Constructors `0x00471832` / `0x004718EA` initialize it to zero.
+    /// This is distinct from TechnoClass's hull-flash countdown.
+    overload_pip_countdown: i32,
+}
+
+impl CaptureManagerState {
+    fn constructed(max_control: i32, infinite: bool) -> Self {
+        Self {
+            max_control,
+            infinite,
+            nodes: Vec::new(),
+            overload_sound_played: false,
+            overload_countdown: OVERLOAD_FIRST_CHECK_FRAMES,
+            overload_pip_countdown: 0,
+        }
+    }
+
+    /// `IsFull @ 0x004722A0`: a finite manager at its limit. Gates
+    /// `ShouldRetaliate` (`0x0070882F`) and `CanAcquireTarget` (`0x00709230`).
+    pub fn is_full(&self) -> bool {
+        !self.infinite && self.count() >= self.max_control
+    }
+
+    /// `HasAny @ 0x004722C0`.
+    pub(crate) fn has_any(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
+    /// `GetControlledCount @ 0x004722D0`.
+    pub fn count(&self) -> i32 {
+        i32::try_from(self.nodes.len()).unwrap_or(i32::MAX)
+    }
+
+    /// `IsOverloading @ 0x004726C0`: no extra pip unless an infinite
+    /// manager exceeds its retained capacity. The returned bool is the
+    /// native out-parameter (`+0x44 > 0`), which selects the active frame.
+    /// The base strip's maximum comes from the current type's weapon;
+    /// this method owns only the manager's overload decision.
+    pub fn overload_pip_state(&self) -> Option<bool> {
+        (self.infinite && self.count() > self.max_control)
+            .then_some(self.overload_pip_countdown > 0)
+    }
+
+    /// CanCapture's capacity gate (`0x00471C90`, gate 8): a finite manager
+    /// below its limit, or one limited to a single victim, which CaptureUnit
+    /// replaces.
+    fn admits_another(&self) -> bool {
+        self.infinite || self.count() < self.max_control || self.max_control == 1
+    }
+
+    /// The controlled objects, in node order.
+    pub(crate) fn victims(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
+        self.nodes.iter().map(|node| node.victim)
+    }
+
+    /// `GetOriginalOwner @ 0x004722F0`: reverse node scan, `None` (native
+    /// null) without a node. Read through `TechnoClass 0x0070F820` by the
+    /// HouseClass defeat blow-up (`house_defeat`); FreeUnit reads its node
+    /// directly.
+    pub(crate) fn original_owner(&self, victim: u64) -> Option<InternedId> {
+        self.nodes
+            .iter()
+            .rev()
+            .find(|node| node.victim == victim)
+            .map(|node| node.original_owner)
+    }
+
+    /// The rewrite half of `SetOriginalOwnerToCivilian @ 0x00472330`: every
+    /// node controlling `victim` (reverse scan, all matches) now returns it
+    /// to `house`. The caller found the Civilian-side house.
+    pub(crate) fn set_original_owner(&mut self, victim: u64, house: InternedId) {
+        for node in self.nodes.iter_mut().rev() {
+            if node.victim == victim {
+                node.original_owner = house;
+            }
+        }
+    }
+
+    /// `RemoveNode @ 0x00471F90`, the pointer-expiry listener: a dead
+    /// victim's node goes silently. It compares the [`Self::victims`], which
+    /// the pointer-expiry index reaches the owner by.
+    pub(crate) fn pointer_expired(&mut self, stable_id: u64) {
+        self.nodes.retain(|node| node.victim != stable_id);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_victims_for_test(max_control: i32, infinite: bool, victims: &[u64]) -> Self {
+        let mut state = Self::constructed(max_control, infinite);
+        state.nodes = victims
+            .iter()
+            .map(|&victim| ControlNode {
+                victim,
+                original_owner: InternedId::default(),
+                line_timer: Default::default(),
+            })
+            .collect();
+        state
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reverse_nodes_for_test(&mut self) {
+        self.nodes.reverse();
+    }
+
+    /// A manager holding these `(victim, original owner)` nodes in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_nodes_for_test(nodes: &[(u64, InternedId)]) -> Self {
+        let mut state = Self::constructed(3, false);
+        state.nodes = nodes
+            .iter()
+            .map(|&(victim, original_owner)| ControlNode {
+                victim,
+                original_owner,
+                line_timer: Default::default(),
+            })
+            .collect();
+        state
+    }
+}
+
+/// One DrawLinks472160 node's live coordinates; presentation consumes these
+/// without a second FLH, selection or timer owner. Colors use `owner`'s House.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureLinkCoordinates {
+    /// Stable target identity lets presentation sample this endpoint without
+    /// guessing which overlapping actor supplied the coordinate.
+    pub victim: u64,
+    pub from: crate::sim::components::DriveCoord,
+    pub to: crate::sim::components::DriveCoord,
+    pub owner: InternedId,
+}
+
+impl Simulation {
+    /// DrawLinks472160..472299, reverse node order. The caller owns Tactical's
+    /// Health/planning gate; the node predicate is selected owner/victim OR a
+    /// positive timer remainder. No RNG draws, timer writes or detach calls.
+    pub fn capture_link_coordinates(
+        &self,
+        id: u64,
+        rules: &RuleSet,
+    ) -> Vec<CaptureLinkCoordinates> {
+        use crate::rules::flh::Flh;
+        use crate::sim::combat::fire_coord::{FireSource, fire_coordinate};
+        use crate::sim::movement::ground_pose::position_world_coord;
+        let Some(controller) = self.substrate.entities.get(id) else {
+            return Vec::new();
+        };
+        let Some(manager) = controller.capture_manager.as_ref() else {
+            return Vec::new();
+        };
+        let Some(object) = self.object_type(controller.type_ref(), rules) else {
+            return Vec::new();
+        };
+        let selected = controller.selection.is_selected();
+        // Rendering queries isolate the canonical fallback CellClass.
+        self.effective_shared_cell_dummy().detached(|| {
+            manager
+                .nodes
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, node)| {
+                    let victim = self.substrate.entities.get(node.victim)?;
+                    if !selected
+                        && !victim.selection.is_selected()
+                        && node
+                            .line_timer
+                            .remaining(self.session.binary_frame() as i32)
+                            <= 0
+                    {
+                        return None;
+                    }
+                    let victim_type = self.object_type(victim.type_ref(), rules)?;
+                    let mut to = position_world_coord(&victim.position);
+                    to.z = to.z.wrapping_add(victim_type.lepton_mind_control_offset);
+                    let from = fire_coordinate(
+                        self,
+                        rules,
+                        &FireSource::of_entity(controller),
+                        object,
+                        -1 - (index % 5) as i32,
+                        controller.weapon_burst.index() as u8,
+                        Flh::default(),
+                    )
+                    .coord;
+                    Some(CaptureLinkCoordinates {
+                        victim: node.victim,
+                        from: crate::sim::components::DriveCoord {
+                            x: from.x,
+                            y: from.y,
+                            z: from.z,
+                        },
+                        to,
+                        owner: controller.owner(),
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+/// The victim side: `TechnoClass+0x2C0` MindControlledBy, `+0x2C4` the
+/// Psychic Dominator's permanent control and `+0x2C8` the ring anim.
+/// Written only by this module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MindControlLink {
+    controller: Option<u64>,
+    ring_anim: Option<AnimId>,
+    /// `+0x2C4`: set by `PsyDom::MindControlArea` (`0x0053B2A2`); nothing
+    /// clears it.
+    permanent: bool,
+    /// Techno+2CC: the House controlling a trigger-transferred building.
+    /// Constructor6F2E5D=null; House50D290 writes it after ChangeOwner.
+    /// Independent of both the unit controller and the Dominator bit.
+    #[serde(default)]
+    house_controller: Option<InternedId>,
+    /// Techno+2E0: its pre-transfer House. ChangeOwner7017A0 clears only
+    /// this pointer, so a later ordinary capture can leave +2CC nonnull
+    /// while GetOriginalOwner70F820 returns NULL. Do not merge the pair.
+    #[serde(default)]
+    house_original_owner: Option<InternedId>,
+}
+
+/// The world hash folds the controller and ring as it always has, and the
+/// permanent byte only when it is set.
+impl std::hash::Hash for MindControlLink {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.controller.hash(hasher);
+        self.ring_anim.hash(hasher);
+        if self.permanent {
+            0x2c4_u32.hash(hasher);
+        }
+        if self.house_controller.is_some() || self.house_original_owner.is_some() {
+            b"trigger-house-control-v1".hash(hasher);
+            self.house_controller.hash(hasher);
+            self.house_original_owner.hash(hasher);
+        }
+    }
+}
+
+impl MindControlLink {
+    /// `TechnoClass::IsMindControlled @ 0x007105E0`: a controller (`+0x2C0`)
+    /// or the Dominator's permanent control (`+0x2C4`).
+    pub fn is_mind_controlled(&self) -> bool {
+        self.controller.is_some() || self.permanent
+    }
+
+    /// `+0x2C0` MindControlledBy alone, which the deploy and repack tests
+    /// read (`0x00700ED0`, `0x00449C15`, `0x0044F614`, `0x00449D50`).
+    pub fn controller(&self) -> Option<u64> {
+        self.controller
+    }
+
+    /// `+0x2C4` alone, which All_To_Hunt's Dominator arm reads (`0x0050144B`).
+    pub(crate) fn permanent(&self) -> bool {
+        self.permanent
+    }
+
+    pub(crate) fn house_controller(&self) -> Option<InternedId> {
+        self.house_controller
+    }
+
+    pub(crate) fn house_original_owner(&self) -> Option<InternedId> {
+        self.house_original_owner
+    }
+
+    /// The shared ChangeOwner7017A0 write, after Added_To_Game and before
+    /// the mission tail. +2CC is deliberately preserved.
+    pub(crate) fn clear_house_original_owner_on_owner_change(&mut self) {
+        self.house_original_owner = None;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn controlled_by_for_test(controller: u64) -> Self {
+        Self {
+            controller: Some(controller),
+            ..Self::default()
+        }
+    }
+
+    /// The Dominator's hold (`+0x2C4`) with no controller or ring.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn permanent_for_test() -> Self {
+        Self {
+            permanent: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// CanCapture's victim-side gates (`0x00471C90`): gates 3-7 and 9 read the
+/// target alone; gate 2 compares its house with the controller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CaptureVictimFacts {
+    owner: InternedId,
+    capturable: bool,
+}
+
+impl CaptureVictimFacts {
+    /// `frame` evaluates gate 7 (vt+0x160, an active Iron Curtain or Force
+    /// Shield).
+    pub(crate) fn of(target: &GameEntity, target_obj: &ObjectType, frame: u32) -> Self {
+        // 3: `ImmuneToPsionics=` (`+0xD35`); 4: a Unit in a tank bunker
+        // (`+0x2E4`); 5: already controlled; 6: a trigger transfer (+0x2CC,
+        // 471CF0); 7: the Iron Curtain; 9: Selling or Construction.
+        let refused = target_obj.immune_to_psionics
+            || (target.category() == EntityCategory::Unit
+                && target.bunker.link().installed_in().is_some())
+            || target.mind_control.is_mind_controlled()
+            || target.mind_control.house_controller.is_some()
+            || crate::sim::superweapon::invulnerability::is_invulnerable(
+                target.invulnerability.as_ref(),
+                frame,
+            )
+            // CanCapture's gate 9 (`0x00471D1E..0x00471D2C`).
+            || target.constructing_or_selling();
+        Self {
+            owner: target.owner(),
+            capturable: !refused,
+        }
+    }
+}
+
+/// CanCapture's manager side: the controller's house and whether its
+/// capacity admits another victim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CaptureControllerFacts {
+    owner: InternedId,
+    admits_another: bool,
+}
+
+impl CaptureControllerFacts {
+    /// `None` without a manager. GetFireError dereferences the manager
+    /// unconditionally for a MindControl warhead (`0x006FCB3B`); a type whose
+    /// weapon 0 is not MindControl but whose other weapon is would crash
+    /// there, which no stock type authors.
+    pub(crate) fn of(controller: &GameEntity) -> Option<Self> {
+        controller.capture_manager.as_ref().map(|manager| Self {
+            owner: controller.owner(),
+            admits_another: manager.admits_another(),
+        })
+    }
+}
+
+/// `CaptureManagerClass::CanCapture @ 0x00471C90` (gate 1, a null target, is
+/// the caller's). Allies are not refused: only the controller's own house is.
+pub(crate) fn can_capture(controller: CaptureControllerFacts, victim: CaptureVictimFacts) -> bool {
+    victim.owner != controller.owner && victim.capturable && controller.admits_another
+}
+
+/// `TechnoClass::Init_Managers @ 0x006F3F40` (`0x006F4090..0x006F40F2`): a
+/// manager for every class (buildings too) whose `GetWeapon(0)` warhead is
+/// MindControl. It runs from the constructors and InitFromType
+/// (`0x007355F1`, `0x00517CC4`, `0x00442C43`, ...), before a map reader sets
+/// veterancy (`0x0051FB00` -> `0x007500E0`), so the weapon is always the
+/// rookie one: an elite Psychic Commando keeps one link.
+pub(crate) fn init_capture_manager(
+    object_type: &ObjectType,
+    rules: &RuleSet,
+) -> Option<CaptureManagerState> {
+    let (weapon_name, _) = crate::sim::combat::combat_weapon::weapon_for_index(object_type, 0, 0)?;
+    let weapon = rules.weapon(weapon_name)?;
+    let warhead = rules.warhead(weapon.warhead.as_deref()?)?;
+    warhead
+        .mind_control
+        .then(|| CaptureManagerState::constructed(weapon.damage, weapon.infinite_mind_control))
+}
+
+impl Simulation {
+    /// House50D290 /50D2D0, reached by active TAction123/124 through
+    /// 6E0CA0/6E0D00 (Steam gamemd). Walk the current House
+    /// building list backwards; ChangeOwner callbacks mutate that same list.
+    /// No health/limbo/type filter and no independent ownership copy.
+    pub(crate) fn control_house_buildings(
+        &mut self,
+        incoming: InternedId,
+        selected: InternedId,
+        restore: bool,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let source = if restore { incoming } else { selected };
+        let destination = if restore { selected } else { incoming };
+        let mut count = self
+            .houses
+            .get(&source)
+            .map_or(0, |house| house.base_projection().buildings().len());
+        while count != 0 {
+            count -= 1;
+            let Some(id) = self
+                .houses
+                .get(&source)
+                .and_then(|house| house.base_projection().buildings().get(count))
+                .copied()
+            else {
+                continue;
+            };
+            if restore
+                && self
+                    .substrate
+                    .entities
+                    .get(id)
+                    .is_none_or(|entity| entity.mind_control.house_original_owner != Some(selected))
+            {
+                continue;
+            }
+            self.change_owner_with_rules(id, destination, rules, registry, frame_effects);
+            if let Some(entity) = self.substrate.entities.get_mut(id) {
+                // Native writes AFTER the entire virtual ChangeOwner. The
+                // shared Techno half has already cleared its old +2E0.
+                entity.mind_control.house_original_owner = (!restore).then_some(selected);
+                entity.mind_control.house_controller = (!restore).then_some(incoming);
+            }
+        }
+    }
+
+    /// CanCapture for the live pair.
+    pub(crate) fn can_capture(&self, controller_id: u64, target_id: u64, rules: &RuleSet) -> bool {
+        let Some(controller) = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .and_then(CaptureControllerFacts::of)
+        else {
+            return false;
+        };
+        let Some(target) = self.substrate.entities.get(target_id) else {
+            return false;
+        };
+        let Some(target_obj) = self.object_type(target.type_ref(), rules) else {
+            return false;
+        };
+        can_capture(
+            controller,
+            CaptureVictimFacts::of(target, target_obj, self.session.binary_frame()),
+        )
+    }
+
+    /// `CaptureManagerClass::CaptureUnit @ 0x00471D40`.
+    pub(crate) fn capture_unit(
+        &mut self,
+        controller_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
+        if !self.can_capture(controller_id, target_id, rules) {
+            return false;
+        }
+        // 0x00471D8A: a single-victim manager releases its victim first.
+        let released: Vec<u64> = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .and_then(|controller| controller.capture_manager.as_ref())
+            .filter(|manager| manager.max_control == 1)
+            .map(|manager| manager.victims().rev().collect())
+            .unwrap_or_default();
+        for victim in released {
+            self.free_unit(controller_id, victim, rules, registry, frame_effects);
+        }
+        let (Some(controller_owner), Some(original_owner)) = (
+            self.substrate
+                .entities
+                .get(controller_id)
+                .map(GameEntity::owner),
+            self.substrate
+                .entities
+                .get(target_id)
+                .map(GameEntity::owner),
+        ) else {
+            return false;
+        };
+        // 0x00471DB8: ChangeOwner(controller's house, 1). It refuses only an
+        // unchanged house, which CanCapture already excluded.
+        self.change_owner_with_rules(target_id, controller_owner, rules, registry, frame_effects);
+        if let Some(manager) = self
+            .substrate
+            .entities
+            .get_mut(controller_id)
+            .and_then(|controller| controller.capture_manager.as_mut())
+        {
+            manager.nodes.push(ControlNode {
+                victim: target_id,
+                original_owner,
+                line_timer: crate::sim::timer::CdTimer::started(
+                    self.session.binary_frame() as i32,
+                    rules.mind_control.attack_line_frames,
+                ),
+            });
+        }
+        if let Some(target) = self.substrate.entities.get_mut(target_id) {
+            target.mind_control.controller = Some(controller_id);
+        }
+        self.reset_captured_orders(target_id, rules, frame_effects);
+        self.decide_unit_fate(controller_id, target_id, rules, registry, frame_effects);
+        if let Some(ring) = rules.mind_control.controlled_anim.as_deref() {
+            self.attach_control_ring(target_id, ring, rules);
+        }
+        true
+    }
+
+    /// `TechnoClass::CanBePermaMindControlled @ 0x0053C450`, which
+    /// `PsyDom::MindControlArea` inlines (`0x0053B219..0x0053B270`): not a
+    /// Building (vt+0x2C), not `ImmuneToPsionics=` (`+0xD35`), not under an
+    /// Iron Curtain or Force Shield (vt+0x160), not `BalloonHover=`
+    /// (`+0xD6A`) and not in the air (vt+0x54). Nothing tests an object
+    /// already controlled.
+    pub(crate) fn can_be_perma_mind_controlled(&self, id: u64, rules: &RuleSet) -> bool {
+        let Some(object) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        if object.category() == EntityCategory::Structure {
+            return false;
+        }
+        let Some(object_type) = self.object_type(object.type_ref(), rules) else {
+            return false;
+        };
+        !object_type.immune_to_psionics
+            && !crate::sim::superweapon::invulnerability::is_invulnerable(
+                object.invulnerability.as_ref(),
+                self.session.binary_frame(),
+            )
+            && !object_type.balloon_hover
+            && !crate::sim::movement::air_movement::is_high_flying(
+                object,
+                self.resolved_terrain.as_ref(),
+                Some((rules, &self.interner)),
+            )
+    }
+
+    /// MindControlArea's capture of one object (`0x0053B276..0x0053B31C`):
+    /// its controller lets it go (FreeUnit through the controller's manager,
+    /// `0x0053B287`), it joins `house` (`SetOwningHouse(house, 1)`, vt+0x3D4),
+    /// its `+0x2C4` is set and `PermaControlledAnimationType=` rings it. A
+    /// ring it already wears stays on it: `+0x2C8` only takes the new one.
+    pub(crate) fn perma_capture(
+        &mut self,
+        id: u64,
+        house: InternedId,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        if let Some(controller) = self
+            .substrate
+            .entities
+            .get(id)
+            .and_then(|object| object.mind_control.controller)
+        {
+            self.free_unit(controller, id, rules, registry, frame_effects);
+        }
+        self.change_owner_with_rules(id, house, rules, registry, frame_effects);
+        if let Some(object) = self.substrate.entities.get_mut(id) {
+            object.mind_control.permanent = true;
+        }
+        if let Some(ring) = rules.mind_control.perma_controlled_anim.as_deref() {
+            self.attach_control_ring(id, ring, rules);
+        }
+    }
+
+    /// The MindControl arm of `BulletClass::DetonateAtCoord` (`0x0046920B..
+    /// 0x0046933E`): no firer or no manager ends it; otherwise the firer's
+    /// manager captures the bullet's own target (a cell or none fails), and a
+    /// success plays `YuriMindControlSound=` at the target when the firer's
+    /// house or the target's house before the capture passes
+    /// `HouseClass::IsHumanPlayer @ 0x0050B6F0` (the local player in skirmish;
+    /// the app resolves it from the two houses on the event).
+    /// RESIDUAL: the two object-tag events raised before the attempt (6 and
+    /// 0x2C, `0x0046929D`/`0x004692B8`) need object Tag attachment, which VERA
+    /// does not have.
+    pub(crate) fn mind_control_detonation(
+        &mut self,
+        firer_id: u64,
+        target: Option<u64>,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let Some(firer) = self.substrate.entities.get(firer_id) else {
+            return;
+        };
+        if firer.capture_manager.is_none() {
+            return;
+        }
+        let firer_owner = firer.owner();
+        let Some(target_id) = target else {
+            return;
+        };
+        let Some(target_owner) = self
+            .substrate
+            .entities
+            .get(target_id)
+            .map(GameEntity::owner)
+        else {
+            return;
+        };
+        if !self.capture_unit(firer_id, target_id, rules, registry, frame_effects) {
+            return;
+        }
+        let Some(sound) = rules.mind_control.mind_control_sound.clone() else {
+            return;
+        };
+        if let Some(target) = self.substrate.entities.get(target_id) {
+            let event = SimSoundEvent::voc_at_for(
+                sound,
+                Some([firer_owner, target_owner]),
+                &target.position,
+            );
+            self.sound_events.emit(event);
+        }
+    }
+
+    /// Gate `0x00471E55..0x00471E9F`, then `vt+0x3D0` at471EA5: unless a Simple Deployer
+    /// is deploying (Unload) or the object is Selling or under Construction,
+    /// the captive's orders reset to Guard ([`Simulation::reset_orders_to_guard`]).
+    fn reset_captured_orders(
+        &mut self,
+        target_id: u64,
+        rules: &RuleSet,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let Some(target) = self.substrate.entities.get(target_id) else {
+            return;
+        };
+        let simple_deployer_unloading = target.category() == EntityCategory::Unit
+            && target.mission.current().known() == Some(MissionType::Unload)
+            && self
+                .object_type(target.type_ref(), rules)
+                .is_some_and(|object| object.is_simple_deployer);
+        if simple_deployer_unloading || target.constructing_or_selling() {
+            return;
+        }
+        self.reset_orders_to_guard(target_id, rules, frame_effects);
+    }
+
+    /// The ring (`0x00471EB8..0x00471F6D`): `ControlledAnimationType=` at the
+    /// victim's GetCoords (`vt+0x48`, the foundation centre for a building)
+    /// raised by its type's `MindControlRingOffset=`, or for a building by
+    /// its `Height=` in levels (`BuildingType+0xEF4 * [0x0089E178]`, 104 once
+    /// the file's static initializer `0x00471610` has run:
+    /// `tools/spatial_oracle/capture_ring_height.py`), attached to the victim.
+    /// MindControlArea builds its `PermaControlledAnimationType=` ring the
+    /// same way (`0x0053B2A9..0x0053B31C`), never for a building.
+    fn attach_control_ring(&mut self, target_id: u64, anim_name: &str, rules: &RuleSet) {
+        let Some(target) = self.substrate.entities.get(target_id) else {
+            return;
+        };
+        let Some(object) = self.object_type(target.type_ref(), rules) else {
+            return;
+        };
+        let building = target.category() == EntityCategory::Structure;
+        let offset = if building {
+            // Without an art section the BuildingTypeClass constructor's 2
+            // stands.
+            let height = rules
+                .art()
+                .get(&object.image)
+                .or_else(|| rules.art().get(&object.id))
+                .map_or(2, |art| art.height);
+            height.wrapping_mul(crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS)
+        } else {
+            object.mind_control_ring_offset
+        };
+        let Some(centre) = self.anim_owner_coords(target_id) else {
+            return;
+        };
+        let coord = AnimWorldCoord {
+            x: centre.x,
+            y: centre.y,
+            z: centre.z.wrapping_add(offset),
+        };
+        let type_id = self.interner.intern(anim_name);
+        let (rx, ry, sub_x, sub_y, z) = coord.to_cell_sub_z();
+        let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
+            delay: 0,
+            loop_count: 1,
+            draw_flags: RING_ANIM_DRAW_FLAGS,
+            z_adjust: 0,
+            reverse: false,
+            owner: Some(target_id),
+            ..crate::sim::components::AnimClassSpawnDescriptor::new(
+                type_id, rx, ry, sub_x, sub_y, z,
+            )
+        };
+        let anim_id = match self.spawn_anim_at_world(rules, descriptor, coord) {
+            Ok(anim_id) => anim_id,
+            Err(error) => {
+                log::debug!("capture ring [{anim_name}] did not construct: {error}");
+                return;
+            }
+        };
+        if let Some(target) = self.substrate.entities.get_mut(target_id) {
+            target.mind_control.ring_anim = Some(anim_id);
+        }
+        if building {
+            self.substrate
+                .set_anim_z_adjust(anim_id, BUILDING_RING_Z_ADJUST);
+        }
+    }
+
+    /// Unit UpdateDisguise's attached-ring tail746A9C..746B19. Read the
+    /// capture owner's existing +2C8 link and the shared House50B6F0 predicate;
+    /// neither allocation nor controller/owner identity changes here.
+    pub(crate) fn update_disguise_ring_visibility(&mut self, id: u64) {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return;
+        };
+        let Some(ring) = entity.mind_control.ring_anim else {
+            return;
+        };
+        let hidden = entity.disguise.as_ref().is_some_and(|d| d.is_disguised())
+            && !self.house_is_human_player(entity.owner());
+        self.substrate.set_anim_hidden(ring, hidden);
+    }
+
+    /// `CaptureManagerClass::FreeUnit @ 0x00471FF0`: every node of `victim`,
+    /// newest first. Returns false for a missing controller or manager.
+    pub(crate) fn free_unit(
+        &mut self,
+        controller_id: u64,
+        victim_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
+        let Some(manager) = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .and_then(|controller| controller.capture_manager.as_ref())
+        else {
+            return false;
+        };
+        let matches: Vec<(usize, InternedId)> = manager
+            .nodes
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, node)| node.victim == victim_id)
+            .map(|(index, node)| (index, node.original_owner))
+            .collect();
+        for (index, original_owner) in matches {
+            // The ring goes (`vt+0xF8` UnInit), then MindClearedSound: the
+            // type's own, else the global.
+            if let Some(ring) = self
+                .substrate
+                .entities
+                .get_mut(victim_id)
+                .and_then(|victim| victim.mind_control.ring_anim.take())
+            {
+                self.destroy_anim(ring, rules);
+            }
+            if let Some(victim) = self.substrate.entities.get(victim_id) {
+                let sound = self
+                    .object_type(victim.type_ref(), rules)
+                    .and_then(|object| object.mind_cleared_sound.clone())
+                    .or_else(|| rules.mind_control.mind_cleared_sound.clone());
+                if let Some(sound) = sound {
+                    let event = SimSoundEvent::voc_at(sound, &victim.position);
+                    self.sound_events.emit(event);
+                }
+            }
+            self.change_owner_with_rules(victim_id, original_owner, rules, registry, frame_effects);
+            // DecideUnitFate runs while `+0x2C0` still names the controller.
+            // Back with its own house, the unit cannot join the controller's
+            // team, so its fate needs no map overlays.
+            self.decide_unit_fate(controller_id, victim_id, rules, None, frame_effects);
+            if let Some(victim) = self.substrate.entities.get_mut(victim_id) {
+                victim.mind_control.controller = None;
+            }
+            if let Some(manager) = self
+                .substrate
+                .entities
+                .get_mut(controller_id)
+                .and_then(|controller| controller.capture_manager.as_mut())
+                && index < manager.nodes.len()
+            {
+                manager.nodes.remove(index);
+            }
+        }
+        true
+    }
+
+    /// `CaptureManagerClass::FreeAll @ 0x00472140`: every victim, newest node
+    /// first.
+    pub(crate) fn free_all_captures(
+        &mut self,
+        controller_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let victims: Vec<u64> = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .and_then(|controller| controller.capture_manager.as_ref())
+            .map(|manager| manager.victims().rev().collect())
+            .unwrap_or_default();
+        for victim in victims {
+            self.free_unit(controller_id, victim, rules, registry, frame_effects);
+        }
+    }
+
+    /// `CaptureManagerClass::DecideUnitFate @ 0x004723B0`, called with the
+    /// unit's house already changed (to the controller's on capture, back to
+    /// the original on release). The unit first leaves its team
+    /// (`0x004723DF`). A controller in a team whose TeamType sets
+    /// `MindControlDecision=` decides by it instead of the roll, which is
+    /// still drawn (`0x00472586..0x004725A9`). "Add To Team" puts a unit that
+    /// did not change house on this call into the controller's team
+    /// (constrained `Add_Member @ 0x006EA4F0`), else it hunts; "Put in Bio
+    /// Reactor" sends it to the house's nearest absorber that takes it
+    /// (`sim::building_entry`), else it hunts. "Put in Grinder" shares
+    /// that module's Foot seek and also hunts only when no Grinder is found.
+    fn decide_unit_fate(
+        &mut self,
+        controller_id: u64,
+        unit_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let Some(unit) = self.substrate.entities.get(unit_id) else {
+            return;
+        };
+        let unit_is_foot = unit.category() != EntityCategory::Structure;
+        if unit_is_foot {
+            self.leave_team(unit_id, false, Some(rules), frame_effects);
+        }
+        // 0x004723E4..0x004723F3: a unit holding a Temporal target lets go.
+        Self::temporal_release_if_warping(
+            &mut self.substrate,
+            &mut self.houses,
+            &mut self.power_states,
+            unit_id,
+        );
+        let Some(unit) = self.substrate.entities.get(unit_id) else {
+            return;
+        };
+        let Some(object) = self.object_type(unit.type_ref(), rules) else {
+            return;
+        };
+        let strength = object.strength;
+        // 0x00472405: an OpenTopped unit's passengers drop their targets
+        // (`0x00710550(unit, 0)`).
+        self.open_topped_passengers_take_target(unit_id, None, rules, registry, frame_effects);
+        let Some(unit) = self.substrate.entities.get(unit_id) else {
+            return;
+        };
+        let (unit_owner, health) = (unit.owner(), unit.health);
+        // 0x0047242A: an object of a human house keeps its orders; no draw.
+        if self
+            .houses
+            .get(&unit_owner)
+            .is_none_or(|house| house.is_human())
+        {
+            return;
+        }
+        let Some(controller_owner) = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .map(GameEntity::owner)
+        else {
+            return;
+        };
+        // 0x00472414..0x0047242C: whether this call changed the unit's house.
+        let changed_house = unit_owner != controller_owner;
+        let reason = self.capture_reason(controller_owner, health, strength, rules);
+        // 0x004724E3: `RandomRanged(1, 100)` on the Scenario stream.
+        let roll = self.scenario_rng.next_range_i32_inclusive(1, 100);
+        let Some(choice) = capture_decision(rules.mind_control.ai_capture_table(reason), roll)
+        else {
+            return;
+        };
+        let mut choice = i32::from(choice);
+        let controller_team = self
+            .team_script_vm
+            .team_for_member(controller_id)
+            .map(|(team_id, _)| team_id);
+        if let Some(decision) = controller_team
+            .and_then(|team_id| self.team_script_vm.mind_control_decision(team_id))
+            .filter(|&decision| decision != 0)
+        {
+            choice = decision;
+        }
+        // 5 "Do Nothing" keeps orders.
+        if choice == 5 {
+            return;
+        }
+        if choice == 1
+            && !changed_house
+            && unit_is_foot
+            && let Some(team_id) = controller_team
+            && self.team_add_member(team_id, unit_id, true, rules, registry, frame_effects)
+        {
+            return;
+        }
+        // 47260E..47261D ->4725E5: preserve PutInGrinder's Eaten and
+        // destination on success; only a failed seek falls through to Hunt.
+        if choice == 2
+            && unit_is_foot
+            && self.foot_enter_grinder(unit_id, rules, registry, frame_effects)
+        {
+            return;
+        }
+        // `0x0047261F..0x0047262E` -> `0x004725E5`: 3 "Put in Bio Reactor"
+        // keeps the seek's orders when it found one (a building's vt+0x340
+        // is the `0x00459E00` stub, false); otherwise the unit hunts.
+        if choice == 3
+            && unit_is_foot
+            && self.foot_enter_bio_reactor(unit_id, rules, registry, frame_effects)
+        {
+            return;
+        }
+        let now = self.session.binary_frame();
+        let readiness = crate::sim::mission::authority::LiveReadyInputProvider { rules };
+        let _ = self.mission_queue_exact(
+            unit_id,
+            MissionId::from_known(MissionType::Hunt),
+            0,
+            now,
+            &readiness,
+        );
+    }
+
+    /// DecideUnitFate's reason (`0x00472438..0x004724D5`), read from the
+    /// CONTROLLER's house, on release too: money below
+    /// `AICaptureLowMoneyMark=`, then a power ratio (`GetPowerRatio
+    /// @ 0x004FCE30`) below one, then the unit's Health/Strength below
+    /// `AICaptureWoundedMark=`.
+    fn capture_reason(
+        &self,
+        controller_owner: InternedId,
+        health: crate::sim::combat::Health,
+        strength: i32,
+        rules: &RuleSet,
+    ) -> CaptureReason {
+        let mind_control = &rules.mind_control;
+        if crate::sim::credit_income::available_money(&self.houses, controller_owner)
+            < mind_control.ai_capture_low_money_mark
+        {
+            return CaptureReason::LowMoney;
+        }
+        // A house without a power state has produced 0 of 0 drained: ratio 1.
+        if self
+            .power_states
+            .get(&controller_owner)
+            .is_some_and(|power| !power.has_full_power())
+        {
+            return CaptureReason::LowPower;
+        }
+        // `FILD Health; FSTP float; FILD Strength; FDIVR float; FCOMP mark;
+        // TEST AH,1` (`0x00472497..0x004724C3`): GetHealthRatio's PC53/chop
+        // quotient (Health passes through a float store, exact up to 2^24),
+        // and C0 is set for less OR unordered, so 0/0 is wounded and x/0
+        // (+inf) is not.
+        use crate::util::native_x87::MaskedX87Ordering;
+        match health.compare_ratio(strength, f64::from(mind_control.ai_capture_wounded_mark)) {
+            MaskedX87Ordering::Less | MaskedX87Ordering::Unordered => CaptureReason::Wounded,
+            MaskedX87Ordering::Equal | MaskedX87Ordering::Greater => CaptureReason::Normal,
+        }
+    }
+}
+
+impl Simulation {
+    /// `CaptureManagerClass::Update @ 0x00471A50`, the Mastermind overload,
+    /// from `TechnoClass::AI_Update` (`0x006FA730`, after mission, targeting,
+    /// the bomb fuse and SlaveManager, and
+    /// before the IsAlive gate at `0x006FA735`). Only an infinite manager
+    /// overloads. The captive count picks the `Overload*=` row; a damaging row
+    /// hits the controller with `C4Warhead=`, plays the overload voice once
+    /// per episode and throws five spark systems.
+    pub(crate) fn capture_manager_update(
+        &mut self,
+        controller_id: u64,
+        rules: &RuleSet,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) {
+        let table = &rules.mind_control;
+        let Some(entity) = self.substrate.entities.get_mut(controller_id) else {
+            return;
+        };
+        let Some(manager) = entity.capture_manager.as_mut() else {
+            return;
+        };
+        if !manager.infinite {
+            return;
+        }
+        // `0x00471A64..0x00471A6C`: this precedes the overload-check
+        // countdown's early return, so the pip also expires on quiet visits.
+        if manager.overload_pip_countdown > 0 {
+            manager.overload_pip_countdown -= 1;
+        }
+        if manager.overload_countdown > 0 {
+            manager.overload_countdown -= 1;
+            return;
+        }
+        // `0x00471A82..0x00471AB1` reads `OverloadCount[0]` unguarded; stock
+        // authors the table.
+        let Some(&first) = table.overload_count.first() else {
+            return;
+        };
+        let count = manager.count();
+        let mut index = 0;
+        if count > first {
+            while index + 1 < table.overload_count.len() {
+                index += 1;
+                if count <= table.overload_count[index] {
+                    break;
+                }
+            }
+        }
+        manager.overload_countdown = table.overload_frames.get(index).copied().unwrap_or(0);
+        let damage = table.overload_damage.get(index).copied().unwrap_or(0);
+        if damage <= 0 {
+            // `0x00471C83`: leaving overload re-arms the voice.
+            manager.overload_sound_played = false;
+            return;
+        }
+        // `0x00471ADF`: store ten before ReceiveDamage, including a fatal
+        // receiver. Non-damaging rows leave the earlier decrement intact.
+        manager.overload_pip_countdown = 10;
+        let sound_played = manager.overload_sound_played;
+        let position = entity.position;
+        let location = crate::sim::movement::ground_pose::position_world_coord(&position);
+        // 0x00471B04: `ReceiveDamage(&damage, 0, C4Warhead, NULL, 0, 0, NULL)`.
+        let warhead = self.interner.intern(&rules.bridge_warheads.c4_name);
+        let event = crate::sim::combat::EntityDamageEvent::direct_receiver(
+            controller_id,
+            damage,
+            0,
+            crate::sim::combat::RAD_NO_ATTACKER,
+            None,
+            warhead,
+            crate::sim::combat::ReceiverCallFlags {
+                ignore_defenses: false,
+                arg6: false,
+            },
+        );
+        self.commit_direct_damage_receiver(rules, overlay_registry, event, frame_effects);
+        if !sound_played {
+            if let Some(sound) = rules.mind_control.overload_sound.clone() {
+                self.sound_events
+                    .emit(SimSoundEvent::voc_at(sound, &position));
+            }
+            if let Some(manager) = self
+                .substrate
+                .entities
+                .get_mut(controller_id)
+                .and_then(|controller| controller.capture_manager.as_mut())
+            {
+                manager.overload_sound_played = true;
+            }
+        }
+        // 0x00471B48..0x00471C23: five `DefaultSparkSystem=` systems, each at
+        // the controller's Location offset by (second draw, first draw, +100).
+        let spark_type = rules
+            .combat_damage
+            .default_spark_system
+            .as_deref()
+            .and_then(|name| rules.ps_type_id_by_name(name));
+        for _ in 0..5 {
+            let dy = self.scenario_rng.next_range_i32_inclusive(-200, 200);
+            let dx = self.scenario_rng.next_range_i32_inclusive(-200, 200);
+            if let Some(system_type) = spark_type {
+                self.spawn_particle_system(
+                    system_type,
+                    glam::IVec3::new(
+                        location.x.wrapping_add(dx),
+                        location.y.wrapping_add(dy),
+                        location.z.wrapping_add(100),
+                    ),
+                    None,
+                    None,
+                    glam::IVec3::ZERO,
+                    None,
+                    rules,
+                );
+            }
+        }
+        // 0x00471C29..0x00471C78: after the receiver and all five full Spark
+        // constructors, a surviving controller above row zero replaces its
+        // sideways angular rate. These are original MOV binary32 literals,
+        // with FCHS for draws below 50, not an ApplyRocker impulse. The common
+        // Techno rocking slot already ran, so integration waits for its next
+        // visit; preserve both angles and the forward rate here.
+        let alive = self
+            .substrate
+            .entities
+            .get(controller_id)
+            .is_some_and(|controller| controller.lifecycle.object_alive());
+        if index > 0 && alive {
+            let lean_left = self.scenario_rng.next_range_i32_inclusive(0, 100) < 50;
+            let magnitude = if index == 1 { 0x3c75_c28f } else { 0x3cf5_c28f };
+            let velocity = crate::util::native_x87::NativeF32Bits::from_bits(
+                magnitude | if lean_left { 0x8000_0000 } else { 0 },
+            );
+            self.substrate
+                .entities
+                .get_mut(controller_id)
+                .expect("live overload controller remains represented")
+                .rocking
+                .get_or_insert_with(Default::default)
+                .set_vel_sideways_native(velocity);
+        }
+    }
+}
+
+/// The choice walk of DecideUnitFate (`0x004724FD..0x00472537`): the running
+/// sum of the table's weights until it reaches the roll. `None` when the
+/// table runs out first (or at choice 6), which returns without an order.
+fn capture_decision(table: &[i32], roll: i32) -> Option<u8> {
+    let mut choice = 0_u8;
+    let mut sum = 0_i32;
+    for &weight in table {
+        if choice == 6 {
+            return None;
+        }
+        choice += 1;
+        sum = sum.wrapping_add(weight);
+        if roll <= sum {
+            return Some(choice);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+#[path = "capture_manager_tests.rs"]
+mod tests;

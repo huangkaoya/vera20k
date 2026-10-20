@@ -1,0 +1,413 @@
+//! The generator's working cell grid and the native cell-iteration order.
+//!
+//! Phases mutate `GridCell`s (the subset of cell state the generator reads or
+//! writes); `emit` projects the grid into a `MapFile` at the end. Iteration
+//! order is load-bearing: every per-cell RNG draw happens in `DiamondScan`
+//! order, so a different traversal silently reorders the whole draw stream.
+
+use super::tiles::TILE_UNASSIGNED;
+
+use crate::util::direction::DIRECTION_DELTAS;
+
+/// One generated cell — the fields the generation phases touch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridCell {
+    /// Flat tile index; 0 = clear ground, `TILE_UNASSIGNED` = untouched.
+    pub tile: i32,
+    /// Sub-tile index within a multi-cell tile block (0 = anchor/unset).
+    pub sub_tile: u8,
+    /// Ground level.
+    pub level: u8,
+    /// Native raw slope id (0 flat; generated ramps use values through at least 16).
+    pub slope: u8,
+    /// Overlay type index, -1 = none.
+    pub overlay: i32,
+    /// Overlay density/frame byte.
+    pub density: u8,
+    /// An object occupies this cell (tree, tech building).
+    pub occupied: bool,
+    /// Start-cell marker set when a waypoint lands here.
+    pub start_marker: bool,
+}
+
+impl Default for GridCell {
+    fn default() -> Self {
+        Self {
+            tile: TILE_UNASSIGNED,
+            sub_tile: 0,
+            // The map-prep stage initialises generated cells to level 4.
+            level: 4,
+            slope: 0,
+            overlay: -1,
+            density: 0,
+            occupied: false,
+            start_marker: false,
+        }
+    }
+}
+
+/// A cell reference a phase holds across later lookups.
+///
+/// The original keeps raw cell pointers; every out-of-band lookup returns the
+/// one shared border cell, so a held reference must distinguish "a real cell"
+/// from "the border cell" to preserve the aliasing (a border reference reads
+/// the border's coordinate slot at use time — it does not remember the
+/// coordinate it was created from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellRef {
+    Cell(i16, i16),
+    Border,
+}
+
+/// Working grid, indexed by the same linear (x, y) scheme as the scratch
+/// array. Cells outside the map's valid band read as `None`, which is what
+/// terminates the native iteration.
+#[derive(Debug, Clone)]
+pub struct RmgGrid {
+    width: usize,
+    diamond_min: i32,
+    diamond_max: i32,
+    cells: Vec<GridCell>,
+    /// The shared out-of-band fallback cell. The original returns one static
+    /// cell for every invalid lookup, writing the requested coordinate into
+    /// it first — so out-of-band accesses alias each other, and a phase that
+    /// paints the fallback affects every later out-of-band read. Its tile
+    /// starts at FFFF through the original Cell constructor; the clear-tile
+    /// predicate accepts that unassigned identity as well as tile zero.
+    border: GridCell,
+    border_coord: (i16, i16),
+}
+
+impl RmgGrid {
+    pub fn new(width: usize, diamond_min: i32, diamond_max: i32) -> Self {
+        Self {
+            width,
+            diamond_min,
+            diamond_max,
+            cells: vec![GridCell::default(); width * width],
+            // Original Cell constructor47BC11 writesFFFF, not zero;
+            // startup565060 and Resize5670F2 construct the shared Dummy.
+            // RMG599E70 resets only allocated iterator cells. Native input
+            // observation: tools/rmg_oracle/cliff_materialization.py.
+            border: GridCell {
+                tile: super::tiles::TILE_UNASSIGNED,
+                level: 0,
+                ..GridCell::default()
+            },
+            border_coord: (0, 0),
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn diamond_bounds(&self) -> (i32, i32) {
+        (self.diamond_min, self.diamond_max)
+    }
+
+    /// Whether a cell exists at this coordinate — the allocation predicate
+    /// the original uses when building the map (asymmetric diamond band).
+    pub fn is_valid(&self, x: i32, y: i32) -> bool {
+        self.diamond_min < x + y
+            && x - y < self.diamond_min
+            && y - x < self.diamond_min
+            && x + y <= self.diamond_max
+            && self.in_bounds(x, y)
+    }
+
+    fn in_bounds(&self, x: i32, y: i32) -> bool {
+        x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.width
+    }
+
+    pub fn get(&self, x: i32, y: i32) -> Option<&GridCell> {
+        self.is_valid(x, y)
+            .then(|| &self.cells[y as usize * self.width + x as usize])
+    }
+
+    pub fn get_mut(&mut self, x: i32, y: i32) -> Option<&mut GridCell> {
+        self.is_valid(x, y)
+            .then(move || &mut self.cells[y as usize * self.width + x as usize])
+    }
+
+    /// The original's cell-pointer lookup, kept as a held reference: an
+    /// invalid coordinate stamps itself into the shared border cell, which
+    /// the reference then names (native lookup `0x5657A0`; the stampers
+    /// inline the same fallback).
+    pub fn cell_ref(&mut self, x: i32, y: i32) -> CellRef {
+        if self.is_valid(x, y) {
+            CellRef::Cell(x as i16, y as i16)
+        } else {
+            self.border_coord = (x as i16, y as i16);
+            CellRef::Border
+        }
+    }
+
+    /// The coordinate read back through a held reference; a border reference
+    /// sees the shared cell's latest stamped coordinate.
+    pub fn ref_coord(&self, held: CellRef) -> (i32, i32) {
+        match held {
+            CellRef::Cell(x, y) => (i32::from(x), i32::from(y)),
+            CellRef::Border => self.border_coord(),
+        }
+    }
+
+    /// The cell behind a held reference, without a fresh (stamping) lookup.
+    pub fn ref_cell(&self, held: CellRef) -> &GridCell {
+        match held {
+            CellRef::Cell(x, y) => &self.cells[self.held_index(x, y)],
+            CellRef::Border => &self.border,
+        }
+    }
+
+    /// Mutable variant of [`Self::ref_cell`].
+    pub fn ref_cell_mut(&mut self, held: CellRef) -> &mut GridCell {
+        match held {
+            CellRef::Cell(x, y) => {
+                let index = self.held_index(x, y);
+                &mut self.cells[index]
+            }
+            CellRef::Border => &mut self.border,
+        }
+    }
+
+    fn held_index(&self, x: i16, y: i16) -> usize {
+        let (x, y) = (i32::from(x), i32::from(y));
+        debug_assert!(
+            self.is_valid(x, y),
+            "a held cell reference names a valid cell"
+        );
+        y as usize * self.width + x as usize
+    }
+
+    /// Cell lookup with the original's fallback semantics: an invalid
+    /// coordinate yields the shared border cell after stamping the requested
+    /// coordinate into it.
+    pub fn cell_native(&mut self, x: i32, y: i32) -> &GridCell {
+        let held = self.cell_ref(x, y);
+        self.ref_cell(held)
+    }
+
+    /// Mutable variant of [`Self::cell_native`].
+    pub fn cell_native_mut(&mut self, x: i32, y: i32) -> &mut GridCell {
+        let held = self.cell_ref(x, y);
+        self.ref_cell_mut(held)
+    }
+
+    /// The coordinate most recently stamped into the border cell — what the
+    /// original reads back from the fallback's coordinate field.
+    pub fn border_coord(&self) -> (i32, i32) {
+        (
+            i32::from(self.border_coord.0),
+            i32::from(self.border_coord.1),
+        )
+    }
+
+    /// Neighbor coordinate one step in direction `dir` (0..7, masked like the
+    /// original's `& 7`).
+    pub fn step(x: i32, y: i32, dir: usize) -> (i32, i32) {
+        let (dx, dy) = DIRECTION_DELTAS[dir & 7];
+        (x + dx, y + dy)
+    }
+
+    /// All existing cells in native scan order. The scan's rows always stay
+    /// inside the off-axis bounds, so the first coordinate past the far
+    /// diagonal is where the original's null-cell check stops it.
+    pub fn native_cells(&self) -> NativeCells {
+        NativeCells {
+            scan: DiamondScan::new(self.diamond_min),
+            diamond_max: self.diamond_max,
+        }
+    }
+}
+
+/// Iterator over valid cell coordinates in native order.
+pub struct NativeCells {
+    scan: DiamondScan,
+    diamond_max: i32,
+}
+
+impl Iterator for NativeCells {
+    type Item = (i32, i32);
+
+    fn next(&mut self) -> Option<(i32, i32)> {
+        let (x, y) = self.scan.next_coord();
+        (x + y <= self.diamond_max).then_some((x, y))
+    }
+}
+
+/// The native cell-iteration order: anti-diagonal rows of the isometric map.
+///
+/// State machine transcribed from the original iterator: start at
+/// `(x=1, y=d)`, walk each row by `(x+1, y-1)`, and when a row of `rem + 1`
+/// cells is exhausted start the next row from the swapped coordinate with a
+/// parity rule choosing between `x = old_y + 1` (row length `d`) and
+/// `y = old_x + 1` (row length `d - 1`... `d`). The machine itself never
+/// stops; the caller stops at the first coordinate that has no cell.
+#[derive(Debug, Clone)]
+pub struct DiamondScan {
+    d: i32,
+    x: i32,
+    y: i32,
+    rem: i32,
+}
+
+impl DiamondScan {
+    pub fn new(d: i32) -> Self {
+        Self {
+            d,
+            x: 1,
+            y: d,
+            rem: d - 1,
+        }
+    }
+
+    /// The next coordinate in native order. Infinite by design — the caller
+    /// owns termination (the original stops on the first null cell).
+    pub fn next_coord(&mut self) -> (i32, i32) {
+        let current = (self.x, self.y);
+        if self.rem != 0 {
+            self.x += 1;
+            self.y -= 1;
+            self.rem -= 1;
+        } else {
+            let (old_x, old_y) = (self.x, self.y);
+            // Swap, then nudge one axis by parity of (x + y - d - 1).
+            self.x = old_y;
+            self.y = old_x;
+            if (old_y + old_x - self.d - 1) & 1 == 0 {
+                self.rem = self.d - 2;
+                self.x = old_y + 1;
+            } else {
+                self.rem = self.d - 1;
+                self.y = old_x + 1;
+            }
+        }
+        current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_masks_the_direction_like_the_original() {
+        assert_eq!(RmgGrid::step(5, 5, 2), (6, 5));
+        assert_eq!(RmgGrid::step(5, 5, 8 + 2), (6, 5), "dir & 7 wraps");
+    }
+
+    /// Hand-walked from the original iterator's state machine with d = 4.
+    /// Rows alternate d and d-1 cells; anti-diagonal sums increase by one per
+    /// row. Any deviation here reorders every per-cell draw in the pipeline.
+    #[test]
+    fn scan_order_matches_the_native_state_machine() {
+        let mut scan = DiamondScan::new(4);
+        let seq: Vec<(i32, i32)> = (0..14).map(|_| scan.next_coord()).collect();
+        assert_eq!(
+            seq,
+            vec![
+                (1, 4),
+                (2, 3),
+                (3, 2),
+                (4, 1), // row sum 5, 4 cells
+                (2, 4),
+                (3, 3),
+                (4, 2), // row sum 6, 3 cells
+                (2, 5),
+                (3, 4),
+                (4, 3),
+                (5, 2), // row sum 7, 4 cells
+                (3, 5),
+                (4, 4),
+                (5, 3), // row sum 8, 3 cells
+            ]
+        );
+    }
+
+    #[test]
+    fn default_cell_matches_map_prep_initial_state() {
+        let cell = GridCell::default();
+        assert_eq!(cell.tile, TILE_UNASSIGNED);
+        assert_eq!(cell.level, 4, "generated cells initialise to level 4");
+        assert_eq!(cell.overlay, -1);
+        assert_eq!(cell.sub_tile, 0);
+        assert!(!cell.occupied);
+    }
+
+    #[test]
+    fn grid_validity_is_the_diamond_band() {
+        let mut grid = RmgGrid::new(16, 4, 12);
+        assert!(grid.get(3, 2).is_some(), "sum 5 is inside");
+        assert!(grid.get(2, 2).is_none(), "sum == min is outside");
+        assert!(grid.get(6, 6).is_some(), "sum == max is inside");
+        assert!(grid.get(7, 6).is_none(), "sum > max is outside");
+        assert!(grid.get(6, 1).is_none(), "x - y >= min is outside");
+        grid.get_mut(3, 2).unwrap().tile = 42;
+        assert_eq!(grid.get(3, 2).unwrap().tile, 42);
+        assert_eq!(grid.get(2, 3).unwrap().tile, TILE_UNASSIGNED);
+    }
+
+    #[test]
+    fn out_of_band_lookups_share_the_border_cell() {
+        let mut grid = RmgGrid::new(16, 4, 12);
+        assert_eq!(
+            grid.cell_native(0, 0).tile,
+            0xFFFF,
+            "native constructed border starts unassigned"
+        );
+        assert_eq!(grid.border_coord(), (0, 0));
+        grid.cell_native_mut(15, 15).tile = 99;
+        assert_eq!(grid.border_coord(), (15, 15), "lookup stamps the coord");
+        assert_eq!(
+            grid.cell_native(1, 0).tile,
+            99,
+            "every invalid coordinate aliases the same cell"
+        );
+        assert_eq!(grid.border_coord(), (1, 0));
+        assert_eq!(
+            grid.get(6, 6).unwrap().tile,
+            TILE_UNASSIGNED,
+            "valid cells are untouched by border writes"
+        );
+    }
+
+    #[test]
+    fn held_border_references_read_the_latest_stamped_coordinate() {
+        let mut grid = RmgGrid::new(16, 4, 12);
+        let held = grid.cell_ref(15, 15);
+        assert_eq!(held, CellRef::Border);
+        assert_eq!(grid.ref_coord(held), (15, 15));
+        grid.cell_native(1, 0);
+        assert_eq!(grid.ref_coord(held), (1, 0), "the shared slot moved");
+        grid.ref_cell_mut(held).tile = 7;
+        assert_eq!(grid.border_coord(), (1, 0), "a held write does not stamp");
+        assert_eq!(grid.cell_native(0, 0).tile, 7, "one shared border cell");
+        assert_eq!(grid.cell_ref(6, 6), CellRef::Cell(6, 6));
+        assert_eq!(
+            grid.border_coord(),
+            (0, 0),
+            "a valid lookup leaves the slot"
+        );
+    }
+
+    #[test]
+    fn native_cells_walk_the_band_and_stop_at_the_far_diagonal() {
+        let grid = RmgGrid::new(16, 4, 8);
+        let cells: Vec<(i32, i32)> = grid.native_cells().collect();
+        assert_eq!(cells.first(), Some(&(1, 4)));
+        assert!(cells.iter().all(|&(x, y)| grid.is_valid(x, y)));
+        assert!(cells.iter().all(|&(x, y)| x + y <= 8));
+        // Every valid cell appears exactly once.
+        let mut sorted = cells.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), cells.len(), "no duplicates");
+        let expected: usize = (0..16i32)
+            .flat_map(|y| (0..16i32).map(move |x| (x, y)))
+            .filter(|&(x, y)| grid.is_valid(x, y))
+            .count();
+        assert_eq!(cells.len(), expected, "full coverage of the band");
+    }
+}

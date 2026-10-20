@@ -1,0 +1,95 @@
+[package]
+name = "vera20k-core"
+version = "0.1.0"
+edition = "2024"
+description = "VERA20k's GPU-free engine: assets, rules, map, simulation, lockstep and the headless scenario"
+publish = false
+# This manifest sits in `src/` so rustc names every file `src/...`, as it did
+# before the workspace split (backtraces, saved RNG traces and panic locations
+# keep their paths). Targets are listed explicitly.
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+[lib]
+path = "core_lib.rs"
+
+[[bin]]
+name = "parity-digest"
+path = "bin/parity-digest.rs"
+
+# Release-build simulation tick benchmark at scale (see its module doc).
+[[bin]]
+name = "sim-bench"
+path = "bin/sim-bench.rs"
+
+[features]
+# The client's Ctrl+Shift dev chord reaches simulation and utility hooks.
+dev-overlays = []
+# Read-only snapshots and opt-in frame timing for the browser dashboard.
+telemetry = []
+# Offline trainer state and diagnostic event hooks, absent from normal builds.
+debug-tools = ["telemetry"]
+# Test fixtures and helpers that client tests share; the client enables it
+# through its dev-dependency.
+test-support = []
+
+[dependencies]
+glam = { workspace = true }
+# Fixed-point arithmetic for simulation positions and other fixed-width mechanisms.
+# Native floating-point mechanisms document their numeric contract at their owner.
+fixed = { version = "1", features = ["serde"] }
+
+# --- Serialization ---
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# --- Binary parsing ---
+# RA2's binary asset formats (.mix, .shp, .vxl, .pal, .tmp, .hva) are parsed by
+# hand-written readers in `assets/` — no parser library, no RA2-specific crates.
+# memmap2 maps disk MIX archives instead of reading them into memory.
+memmap2 = "0.9"
+
+# --- Error handling ---
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# --- Logging ---
+log = { workspace = true }
+
+# --- Parallel simulation work ---
+# The persistent worker pool behind `sim::parallel::map`; its threads keep their
+# thread-local search scratch between frames. Already in the lock via `image`.
+rayon = "1.11"
+
+# --- Crypto (for MIX archive header decryption) ---
+# RA2 .mix files encrypt their file index with Blowfish (`assets::blowfish`).
+# The key is RSA-encrypted.
+# Big integer arithmetic — RSA modular exponentiation to extract the Blowfish key.
+# Simpler than the full `rsa` crate since RA2 uses raw/textbook RSA (no PKCS padding).
+num-bigint = "0.4"
+
+# --- Unix saved-list timestamps ---
+# Local time and the user's locale (src/util/native_file_time.rs). The
+# lockfile already carries libc 0.2.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Not used by core's own code. `cargo test --workspace` resolves these shared
+# crates with the client's features; listing those features here gives
+# `cargo test -p vera20k-core` (with core's dev-overlays and test-support,
+# which tools.cargo_run adds) the same dependency graph, so both commands build
+# and reuse one core test executable instead of compiling it twice.
+# unicode-ident is a normal dependency there too, which keeps the proc-macro
+# crates' build profile the same. tools/tests/test_cargo_run.py checks the
+# features still match.
+[dev-dependencies]
+bytemuck = { version = "1", default-features = false, features = ["derive", "extern_crate_alloc", "min_const_generics"] }
+half = { version = "2", default-features = false, features = ["num-traits"] }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
+num-traits = { version = "0.2", features = ["libm"] }
+unicode-ident = "1"
+
+[lints]
+workspace = true

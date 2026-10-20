@@ -1,0 +1,185 @@
+//! Match presentation owner (F12 `MatchPresentationState`): the per-match GPU
+//! atlas set, the software cursor, and the map-view data the render paths read
+//! each frame (terrain/overlay/waypoint/tag projections, house colors, and the
+//! transient lighting view).
+//!
+//! Map-load handoff replaces per-map resources; the presentation owner remains
+//! allocated while the shell is active.
+//! Process-lifetime GPU objects live in `app::renderer_state::RendererState`.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
+
+use crate::map::houses::{HouseColorMap, HouseRoster};
+use crate::map::overlay::TerrainObject;
+use crate::map::terrain::TerrainGrid;
+use crate::render::bridge_atlas::BridgeAtlas;
+use crate::render::overlay_atlas::OverlayAtlas;
+use crate::render::radar::minimap::MinimapRenderer;
+use crate::render::selection_overlay::SelectionOverlay;
+use crate::render::sidebar_cameo_atlas::SidebarCameoAtlas;
+use crate::render::sidebar_chrome::SidebarChromeSet;
+use crate::render::sprite_atlas::SpriteAtlas;
+use crate::render::tile_atlas::TileAtlas;
+use crate::render::unit_atlas::UnitAtlas;
+use crate::ui::sidebar::{SidebarChromeLayoutSpec, SidebarTab};
+
+pub(crate) struct MatchPresentationState {
+    pub(crate) interpolation: super::interpolation::RenderInterpolation,
+    /// Native Techno+3CA waterline cache, captured by drawing and retained in
+    /// the snapshot presentation supplement rather than simulation authority.
+    pub(crate) sinking_waterlines: std::cell::RefCell<crate::render::sinking::SinkingWaterlines>,
+    /// The pitch each unit type's cached barrel image was first drawn at.
+    pub(crate) barrel_image_pitches:
+        std::cell::RefCell<crate::render::unit_atlas::BarrelImagePitches>,
+    pub(crate) tile_atlas: Option<TileAtlas>,
+    /// BUILDNGZ.SHA z-shape bound at group 2 of the Z-writing building draw.
+    pub(crate) building_zshape: Option<crate::render::building_zshape::BuildingZShape>,
+    pub(crate) unit_atlas: Option<UnitAtlas>,
+    /// Palette + per-house RGB ramp GPU resources for the voxel sprite shader.
+    pub(crate) palette_set: Option<crate::render::palette_textures::PaletteSet>,
+    pub(crate) sprite_atlas: Option<SpriteAtlas>,
+    pub(crate) overlay_atlas: Option<OverlayAtlas>,
+    pub(crate) bridge_atlas: Option<BridgeAtlas>,
+    pub(crate) sidebar_cameo_atlas: Option<SidebarCameoAtlas>,
+    pub(crate) sidebar_chrome: Option<SidebarChromeSet>,
+    pub(crate) software_cursor: Option<crate::app::presentation::render::SoftwareCursor>,
+    pub(crate) terrain_grid: Option<TerrainGrid>,
+    /// Overlay entries from map for per-frame instance generation.
+    pub(crate) overlays: crate::app::presentation::overlay_index::OverlayRenderIndex,
+    /// Terrain objects from map for per-frame instance generation.
+    pub(crate) terrain_objects: Vec<TerrainObject>,
+    /// Overlay ID → type name mapping for atlas lookups at render time.
+    pub(crate) overlay_names: BTreeMap<u8, String>,
+    /// Exact SHP frame-header radar RGB for each native-selected overlay frame.
+    pub(crate) overlay_radar_colors: HashMap<(u8, u8), [u8; 3]>,
+    /// Owner name → house color index mapping for atlas key lookups.
+    pub(crate) house_color_map: HouseColorMap,
+    pub(crate) house_roster: HouseRoster,
+    pub(crate) lighting: super::lighting::MatchLighting,
+    pub(crate) line_trails: super::line_trails::LineTrails,
+    pub(crate) lasers: super::lasers::Lasers,
+    pub(crate) talk_bubble: super::talk_bubble::TalkBubble,
+    pub(crate) electric_bolts: super::electric_bolts::ElectricBolts,
+    /// Process registry B04A60; ordinary kind1 beams copy their endpoints.
+    pub(crate) radiation_beams: super::radiation_beams::RadiationBeams,
+    /// Process-lived native Tactical superweapon ring fade state. Map loads
+    /// replace map resources but keep this presentation owner alive.
+    pub(crate) superweapon_range_pulse:
+        crate::app::presentation::radial_indicators::SuperweaponRangePulse,
+    /// Native process-lived FPS counter and detail hysteresis, never sim state.
+    pub(crate) detail: std::cell::RefCell<super::detail::DetailState>,
+    /// The client's AnimClass `+0x19D` for Supers' ChronoPlacement anims
+    /// (`match_runtime::super_selection`): hidden anims, by id.
+    pub(crate) hidden_super_anims: std::collections::BTreeSet<crate::sim::anim_class::AnimId>,
+    /// The Supers' timer blinks (`SuperClass+0x40`, `+0x48`), by owner and
+    /// type (`presentation::super_timers`).
+    pub(crate) super_timer_blinks: crate::app::presentation::super_timers::TimerBlinks,
+    pub(crate) combat_lights: crate::app::presentation::combat_lights::CombatLightRuntime,
+    pub(crate) minimap: Option<MinimapRenderer>,
+    /// Animated radar chrome — plays 33-frame open/close animation when radar gained/lost.
+    pub(crate) radar_anim: Option<crate::render::radar::anim::RadarAnimState>,
+    pub(crate) radar_movies: crate::app::radar_movie::RadarMovies,
+    pub(crate) chrono_screen: crate::app::chrono_screen::ChronoScreenPresentation,
+    pub(crate) scenario_pause: crate::app::match_runtime::scenario_pause::ScenarioPauseClock,
+    /// Requested-versus-resolved atlas identity used to construct `radar_anim`.
+    ///
+    /// Kept beside the animation so tactical evidence never reconstructs
+    /// provenance from the currently selected sidebar theme.
+    pub(crate) radar_animation_source:
+        Option<crate::render::sidebar_chrome::ResolvedSidebarChromeIdentity>,
+    /// Content insets [left, top, right, bottom] derived from the transparent opening
+    /// in radar.shp frame 0. Used to position the minimap inside the chrome housing.
+    /// Unscaled pixels — multiply by `ui_scale` at use site.
+    pub(crate) radar_content_insets: Option<[u32; 4]>,
+    /// Whether the local player currently has operational radar (power-gated).
+    pub(crate) has_radar: bool,
+    /// Selection overlay renderer — highlights and drag rectangle.
+    pub(crate) selection_overlay: Option<SelectionOverlay>,
+    /// Authentic SHROUD.SHP sprite-based shroud edge renderer.
+    /// GPU ABuffer — screen-resolution brightness texture for per-pixel shroud darkening.
+    /// SHROUD.SHP brightness pixels blitted per-cell, then a full-screen multiply pass
+    /// darkens the scene.
+    pub(crate) shroud_buffer: Option<crate::render::shroud_buffer::ShroudBuffer>,
+    /// Active map theater name (e.g., DESERT).
+    pub(crate) theater_name: String,
+    /// Active map theater extension (e.g., des).
+    pub(crate) theater_ext: String,
+    /// Target/action lines — colored lines from selected units to command destinations.
+    pub(crate) target_lines: crate::app::presentation::target_lines::TargetLineState,
+    // -- Reusable per-frame scratch buffers (avoid allocation each frame) --
+    /// Overlay instance scratch vec — cleared and refilled each frame.
+    pub(crate) cached_overlay_instances: Vec<crate::render::batch::SpriteInstance>,
+    /// Animated power bar — segment-by-segment transition matching original PowerClass.
+    pub(crate) power_bar_anim: crate::ui::sidebar::PowerBarAnimState,
+    /// Persistent flash + mode state for in-game sidebar gadgets. Ticked from
+    /// `sidebar_gadgets::update_sidebar_gadget_state` once per sim tick;
+    /// read each frame by the sidebar view builder to pick SHP frame indices.
+    pub(crate) sidebar_gadget_state: crate::ui::sidebar::gadget_flash::SidebarGadgetState,
+    /// In-game gadget substrate (study §6.1): retained sidebar button list +
+    /// capture/focus state + reusable tick output + the mouse-held record.
+    pub(crate) in_game_gadgets: crate::app::input::gadget_input::InGameGadgets,
+    /// Retained immutable sidebar view plus its per-owner animated credit state.
+    /// Consumers read the snapshot; explicit transitions rebuild it.
+    pub(crate) sidebar_projection: crate::app::sidebar_projection::SidebarProjectionState,
+    /// Active tab for the custom in-game sidebar.
+    pub(crate) active_sidebar_tab: SidebarTab,
+    /// Native side-specific geometry in physical render pixels.
+    pub(crate) sidebar_layout_spec: SidebarChromeLayoutSpec,
+    /// Ordinary retail artwork uses one render pixel per source pixel.
+    pub(crate) ui_scale: f32,
+    /// Shared tooltip service (study S1) — the model is clock-injected; only
+    /// `input::tooltips` reads the wall clock.
+    pub(crate) tooltips: crate::ui::tooltips::TooltipService,
+    /// Epoch for the tooltip/message wall-clock (`now_ms` = elapsed since
+    /// app construction).
+    pub(crate) tooltip_epoch: Instant,
+    /// In-game chat/system message surface (study §3.1) — re-anchored to the
+    /// tactical viewport per frame by `input::messages`.
+    pub(crate) message_list: crate::ui::messages::MessageList,
+    /// Pause-adjusted clock for message deadlines (contract §4.2 step 8 /
+    /// §4.3: the native composite timer freezes during pause). Fed pause
+    /// edges by `messages::update`.
+    pub(crate) message_clock: crate::ui::messages::PauseAwareClock,
+    /// The in-battle chat target and chat mask, beside the list whose edit
+    /// line they route.
+    pub(crate) chat: crate::app::input::chat::ChatState,
+    /// In-scenario modal state — the port of gamemd's in-scenario state
+    /// variable. Owns the in-game menu, the abort-mission confirmation and the
+    /// parent/child relationship with the `0xBBB` Options dialog.
+    pub(crate) in_game_menu: crate::ui::pause_menu::InGameMenuState,
+    /// `[0x822CFC]`, State_Machine's admission latch: `Main_Game` sets it at
+    /// each scenario start (`0x0048CE7E`) and a confirmed Abort clears it
+    /// (`0x0048CAA1`); see `App::state_machine_admission`.
+    pub(crate) modal_latch: bool,
+    pub(crate) pause_menu_has_saves: bool,
+    pub(crate) pause_menu_interaction: crate::ui::shell::pause_menu::PauseMenuInteraction,
+    /// The template 4F10E0 chose when state 1 last opened; it stays for that
+    /// dialog's lifetime.
+    pub(crate) pause_menu_template: crate::ui::shell::pause_menu::PauseMenuTemplate,
+    /// FF's trackbars (WOL in-game menu), recreated on every state-1 entry.
+    pub(crate) internet_pause: crate::app::input::pause_menu::InternetPauseControls,
+    /// What B6 init (4F1840) made of control712 when the dialog last opened;
+    /// its stored results stay for that dialog's lifetime.
+    pub(crate) abort_secondary: crate::ui::shell::abort::AbortSecondary,
+    pub(crate) sound_dialog: Option<crate::ui::shell::sound::SoundState>,
+    pub(crate) abort_buttons:
+        crate::ui::shell::button::ShellButtonInteraction<crate::ui::shell::abort::AbortButton>,
+    pub(crate) diplomacy: crate::ui::shell::diplomacy::DiplomacyInteraction,
+    /// Restate 0x10C's pointer state.
+    pub(crate) restate: crate::ui::shell::restate::RestateInteraction,
+    /// `[0xB04CA0]`: the briefing text 0x10C shows, resolved once at open.
+    pub(crate) restate_text: String,
+    pub(crate) saved_game_browser:
+        Option<crate::ui::skirmish_shell::SavedSeedBrowserState<std::path::PathBuf>>,
+    /// Client-side in-game Options (0xBBB) state: the six [Options] values plus
+    /// transient interaction flags. `game_speed` mirrors the launched sim and
+    /// queues an authoritative transition on close; `sim_speed_tps` is its local
+    /// presentation readout. App/ui-level.
+    pub(crate) in_game_options: crate::ui::shell::in_game_options_state::InGameOptionsState,
+    /// Laid-out 0xBBB anchor cached by the overlay render pass each frame it draws,
+    /// so the paused mouse handler hit-tests the exact rects that were rendered
+    /// (the sidebar-anchored button Y is render-derived; see KD-6). None until the
+    /// overlay first renders.
+    pub(crate) in_game_options_anchor: Option<crate::ui::shell::layout::InGameOptionsAnchor>,
+}
