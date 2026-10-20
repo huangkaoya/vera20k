@@ -1,11 +1,12 @@
 import type {EngineResult,Placement,Snapshot,VeraCommand,VeraConfig} from './types';
+import type { RuntimeAssets } from '../config/runtime';
 
 export class VeraEngine {
   private readonly worker=new Worker(new URL('./worker.ts',import.meta.url),{type:'module'});
   private pending=new Map<number,{resolve:(result:EngineResult)=>void;reject:(error:Error)=>void}>();
   private sequence=0;
   private disposed=false;
-  constructor(onProgress:(message:string,progress:number)=>void){
+  constructor(onProgress:(message:string,progress:number)=>void, private readonly assets: RuntimeAssets){
     this.worker.onmessage=({data})=>{
       if(data.type==='progress'){onProgress(data.message,data.progress);return;}
       const request=this.pending.get(data.id); if(!request)return;
@@ -19,7 +20,7 @@ export class VeraEngine {
   private failAll(error:Error){for(const item of this.pending.values())item.reject(error);this.pending.clear();}
   private request(request:unknown):Promise<EngineResult>{
     if(this.disposed)return Promise.reject(new Error('Simulation disposed'));
-    return new Promise((resolve,reject)=>{const id=++this.sequence;this.pending.set(id,{resolve,reject});this.worker.postMessage({id,request});});
+    return new Promise((resolve,reject)=>{const id=++this.sequence;this.pending.set(id,{resolve,reject});this.worker.postMessage({id,request,assets:this.assets,pageUrl:location.href});});
   }
   async init(config:VeraConfig):Promise<Snapshot>{const r=await this.request({op:'init',config});if(!r.snapshot)throw new Error('Missing initialized snapshot');return r.snapshot;}
   async step(commands:VeraCommand[],ticks=1):Promise<Snapshot>{const r=await this.request({op:'tick',commands,ticks});if(!r.snapshot)throw new Error('Missing simulation snapshot');return r.snapshot;}

@@ -64,6 +64,12 @@ export async function createDevServer({ port = Number(process.env.PORT ?? 5280),
           resources: resourceIndex ? { count: resourceIndex.manifest.files.length, bytes: resourceIndex.manifest.totalBytes } : null,
           error: resourceError ? '无法读取本地零售游戏资源，请设置 VERA_ASSET_ROOT。' : undefined }); return;
       }
+      if (url.pathname === '/api/config') {
+        const origin = `http://${host}:${server.address().port}`;
+        json(response, 200, {schema: 1, assets: {manifestUrl: `${origin}/generated/catalog.json`,
+          wasmUrl: `${origin}/wasm/vera_web_core.wasm`, resourceManifestUrl: `${origin}/api/resources`},
+          network: {lobbyUrl: `${origin.replace('http:', 'ws:')}/ws/rooms`}}); return;
+      }
       if (url.pathname === '/api/resources') {
         if (request.method !== 'GET' && request.method !== 'HEAD') { response.writeHead(405, { Allow: 'GET, HEAD' }); response.end(); return; }
         if (!resourceIndex) { json(response, 503, { error: '本地游戏资源不可用。' }); return; }

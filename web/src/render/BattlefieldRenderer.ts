@@ -1,4 +1,6 @@
 import type { AssetsManifest, BuildingPlacement, MapAsset, SpriteAsset, SpriteFrame, VeraEntity, VeraSnapshot } from './types';
+import { resolveHttpUrl } from '../config/runtime';
+import { resolveArtManifest } from './urls';
 export type { AssetsManifest, BuildingPlacement, MapAsset, SpriteAsset, VeraEntity, VeraSnapshot } from './types';
 
 // Fallback ordering is the native lobby priority: yellow, red, blue, green,
@@ -30,12 +32,11 @@ export class BattlefieldRenderer {
   private dpr = 1;
   private selectionRect: { x1: number; y1: number; x2: number; y2: number } | undefined;
 
-  static async loadManifest(url = '/generated/manifest.json'): Promise<AssetsManifest> {
-    const response = await fetch(url);
+  static async loadManifest(url: string): Promise<AssetsManifest> {
+    const manifestUrl = resolveHttpUrl(url, location.href);
+    const response = await fetch(manifestUrl);
     if (!response.ok) throw new Error(`读取地图美术失败：${response.status}`);
-    const manifest = await response.json() as AssetsManifest;
-    if (manifest.schema !== 1 || !manifest.maps.length) throw new Error('地图美术版本无效，请运行资源编译脚本');
-    return manifest;
+    return resolveArtManifest(await response.json(), response.url || manifestUrl, location.href);
   }
   constructor(canvas: HTMLCanvasElement, manifest: AssetsManifest) {
     this.canvas = canvas; this.manifest = manifest;
@@ -300,7 +301,7 @@ export class BattlefieldRenderer {
     const pending = this.pending.get(url); if (pending) return pending;
     const promise = new Promise<HTMLImageElement>((resolve, reject) => {
       const image = new Image(); image.onload = () => { this.images.set(url, image); this.pending.delete(url); resolve(image); };
-      image.onerror = () => { this.pending.delete(url); reject(new Error(`无法加载游戏美术 ${url}`)); }; image.src = url;
+      image.onerror = () => { this.pending.delete(url); reject(new Error(`无法加载游戏美术 ${url}`)); }; image.crossOrigin = 'anonymous'; image.src = url;
     });
     this.pending.set(url, promise); return promise;
   }

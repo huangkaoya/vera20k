@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "web": { "host": "127.0.0.1", "port": 5280, "publicUrl": "https://game.example.com" },
+  "resources": { "host": "127.0.0.1", "port": 5281, "publicUrl": "https://assets.example.com/vera" },
+  "lobby": { "host": "127.0.0.1", "port": 5282, "publicUrl": "https://lobby.example.com" },
+  "battle": { "host": "127.0.0.1", "port": 5283, "publicUrl": "https://battle.example.com", "internalUrl": "http://127.0.0.1:5283" }
+}

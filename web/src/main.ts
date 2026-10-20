@@ -5,8 +5,10 @@ import type { AssetsManifest } from './render/types';
 import { VeraEngine } from './engine/VeraEngine';
 import { engineConfig } from './engine/config';
 import type { Snapshot, VeraCommand } from './engine/types';
+import { loadRuntimeConfig, type RuntimeConfig } from './config/runtime';
 
 let manifest: AssetsManifest;
+let runtime: RuntimeConfig;
 let engine: VeraEngine | undefined;
 let renderer: BattlefieldRenderer | undefined;
 let snapshot: Snapshot | undefined;
@@ -87,10 +89,11 @@ function accept(next: Snapshot): void {
   updateHud();
 }
 async function start(config: SkirmishConfig, viewPlayer = 0, multiplayer = false): Promise<void> {
+  if(!runtime || !manifest){ui.notify('运行配置和游戏资源仍在载入，请稍后重试。',true);return;}
   leave(false); const token = ++generation;
   frameInterval=[16,33,50,66,83,100,125][config.gameSpeed] ?? 66;
   ui.showLoading('正在准备 VERA WASM 引擎…',0); message='';
-  const next = new VeraEngine((text,progress) => {if(token === generation)ui.setLoadProgress(text,progress);}); engine=next;
+  const next = new VeraEngine((text,progress) => {if(token === generation)ui.setLoadProgress(text,progress);}, runtime.assets); engine=next;
   try {
     const state = await next.init(engineConfig(config,viewPlayer)); if(token !== generation)return;
     ui.showBattle(); renderer = new BattlefieldRenderer(ui.canvas,manifest); renderer.setMap(config.mapId);
@@ -212,6 +215,7 @@ Object.defineProperty(window,'__veraWeb',{value:Object.freeze({
 import { RoomClient } from './network/RoomClient';
 let room: RoomClient | undefined;
 async function connectRoom():Promise<RoomClient>{
+  if(!runtime)throw new Error('运行配置仍在载入，请稍后重试。');
   if(room){await room.connect();return room;}
   const client=new RoomClient({
     onRoom:state=>ui.setRoom(state), onError:error=>{ui.notify(error,true);if(running)fail(error);},
@@ -232,7 +236,7 @@ async function connectRoom():Promise<RoomClient>{
       if(wasPlaying){message=reason;updateHud();renderer?.render();}else{snapshot=undefined;renderer=undefined;ui.showLobby();}
       ui.notify(reason,true);
     },
-  });
+  }, runtime.network.lobbyUrl);
   room=client;leaveRoom=()=>disconnectRoom();
   try{await client.connect();return client;}catch(error){if(room===client)disconnectRoom();throw error;}
 }
@@ -241,10 +245,11 @@ async function joinRoom(code:string){try{await(await connectRoom()).join(code,ui
 function disconnectRoom(){room?.close();room=undefined;roomTick=undefined;leaveRoom=undefined;ui.setRoom(null);}
 
 try {
-  manifest=await BattlefieldRenderer.loadManifest('/generated/catalog.json');
+  runtime=await loadRuntimeConfig();
+  manifest=await BattlefieldRenderer.loadManifest(runtime.assets.manifestUrl);
   ui.setCatalog({
     maps:manifest.maps.map(map=>({id:map.id,name:map.title,maxPlayers:map.starts.length,previewUrl:map.minimap,size:`${map.localWidth} × ${map.localHeight}`})),
     countries:[['America','美国'],['Korea','韩国'],['France','法国'],['Germany','德国'],['GreatBritain','英国'],['Russia','苏俄'],['Iraq','伊拉克'],['Cuba','古巴'],['Libya','利比亚'],['Yuri','尤里']].map(([id,name])=>({id,name})),
     colors:['黄色','红色','蓝色','绿色','橙色','青色','紫色','粉色'].map((name,id)=>({id,name,hex:['#f3d548','#ed4545','#5086f0','#57b85b','#ed9d43','#58d0ce','#ae68db','#e778bf'][id]})),
   });
-} catch(error){ui.notify(`资源尚未准备好：${error instanceof Error?error.message:String(error)}。请运行 npm run build。`,true);}
+} catch(error){ui.notify(`运行配置或游戏资源载入失败：${error instanceof Error?error.message:String(error)}`,true);}

@@ -5,6 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "node tools/dev-server.mjs",
+    "dev:stack": "node tools/run-stack.mjs --dev",
+    "start:stack": "node tools/run-stack.mjs",
+    "serve:web": "node tools/service.mjs web",
+    "serve:resources": "node tools/service.mjs resources",
+    "serve:lobby": "node tools/service.mjs lobby",
+    "serve:battle": "node tools/service.mjs battle",
     "typecheck": "tsc --noEmit",
     "build:wasm": "node tools/build-wasm.mjs",
     "build:assets": "node tools/build-assets.mjs",

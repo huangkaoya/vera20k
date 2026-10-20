@@ -1,10 +1,9 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-const COMMAND_KINDS = new Set(['select', 'move', 'attack', 'deploy', 'queue', 'produce', 'place', 'cancel', 'cancelProduction', 'stop', 'guard', 'sell', 'repair', 'scatter', 'attackMove', 'forceAttack']);
+import { bindCommands as safeCommands, ensure, isStateHash as isHash } from './services/protocol.mjs';
+import { originAllowed } from './services/common.mjs';
 const clone = value => JSON.parse(JSON.stringify(value));
 const cleanName = value => typeof value === 'string' && value.trim() ? value.trim().slice(0, 24) : '指挥官';
-const isHash = value => typeof value === 'string' && /^[\da-z:_-]{1,128}$/i.test(value);
-function ensure(condition, message) { if (!condition) throw new Error(message); }
 function roomConfig(value, maxPlayers) {
   ensure(value && typeof value === 'object' && !Array.isArray(value), '无效的房间设置');
   ensure(typeof value.mapId === 'string' && value.mapId.length > 0 && value.mapId.length < 128, '请选择有效地图');
@@ -22,10 +21,15 @@ function roomConfig(value, maxPlayers) {
 /** Local-only experimental lockstep rooms. No WOL / production WERHD protocol is implemented. */
 export function attachRooms(server, {
   path = '/ws/rooms', getMapLimit = () => 8,
-  loadingTimeoutMs = 120000, turnTimeoutMs = 30000,
+  loadingTimeoutMs = 120000, turnTimeoutMs = 30000, createMatch, cancelMatch, allowedOrigins,
 } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
-  const rooms = new Map(), clients = new Set();
+  const rooms = new Map(), clients = new Set(), pendingHooks = new Set();
+  let closed = false;
+  function track(promise) {
+    pendingHooks.add(promise); promise.then(() => pendingHooks.delete(promise), () => pendingHooks.delete(promise)); return promise;
+  }
+  function cancel(matchId, reason) { if (matchId && cancelMatch) track(Promise.resolve().then(() => cancelMatch(matchId, reason)).catch(() => {})); }
   function send(client, message) {
     if (client.ws.readyState === WebSocket.OPEN) client.ws.send(JSON.stringify(message));
   }
@@ -34,7 +38,7 @@ export function attachRooms(server, {
     return { code: room.code, isHost: room.host === client.id, localMemberId: client.id,
       members: room.members.map(member => ({ id: member.id, name: member.name, ready: member.ready, host: member.id === room.host, slot: member.slot })),
       canStart: room.phase === 'lobby' && room.members.length >= 2 && room.members.every(member => member.id === room.host || member.ready),
-      config: clone(room.config), status: room.phase === 'lobby' ? '分享房间号，在本机的另一浏览器窗口加入。' : room.phase === 'loading' ? '等待所有指挥官完成战场部署…' : '对战进行中',
+      config: clone(room.config), status: room.phase === 'lobby' ? '分享房间号，在本机的另一浏览器窗口加入。' : room.phase === 'creating' || room.phase === 'loading' ? '等待所有指挥官完成战场部署…' : room.phase === 'transferred' ? '对战由独立服务运行。' : '对战进行中',
     };
   }
   function update(room) { for (const member of room.members) send(member, { type: 'room', room: view(room, member) }); }
@@ -49,9 +53,12 @@ export function attachRooms(server, {
   }
   function clearTimeouts(room) { if (room.timeout) clearTimeout(room.timeout); room.timeout = undefined; }
   function stop(room, reason) {
+    if (room.phase === 'stopped') return;
+    const matchId = room.matchId; room.matchId = undefined;
     clearTimeouts(room); rooms.delete(room.code);
     for (const member of room.members) { member.room = null; member.ready = false; send(member, { type: 'stopped', reason }); send(member, { type: 'room', room: null }); }
     room.phase = 'stopped'; room.members = []; room.frames.clear(); room.loaded.clear();
+    cancel(matchId, reason);
   }
   function arm(room, ms, reason) { clearTimeouts(room); room.timeout = setTimeout(() => stop(room, reason), ms); room.timeout.unref?.(); }
   function leave(client) {
@@ -69,13 +76,6 @@ export function attachRooms(server, {
     return client.room;
   }
   function humanOrder(room) { return [...room.members].sort((a, b) => a.slot - b.slot); }
-  function safeCommands(value, player) {
-    ensure(Array.isArray(value) && value.length <= 256, '每帧最多提交 256 条指令');
-    return value.map(command => {
-      ensure(command && typeof command === 'object' && !Array.isArray(command) && COMMAND_KINDS.has(command.kind), '不支持的作战指令');
-      const data = clone(command); data.player = player; return data;
-    });
-  }
   async function message(client, data) {
     let request;
     try {
@@ -111,9 +111,28 @@ export function attachRooms(server, {
       } else if (type === 'start') {
         const room = requireRoom(client, 'lobby'); ensure(room.host === client.id, '只有房主可以开始对战');
         ensure(room.members.length >= 2 && room.members.every(member => member.id === room.host || member.ready), '请等待所有玩家准备');
-        normalizeHumans(room); room.phase = 'loading'; room.loaded.clear(); room.frames.clear();
-        humanOrder(room).forEach((member, playerIndex) => send(member, { type: 'start', config: clone(room.config), playerIndex, roomCode: room.code }));
-        arm(room, loadingTimeoutMs, '等待战场部署超时，对战已停止。'); update(room);
+        normalizeHumans(room); room.loaded.clear(); room.frames.clear();
+        if (createMatch) {
+          room.phase = 'creating'; update(room);
+          const humans = humanOrder(room);
+          try {
+            const match = await track(Promise.resolve().then(() => createMatch({ roomCode: room.code, config: clone(room.config),
+              members: humans.map((member, playerIndex) => ({ id: member.id, name: member.name, playerIndex })) })));
+            if (rooms.get(room.code) !== room || room.phase !== 'creating' || closed) { cancel(match?.matchId, '大厅房间已关闭。'); return; }
+            room.matchId = match?.matchId;
+            ensure(typeof match?.matchId === 'string' && typeof match.url === 'string' && Array.isArray(match.players), '无效的对战服务响应');
+            const tickets = humans.map((member, playerIndex) => match.players.find(player => player.id === member.id && player.playerIndex === playerIndex));
+            ensure(tickets.every(player => typeof player?.ticket === 'string' && player.ticket.length > 0), '对战服务没有提供完整玩家凭据');
+            room.phase = 'transferred';
+            humans.forEach((member, playerIndex) => send(member, { type: 'start', config: clone(room.config), playerIndex, roomCode: room.code,
+              battle: { url: match.url, matchId: match.matchId, ticket: tickets[playerIndex].ticket } }));
+            update(room);
+          } catch (error) { if (rooms.get(room.code) === room) stop(room, '无法创建独立对战，请重新建立房间。'); throw error; }
+        } else {
+          room.phase = 'loading';
+          humanOrder(room).forEach((member, playerIndex) => send(member, { type: 'start', config: clone(room.config), playerIndex, roomCode: room.code }));
+          arm(room, loadingTimeoutMs, '等待战场部署超时，对战已停止。'); update(room);
+        }
       } else if (type === 'loaded') {
         const room = requireRoom(client, 'loading');
         ensure(isHash(request.hash) && Number.isSafeInteger(request.tick) && request.tick >= 0, '无效的初始状态校验');
@@ -151,12 +170,7 @@ export function attachRooms(server, {
   function upgrade(request, socket, head) {
     const requestPath = new URL(request.url ?? '/', 'http://localhost').pathname;
     if (requestPath !== path) return;
-    if (request.headers.origin) {
-      try {
-        const origin = new URL(request.headers.origin);
-        if (!['127.0.0.1', 'localhost', '[::1]'].includes(origin.hostname)) { socket.destroy(); return; }
-      } catch { socket.destroy(); return; }
-    }
+    if (!originAllowed(request.headers.origin, allowedOrigins)) { socket.destroy(); return; }
     wss.handleUpgrade(request, socket, head, ws => wss.emit('connection', ws, request));
   }
   server.on('upgrade', upgrade);
@@ -177,9 +191,11 @@ export function attachRooms(server, {
   return {
     get roomCount() { return rooms.size; },
     async close() {
+      if (closed) return; closed = true;
       clearInterval(heartbeat); server.off('upgrade', upgrade);
       for (const room of [...rooms.values()]) stop(room, '本地联调服务已停止。');
       for (const client of clients) client.ws.terminate();
+      while (pendingHooks.size) await Promise.allSettled([...pendingHooks]);
       await new Promise(resolve => wss.close(resolve));
     },
   };

@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
-import type { EngineResult, ResourceManifest } from './types';
+import type { EngineResult } from './types';
+import { resolveHttpUrl, resolveResourceManifest, type RuntimeAssets } from '../config/runtime';
 
 type Exports = {
   memory: WebAssembly.Memory;
@@ -24,16 +25,18 @@ function call(request:unknown):EngineResult {
   try { phase=`执行 ${(request as {op?:string}).op ?? 'request'}`;api.vw_call(ptr,data.length);phase='解析引擎响应';return result(); }
   finally {api.vw_dealloc(ptr,data.length);}
 }
-async function load():Promise<void> {
+async function load(assets:RuntimeAssets,pageUrl:string):Promise<void> {
   if(api)return;
   self.postMessage({type:'progress',message:'正在载入游戏引擎',progress:0});
-  const response=await fetch('/wasm/vera_web_core.wasm');
+  const wasmUrl=resolveHttpUrl(assets.wasmUrl,pageUrl,pageUrl);
+  const response=await fetch(wasmUrl);
   if(!response.ok)throw new Error(`WASM build missing (${response.status}); run npm run build:wasm`);
   phase='编译 WASM';const module=await WebAssembly.instantiate(await response.arrayBuffer(),{});
   api=module.instance.exports as unknown as Exports;
-  const manifestResponse=await fetch('/api/resources');
+  const resourceManifestUrl=resolveHttpUrl(assets.resourceManifestUrl,pageUrl,pageUrl);
+  const manifestResponse=await fetch(resourceManifestUrl);
   if(!manifestResponse.ok)throw new Error('本地游戏资源不可用，请检查资源目录');
-  const manifest:ResourceManifest=await manifestResponse.json();
+  const manifest=resolveResourceManifest(await manifestResponse.json(),manifestResponse.url || resourceManifestUrl,pageUrl);
   let completed=0;
   for(const file of manifest.files){
     phase=`读取资源 ${file.name}`;
@@ -54,10 +57,10 @@ async function load():Promise<void> {
   self.postMessage({type:'progress',message:'正在部署战场',progress:1});
 }
 let queue=Promise.resolve();
-self.onmessage=(event:MessageEvent<{id:number;request:unknown}>)=>{
+self.onmessage=(event:MessageEvent<{id:number;request:unknown;assets:RuntimeAssets;pageUrl:string}>)=>{
   queue=queue.then(async()=>{
     try {
-      await load();
+      await load(event.data.assets,event.data.pageUrl);
       const answer=call(event.data.request);
       self.postMessage({id:event.data.id,result:answer});
     } catch(error) {
