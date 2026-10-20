@@ -93,7 +93,8 @@ pub struct MixArchive {
 
 #[derive(Clone)]
 enum MixBytes {
-    Owned(Arc<[u8]>),
+    Owned(Arc<Vec<u8>>),
+    #[cfg(not(target_arch = "wasm32"))]
     Mapped(Arc<memmap2::Mmap>),
 }
 
@@ -106,7 +107,7 @@ struct MixData {
 
 impl MixData {
     fn from_owned(data: Vec<u8>) -> Self {
-        let bytes: Arc<[u8]> = data.into();
+        let bytes = Arc::new(data);
         let len = bytes.len();
         Self {
             bytes: MixBytes::Owned(bytes),
@@ -115,6 +116,7 @@ impl MixData {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn from_mapped(map: memmap2::Mmap) -> Self {
         let bytes = Arc::new(map);
         let len = bytes.len();
@@ -128,6 +130,7 @@ impl MixData {
     fn as_slice(&self) -> &[u8] {
         let bytes = match &self.bytes {
             MixBytes::Owned(data) => &data[..],
+            #[cfg(not(target_arch = "wasm32"))]
             MixBytes::Mapped(map) => &map[..],
         };
         &bytes[self.start..self.start + self.len]
@@ -240,10 +243,18 @@ impl MixArchive {
     }
 
     /// Load a MIX archive from a file path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(path: &Path) -> Result<Self, AssetError> {
         let file = File::open(path)?;
         let data = unsafe { memmap2::MmapOptions::new().map(&file)? };
         Self::from_data(MixData::from_mapped(data))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn load(_path: &Path) -> Result<Self, AssetError> {
+        Err(AssetError::AssetNotFound {
+            name: "filesystem unavailable in browser; register memory assets".into(),
+        })
     }
 
     /// Look up a file by name. Returns the raw bytes if found.

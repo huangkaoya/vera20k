@@ -376,156 +376,151 @@ fn flood_fill_node_index(
     height: u16,
     edge_buckets: &mut BaseEdgeBuckets,
 ) -> i32 {
-    let start_idx = start_y as usize * width as usize + start_x as usize;
-    let movement_class = movement_classes[start_idx];
-    let seed_x = i32::from(start_x);
-    let seed_y = i32::from(start_y);
-    let Some(mut carried_level) = base_level_at(levels, seed_x, seed_y, width, height) else {
-        return 0;
-    };
-
-    // The native scan first walks left with a carried <=1 height reference.
-    // Horizontal scans overwrite prior zone IDs; only vertical recursion tests
-    // for an unassigned candidate.
-    let mut left = seed_x;
-    while let Some(index) = base_record_index(left, seed_y, width, height) {
-        if movement_classes[index] != movement_class {
-            break;
-        }
-        let Some(level) = base_level_at(levels, left, seed_y, width, height) else {
-            break;
-        };
-        if (i16::from(level) - i16::from(carried_level)).abs() >= 2 {
-            break;
-        }
-        node_indices[index] = node_id;
-        carried_level = level;
-        left -= 1;
+    // Keep the native depth-first scanline traversal, including the different
+    // above/below return advances, on a heap stack. Large connected retail maps
+    // exhaust JavaScriptCore's machine call stack with the recursive form.
+    struct Frame {
+        seed_x: i32,
+        seed_y: i32,
+        movement_class: u8,
+        left: i32,
+        right: i32,
+        scan_x: i32,
+        below: bool,
     }
-    register_scanline_edge(
-        edge_buckets,
-        left,
-        seed_y,
-        left + 1,
-        seed_y,
-        node_id,
-        movement_class,
-        node_indices,
-        levels,
-        width,
-        height,
-    );
 
-    // Right starts at the seed but retains the level carried out of the left
-    // scan. The retail comparison is strictly <4.
-    let mut right = seed_x;
-    while let Some(index) = base_record_index(right, seed_y, width, height) {
-        if movement_classes[index] != movement_class {
-            break;
-        }
-        let Some(level) = base_level_at(levels, right, seed_y, width, height) else {
-            break;
-        };
-        if (i16::from(level) - i16::from(carried_level)).abs() >= 4 {
-            break;
-        }
-        node_indices[index] = node_id;
-        carried_level = level;
-        right += 1;
-    }
-    register_scanline_edge(
-        edge_buckets,
-        right,
-        seed_y,
-        right - 1,
-        seed_y,
-        node_id,
-        movement_class,
-        node_indices,
-        levels,
-        width,
-        height,
-    );
+    let mut frames = Vec::<Frame>::new();
+    let mut pending_seed = Some((start_x, start_y));
+    loop {
+        if let Some((start_x, start_y)) = pending_seed.take() {
+            let start_idx = start_y as usize * width as usize + start_x as usize;
+            let movement_class = movement_classes[start_idx];
+            let seed_x = i32::from(start_x);
+            let seed_y = i32::from(start_y);
+            let Some(mut carried_level) = base_level_at(levels, seed_x, seed_y, width, height)
+            else {
+                if let Some(parent) = frames.last_mut() {
+                    parent.scan_x += i32::from(!parent.below);
+                    continue;
+                }
+                return 0;
+            };
 
-    // Both adjacent-row scans include the two flanks [L-1, R+1]. Their
-    // current-row reference is one cell right, clamped to R.
-    let mut scan_x = left;
-    let run_right = right - 1;
-    while scan_x <= right {
-        let candidate_y = seed_y - 1;
-        let reference_x = (scan_x + 1).min(run_right);
+            // Horizontal scans overwrite prior IDs. Retain the carried level
+            // from the left scan when restarting at the seed to scan right.
+            let mut left = seed_x;
+            while let Some(index) = base_record_index(left, seed_y, width, height) {
+                if movement_classes[index] != movement_class {
+                    break;
+                }
+                let Some(level) = base_level_at(levels, left, seed_y, width, height) else {
+                    break;
+                };
+                if (i16::from(level) - i16::from(carried_level)).abs() >= 2 {
+                    break;
+                }
+                node_indices[index] = node_id;
+                carried_level = level;
+                left -= 1;
+            }
+            register_scanline_edge(
+                edge_buckets,
+                left,
+                seed_y,
+                left + 1,
+                seed_y,
+                node_id,
+                movement_class,
+                node_indices,
+                levels,
+                width,
+                height,
+            );
+
+            let mut right = seed_x;
+            while let Some(index) = base_record_index(right, seed_y, width, height) {
+                if movement_classes[index] != movement_class {
+                    break;
+                }
+                let Some(level) = base_level_at(levels, right, seed_y, width, height) else {
+                    break;
+                };
+                if (i16::from(level) - i16::from(carried_level)).abs() >= 4 {
+                    break;
+                }
+                node_indices[index] = node_id;
+                carried_level = level;
+                right += 1;
+            }
+            register_scanline_edge(
+                edge_buckets,
+                right,
+                seed_y,
+                right - 1,
+                seed_y,
+                node_id,
+                movement_class,
+                node_indices,
+                levels,
+                width,
+                height,
+            );
+            frames.push(Frame {
+                seed_x,
+                seed_y,
+                movement_class,
+                left,
+                right,
+                scan_x: left,
+                below: false,
+            });
+        }
+
+        let frame = frames.last_mut().expect("active flood-fill frame");
+        if frame.scan_x > frame.right {
+            if !frame.below {
+                frame.below = true;
+                frame.scan_x = frame.left;
+                continue;
+            }
+            let child_advance = frame.right - frame.seed_x - 1;
+            frames.pop();
+            if let Some(parent) = frames.last_mut() {
+                // Above advances past the child's rightmost run cell. Below
+                // rechecks that cell, exactly as the recursive native walk.
+                parent.scan_x += child_advance + i32::from(!parent.below);
+                continue;
+            }
+            return child_advance;
+        }
+
+        // Both rows include the flanks. The reference is one cell right,
+        // clamped to the current run's rightmost cell.
+        let candidate_y = frame.seed_y + if frame.below { 1 } else { -1 };
+        let reference_x = (frame.scan_x + 1).min(frame.right - 1);
         if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
-            base_record_index(scan_x, candidate_y, width, height),
-            base_level_at(levels, scan_x, candidate_y, width, height),
-            base_level_at(levels, reference_x, seed_y, width, height),
+            base_record_index(frame.scan_x, candidate_y, width, height),
+            base_level_at(levels, frame.scan_x, candidate_y, width, height),
+            base_level_at(levels, reference_x, frame.seed_y, width, height),
         ) {
             let neighbor = node_indices[candidate];
             let height_allowed =
                 (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2;
-            if neighbor == 0 && movement_classes[candidate] == movement_class && height_allowed {
-                let child_advance = flood_fill_node_index(
-                    scan_x as u16,
-                    candidate_y as u16,
-                    node_id,
-                    movement_classes,
-                    node_indices,
-                    levels,
-                    width,
-                    height,
-                    edge_buckets,
-                );
-                // Above advances beyond the returned child run.
-                scan_x += child_advance + 1;
+            if neighbor == 0
+                && movement_classes[candidate] == frame.movement_class
+                && height_allowed
+            {
+                pending_seed = Some((frame.scan_x as u16, candidate_y as u16));
                 continue;
             } else if neighbor != 0
                 && neighbor != node_id
-                && (height_allowed || movement_class == zone_class::IMPASSABLE)
+                && (height_allowed || frame.movement_class == zone_class::IMPASSABLE)
             {
                 edge_buckets.register(neighbor, node_id);
             }
         }
-        scan_x += 1;
+        frame.scan_x += 1;
     }
-
-    // Below uses the same range/reference mapping, but rechecks the returned
-    // child run's rightmost cell once before advancing.
-    scan_x = left;
-    while scan_x <= right {
-        let candidate_y = seed_y + 1;
-        let reference_x = (scan_x + 1).min(run_right);
-        if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
-            base_record_index(scan_x, candidate_y, width, height),
-            base_level_at(levels, scan_x, candidate_y, width, height),
-            base_level_at(levels, reference_x, seed_y, width, height),
-        ) {
-            let neighbor = node_indices[candidate];
-            let height_allowed =
-                (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2;
-            if neighbor == 0 && movement_classes[candidate] == movement_class && height_allowed {
-                let child_advance = flood_fill_node_index(
-                    scan_x as u16,
-                    candidate_y as u16,
-                    node_id,
-                    movement_classes,
-                    node_indices,
-                    levels,
-                    width,
-                    height,
-                    edge_buckets,
-                );
-                scan_x += child_advance;
-                continue;
-            } else if neighbor != 0
-                && neighbor != node_id
-                && (height_allowed || movement_class == zone_class::IMPASSABLE)
-            {
-                edge_buckets.register(neighbor, node_id);
-            }
-        }
-        scan_x += 1;
-    }
-
-    right - seed_x - 1
 }
 
 fn base_record_index(x: i32, y: i32, width: u16, height: u16) -> Option<usize> {

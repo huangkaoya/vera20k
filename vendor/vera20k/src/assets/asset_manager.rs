@@ -28,11 +28,11 @@ struct NamedArchive {
     archive: MixArchive,
 }
 
-#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
+#[derive(Clone)]
 struct LooseAsset {
     path: PathBuf,
     source_name: String,
-    bytes: OnceLock<Option<Box<[u8]>>>,
+    bytes: OnceLock<Option<Arc<Vec<u8>>>>,
 }
 
 impl LooseAsset {
@@ -44,13 +44,14 @@ impl LooseAsset {
     fn bytes(&self) -> Option<&[u8]> {
         self.bytes
             .get_or_init(|| match std::fs::read(&self.path) {
-                Ok(bytes) => Some(bytes.into_boxed_slice()),
+                Ok(bytes) => Some(Arc::new(bytes)),
                 Err(err) => {
                     log::debug!("Skipping loose {}: {}", self.path.display(), err);
                     None
                 }
             })
-            .as_deref()
+            .as_ref()
+            .map(|bytes| bytes.as_slice())
     }
 }
 
@@ -125,15 +126,14 @@ pub fn load_audio_index_pair(
 
 /// A frozen resolver winner, not another archive search list. Archive storage
 /// stays on the manager; loose bytes stay in its existing OnceLock snapshot.
-#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
+#[derive(Clone)]
 struct SelectedAudioFile {
     source_archive: String,
     entry_id: i32,
     loose_name: Option<String>,
 }
 
-#[derive(Default)]
-#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
+#[derive(Default, Clone)]
 struct SelectedAudioPair {
     idx: Option<SelectedAudioFile>,
     bag: Option<SelectedAudioFile>,
@@ -186,6 +186,8 @@ pub struct MixFileLoad {
 /// and theater-dependent assets want current-resolution; anything mirroring
 /// the native `LoadFileFromMIX` contract wants the sticky path.
 pub struct AssetManager {
+    /// Browser-owned top-level archives; shared storage survives match reloads.
+    memory_sources: HashMap<String, MixArchive>,
     /// Loaded MIX archives in search priority order.
     archives: Vec<NamedArchive>,
     /// Parsed, named nested MIX archives that retail has not registered yet.
@@ -212,10 +214,10 @@ pub struct AssetManager {
 /// bytes and starts with the same registrations, lookups, caches and loose
 /// snapshots as the original. Production code holds one manager and never
 /// copies it.
-#[cfg(any(test, feature = "test-support"))]
 impl Clone for AssetManager {
     fn clone(&self) -> Self {
         Self {
+            memory_sources: self.memory_sources.clone(),
             archives: self.archives.clone(),
             archive_catalog: self.archive_catalog.clone(),
             lookup_index: self.lookup_index.clone(),
@@ -306,6 +308,7 @@ impl AssetManager {
     /// existing load_all_disk_mixes widening. Not a gameplay constructor.
     pub fn from_ini_probe_root(ra2_dir: &Path) -> Result<Self, AssetError> {
         Ok(Self {
+            memory_sources: HashMap::new(),
             archives: Vec::new(),
             archive_catalog: Vec::new(),
             lookup_index: HashMap::new(),
@@ -327,7 +330,8 @@ impl AssetManager {
 
     /// Load the core runtime archive stack for one native media-selection mode.
     pub fn new(ra2_dir: &Path, media_mode: MediaArchiveMode) -> Result<Self, AssetError> {
-        let mut manager = Self {
+        let manager = Self {
+            memory_sources: HashMap::new(),
             archives: Vec::new(),
             archive_catalog: Vec::new(),
             lookup_index: HashMap::new(),
@@ -339,6 +343,53 @@ impl AssetManager {
             ra2_dir: ra2_dir.to_path_buf(),
         };
 
+        manager.initialize_archive_stack(media_mode, true)
+    }
+
+    /// Build the same native archive stack from owned browser file buffers.
+    /// MIX storage is Arc-backed and never copied while mounting nested archives.
+    pub fn from_memory_files(
+        files: Vec<(String, Vec<u8>)>,
+        media_mode: MediaArchiveMode,
+    ) -> Result<Self, AssetError> {
+        let mut manager = Self {
+            memory_sources: HashMap::new(),
+            archives: Vec::new(),
+            archive_catalog: Vec::new(),
+            lookup_index: HashMap::new(),
+            mix_file_cache: Mutex::new(HashMap::new()),
+            loose_files: HashMap::new(),
+            audio_pair: SelectedAudioPair::default(),
+            active_theater: None,
+            active_theater_archives: Vec::new(),
+            ra2_dir: PathBuf::from("/memory"),
+        };
+        for (name, bytes) in files {
+            let key = name.to_ascii_lowercase();
+            if key.ends_with(".mix") {
+                manager
+                    .memory_sources
+                    .insert(key, MixArchive::from_bytes(bytes)?);
+            } else {
+                manager.loose_files.insert(
+                    key,
+                    LooseAsset {
+                        path: PathBuf::from(&name),
+                        source_name: name,
+                        bytes: OnceLock::from(Some(Arc::new(bytes))),
+                    },
+                );
+            }
+        }
+        manager.initialize_archive_stack(media_mode, false)
+    }
+
+    fn initialize_archive_stack(
+        mut self,
+        media_mode: MediaArchiveMode,
+        presentation_media: bool,
+    ) -> Result<Self, AssetError> {
+        let manager = &mut self;
         // WinMain registers the YR language archive before the RA2 fallback.
         manager.mount_named_archive("langmd.mix", false)?;
         manager.mount_named_archive("language.mix", false)?;
@@ -378,14 +429,18 @@ impl AssetManager {
 
         manager.mount_native_map_media(media_mode)?;
         manager.mount_named_archive("multimd.mix", true)?;
-        manager.mount_named_archive("thememd.mix", false)?;
-        // VERA presentation extension: native YR mounts THEME.MIX only when
-        // THEMEMD.MIX is absent. Keep MD first, then make original RA2 music
-        // available to the shared Theme catalog without displacing YR files.
-        // Preserve this user-requested parity exception during future parity
-        // work unless the user explicitly asks to change the music catalog.
-        manager.mount_named_archive("theme.mix", false)?;
-        manager.mount_native_movie_media(media_mode)?;
+        // The memory constructor is the explicit GPU-free simulation policy:
+        // movies and music have no gameplay reader and need not be transferred.
+        if presentation_media {
+            manager.mount_named_archive("thememd.mix", false)?;
+            // VERA presentation extension: native YR mounts THEME.MIX only when
+            // THEMEMD.MIX is absent. Keep MD first, then make original RA2 music
+            // available to the shared Theme catalog without displacing YR files.
+            // Preserve this user-requested parity exception during future parity
+            // work unless the user explicitly asks to change the music catalog.
+            manager.mount_named_archive("theme.mix", false)?;
+            manager.mount_native_movie_media(media_mode)?;
+        }
 
         // Loose YRO archives are deliberately absent here. Retail registers
         // each one during SessionClass scenario enumeration, immediately
@@ -404,7 +459,7 @@ impl AssetManager {
             );
         }
 
-        Ok(manager)
+        Ok(self)
     }
 
     /// Freeze the independent CCFile winners at native AudioIndex construction.
@@ -830,6 +885,12 @@ impl AssetManager {
     /// to ASCII case. Read from disk at each call; not part of the startup
     /// loose catalog, which holds top-level files only.
     pub fn read_install_file(&self, relative: &str) -> Option<Vec<u8>> {
+        if !self.memory_sources.is_empty() {
+            return self
+                .loose_asset(&relative.replace('\\', "/"))
+                .and_then(LooseAsset::bytes)
+                .map(<[u8]>::to_vec);
+        }
         let mut path = self.ra2_dir.clone();
         for component in relative.split(['\\', '/']).filter(|part| !part.is_empty()) {
             let exact = path.join(component);
@@ -1024,6 +1085,14 @@ impl AssetManager {
             .iter()
             .any(|archive| archive_name_matches(&archive.name, name))
         {
+            return Ok(true);
+        }
+
+        if let Some(archive) = self.memory_sources.get(&name.to_ascii_lowercase()).cloned() {
+            self.append_registered_archive(NamedArchive {
+                name: name.to_owned(),
+                archive,
+            });
             return Ok(true);
         }
 
@@ -1382,6 +1451,7 @@ mod tests {
 
     fn empty_manager(ra2_dir: &Path) -> AssetManager {
         AssetManager {
+            memory_sources: HashMap::new(),
             archives: Vec::new(),
             archive_catalog: Vec::new(),
             lookup_index: HashMap::new(),
@@ -1736,6 +1806,7 @@ mod tests {
     #[test]
     fn loading_archives_register_md_then_base_once_at_resource_setup() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: vec![NamedArchive {
                 name: "base.mix".to_string(),
                 archive: make_new_format_mix("base.bin", b"base"),
@@ -1819,6 +1890,7 @@ mod tests {
     #[test]
     fn load_file_from_mix_cache_survives_theater_replacement_and_normalizes_case() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: vec![NamedArchive {
                 name: "base.mix".to_string(),
                 archive: make_new_format_mix("base.bin", b"base"),
@@ -1899,6 +1971,7 @@ mod tests {
     #[test]
     fn archive_lookup_matches_nested_leaf_aliases() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: vec![NamedArchive {
                 name: "language.mix -> audio.mix".to_string(),
                 archive: make_new_format_mix("audio.idx", b"test"),
@@ -1932,6 +2005,7 @@ mod tests {
     fn registering_nested_archive_appends_without_displacing_first_winner() {
         let nested_bytes = make_new_format_mix_bytes("duplicate.bin", b"late");
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: vec![
                 NamedArchive {
                     name: "early.mix".to_string(),
@@ -1969,6 +2043,7 @@ mod tests {
     #[test]
     fn neutral_archive_registration_preserves_md_first_winner() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: Vec::new(),
             archive_catalog: vec![
                 NamedArchive {
@@ -2013,6 +2088,7 @@ mod tests {
     #[test]
     fn neutral_archive_registration_stops_when_md_archive_is_missing() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: Vec::new(),
             archive_catalog: vec![NamedArchive {
                 name: "ra2.mix -> neutral.mix".to_string(),
@@ -2039,6 +2115,7 @@ mod tests {
     #[test]
     fn load_file_from_mix_fills_from_loose_before_mix_and_stays_sticky() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: vec![NamedArchive {
                 name: "first.mix".to_string(),
                 archive: make_new_format_mix("ra2md.csf", b"archived"),
@@ -2051,7 +2128,7 @@ mod tests {
                 LooseAsset {
                     path: PathBuf::from("RA2MD.CSF"),
                     source_name: "loose:RA2MD.CSF".to_string(),
-                    bytes: OnceLock::from(Some(Box::from(&b"loose"[..]))),
+                    bytes: OnceLock::from(Some(Arc::new(b"loose".to_vec()))),
                 },
             )]),
             audio_pair: SelectedAudioPair::default(),
@@ -2091,6 +2168,7 @@ mod tests {
     #[test]
     fn theater_group_replaces_old_archives_and_repeated_identity_is_noop() {
         let mut manager = AssetManager {
+            memory_sources: HashMap::new(),
             archives: vec![NamedArchive {
                 name: "base.mix".to_string(),
                 archive: make_new_format_mix("base.bin", b"base"),
@@ -2175,6 +2253,56 @@ mod tests {
         assert_eq!(
             manager.registered_archive_names(),
             ["temperat.mix", "isotemmd.mix"]
+        );
+    }
+    #[test]
+    fn memory_constructor_preserves_native_priority_and_shares_owned_storage() {
+        let mut files = Vec::new();
+        for name in [
+            "langmd.mix",
+            "language.mix",
+            "ra2md.mix",
+            "ra2.mix",
+            "cachemd.mix",
+            "cache.mix",
+            "localmd.mix",
+            "local.mix",
+            "conqmd.mix",
+            "conquer.mix",
+            "cameomd.mix",
+            "cameo.mix",
+            "mapsmd03.mix",
+            "multimd.mix",
+        ] {
+            files.push((
+                name.to_string(),
+                make_new_format_mix_bytes("duplicate.bin", name.as_bytes()),
+            ));
+        }
+        let input_pointer = files[0].1.as_ptr();
+        let manager =
+            AssetManager::from_memory_files(files, MediaArchiveMode::STOCK_DIGITAL).unwrap();
+        let first = manager.get_ref("duplicate.bin").unwrap();
+        assert_eq!(first, b"langmd.mix");
+        assert_eq!(
+            first.as_ptr(),
+            input_pointer.wrapping_add(22),
+            "owned MIX buffer was transferred without a full archive copy"
+        );
+        let second = manager.clone();
+        assert_eq!(
+            first.as_ptr(),
+            second.get_ref("duplicate.bin").unwrap().as_ptr()
+        );
+        assert_eq!(
+            &manager.registered_archive_names()[..2],
+            &["langmd.mix", "language.mix"]
+        );
+        assert!(
+            !manager
+                .registered_archive_names()
+                .iter()
+                .any(|n| n.contains("mov") || n.contains("theme"))
         );
     }
 }

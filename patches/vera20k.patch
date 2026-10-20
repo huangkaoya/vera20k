@@ -1,0 +1,945 @@
+--- a/src/Cargo.toml
++++ b/src/Cargo.toml
+@@ -49,7 +49,7 @@
+ # RA2's binary asset formats (.mix, .shp, .vxl, .pal, .tmp, .hva) are parsed by
+ # hand-written readers in `assets/` — no parser library, no RA2-specific crates.
+ # memmap2 maps disk MIX archives instead of reading them into memory.
+-memmap2 = "0.9"
++
+ 
+ # --- Error handling ---
+ thiserror = { workspace = true }
+@@ -61,7 +61,7 @@
+ # --- Parallel simulation work ---
+ # The persistent worker pool behind `sim::parallel::map`; its threads keep their
+ # thread-local search scratch between frames. Already in the lock via `image`.
+-rayon = "1.11"
++
+ 
+ # --- Crypto (for MIX archive header decryption) ---
+ # RA2 .mix files encrypt their file index with Blowfish (`assets::blowfish`).
+@@ -69,6 +69,11 @@
+ # Big integer arithmetic — RSA modular exponentiation to extract the Blowfish key.
+ # Simpler than the full `rsa` crate since RA2 uses raw/textbook RSA (no PKCS padding).
+ num-bigint = "0.4"
++
++# Native archive mappings and persistent pool; browser owns memory buffers and runs serially.
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++memmap2 = "0.9"
++rayon = "1.11"
+ 
+ # --- Unix saved-list timestamps ---
+ # Local time and the user's locale (src/util/native_file_time.rs). The
+--- a/src/assets/asset_manager.rs
++++ b/src/assets/asset_manager.rs
+@@ -28,11 +28,11 @@
+     archive: MixArchive,
+ }
+ 
+-#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
++#[derive(Clone)]
+ struct LooseAsset {
+     path: PathBuf,
+     source_name: String,
+-    bytes: OnceLock<Option<Box<[u8]>>>,
++    bytes: OnceLock<Option<Arc<Vec<u8>>>>,
+ }
+ 
+ impl LooseAsset {
+@@ -44,13 +44,14 @@
+     fn bytes(&self) -> Option<&[u8]> {
+         self.bytes
+             .get_or_init(|| match std::fs::read(&self.path) {
+-                Ok(bytes) => Some(bytes.into_boxed_slice()),
++                Ok(bytes) => Some(Arc::new(bytes)),
+                 Err(err) => {
+                     log::debug!("Skipping loose {}: {}", self.path.display(), err);
+                     None
+                 }
+             })
+-            .as_deref()
++            .as_ref()
++            .map(|bytes| bytes.as_slice())
+     }
+ }
+ 
+@@ -125,15 +126,14 @@
+ 
+ /// A frozen resolver winner, not another archive search list. Archive storage
+ /// stays on the manager; loose bytes stay in its existing OnceLock snapshot.
+-#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
++#[derive(Clone)]
+ struct SelectedAudioFile {
+     source_archive: String,
+     entry_id: i32,
+     loose_name: Option<String>,
+ }
+ 
+-#[derive(Default)]
+-#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
++#[derive(Default, Clone)]
+ struct SelectedAudioPair {
+     idx: Option<SelectedAudioFile>,
+     bag: Option<SelectedAudioFile>,
+@@ -186,6 +186,8 @@
+ /// and theater-dependent assets want current-resolution; anything mirroring
+ /// the native `LoadFileFromMIX` contract wants the sticky path.
+ pub struct AssetManager {
++    /// Browser-owned top-level archives; shared storage survives match reloads.
++    memory_sources: HashMap<String, MixArchive>,
+     /// Loaded MIX archives in search priority order.
+     archives: Vec<NamedArchive>,
+     /// Parsed, named nested MIX archives that retail has not registered yet.
+@@ -212,10 +214,10 @@
+ /// bytes and starts with the same registrations, lookups, caches and loose
+ /// snapshots as the original. Production code holds one manager and never
+ /// copies it.
+-#[cfg(any(test, feature = "test-support"))]
+ impl Clone for AssetManager {
+     fn clone(&self) -> Self {
+         Self {
++            memory_sources: self.memory_sources.clone(),
+             archives: self.archives.clone(),
+             archive_catalog: self.archive_catalog.clone(),
+             lookup_index: self.lookup_index.clone(),
+@@ -306,6 +308,7 @@
+     /// existing load_all_disk_mixes widening. Not a gameplay constructor.
+     pub fn from_ini_probe_root(ra2_dir: &Path) -> Result<Self, AssetError> {
+         Ok(Self {
++            memory_sources: HashMap::new(),
+             archives: Vec::new(),
+             archive_catalog: Vec::new(),
+             lookup_index: HashMap::new(),
+@@ -327,7 +330,8 @@
+ 
+     /// Load the core runtime archive stack for one native media-selection mode.
+     pub fn new(ra2_dir: &Path, media_mode: MediaArchiveMode) -> Result<Self, AssetError> {
+-        let mut manager = Self {
++        let manager = Self {
++            memory_sources: HashMap::new(),
+             archives: Vec::new(),
+             archive_catalog: Vec::new(),
+             lookup_index: HashMap::new(),
+@@ -339,6 +343,53 @@
+             ra2_dir: ra2_dir.to_path_buf(),
+         };
+ 
++        manager.initialize_archive_stack(media_mode, true)
++    }
++
++    /// Build the same native archive stack from owned browser file buffers.
++    /// MIX storage is Arc-backed and never copied while mounting nested archives.
++    pub fn from_memory_files(
++        files: Vec<(String, Vec<u8>)>,
++        media_mode: MediaArchiveMode,
++    ) -> Result<Self, AssetError> {
++        let mut manager = Self {
++            memory_sources: HashMap::new(),
++            archives: Vec::new(),
++            archive_catalog: Vec::new(),
++            lookup_index: HashMap::new(),
++            mix_file_cache: Mutex::new(HashMap::new()),
++            loose_files: HashMap::new(),
++            audio_pair: SelectedAudioPair::default(),
++            active_theater: None,
++            active_theater_archives: Vec::new(),
++            ra2_dir: PathBuf::from("/memory"),
++        };
++        for (name, bytes) in files {
++            let key = name.to_ascii_lowercase();
++            if key.ends_with(".mix") {
++                manager
++                    .memory_sources
++                    .insert(key, MixArchive::from_bytes(bytes)?);
++            } else {
++                manager.loose_files.insert(
++                    key,
++                    LooseAsset {
++                        path: PathBuf::from(&name),
++                        source_name: name,
++                        bytes: OnceLock::from(Some(Arc::new(bytes))),
++                    },
++                );
++            }
++        }
++        manager.initialize_archive_stack(media_mode, false)
++    }
++
++    fn initialize_archive_stack(
++        mut self,
++        media_mode: MediaArchiveMode,
++        presentation_media: bool,
++    ) -> Result<Self, AssetError> {
++        let manager = &mut self;
+         // WinMain registers the YR language archive before the RA2 fallback.
+         manager.mount_named_archive("langmd.mix", false)?;
+         manager.mount_named_archive("language.mix", false)?;
+@@ -378,14 +429,18 @@
+ 
+         manager.mount_native_map_media(media_mode)?;
+         manager.mount_named_archive("multimd.mix", true)?;
+-        manager.mount_named_archive("thememd.mix", false)?;
+-        // VERA presentation extension: native YR mounts THEME.MIX only when
+-        // THEMEMD.MIX is absent. Keep MD first, then make original RA2 music
+-        // available to the shared Theme catalog without displacing YR files.
+-        // Preserve this user-requested parity exception during future parity
+-        // work unless the user explicitly asks to change the music catalog.
+-        manager.mount_named_archive("theme.mix", false)?;
+-        manager.mount_native_movie_media(media_mode)?;
++        // The memory constructor is the explicit GPU-free simulation policy:
++        // movies and music have no gameplay reader and need not be transferred.
++        if presentation_media {
++            manager.mount_named_archive("thememd.mix", false)?;
++            // VERA presentation extension: native YR mounts THEME.MIX only when
++            // THEMEMD.MIX is absent. Keep MD first, then make original RA2 music
++            // available to the shared Theme catalog without displacing YR files.
++            // Preserve this user-requested parity exception during future parity
++            // work unless the user explicitly asks to change the music catalog.
++            manager.mount_named_archive("theme.mix", false)?;
++            manager.mount_native_movie_media(media_mode)?;
++        }
+ 
+         // Loose YRO archives are deliberately absent here. Retail registers
+         // each one during SessionClass scenario enumeration, immediately
+@@ -404,7 +459,7 @@
+             );
+         }
+ 
+-        Ok(manager)
++        Ok(self)
+     }
+ 
+     /// Freeze the independent CCFile winners at native AudioIndex construction.
+@@ -830,6 +885,12 @@
+     /// to ASCII case. Read from disk at each call; not part of the startup
+     /// loose catalog, which holds top-level files only.
+     pub fn read_install_file(&self, relative: &str) -> Option<Vec<u8>> {
++        if !self.memory_sources.is_empty() {
++            return self
++                .loose_asset(&relative.replace('\\', "/"))
++                .and_then(LooseAsset::bytes)
++                .map(<[u8]>::to_vec);
++        }
+         let mut path = self.ra2_dir.clone();
+         for component in relative.split(['\\', '/']).filter(|part| !part.is_empty()) {
+             let exact = path.join(component);
+@@ -1027,6 +1088,14 @@
+             return Ok(true);
+         }
+ 
++        if let Some(archive) = self.memory_sources.get(&name.to_ascii_lowercase()).cloned() {
++            self.append_registered_archive(NamedArchive {
++                name: name.to_owned(),
++                archive,
++            });
++            return Ok(true);
++        }
++
+         if let Some(disk_path) = self.loose_path(name).map(Path::to_path_buf) {
+             let archive = MixArchive::load(&disk_path)?;
+             if let Some(position) = self
+@@ -1382,6 +1451,7 @@
+ 
+     fn empty_manager(ra2_dir: &Path) -> AssetManager {
+         AssetManager {
++            memory_sources: HashMap::new(),
+             archives: Vec::new(),
+             archive_catalog: Vec::new(),
+             lookup_index: HashMap::new(),
+@@ -1736,6 +1806,7 @@
+     #[test]
+     fn loading_archives_register_md_then_base_once_at_resource_setup() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: vec![NamedArchive {
+                 name: "base.mix".to_string(),
+                 archive: make_new_format_mix("base.bin", b"base"),
+@@ -1819,6 +1890,7 @@
+     #[test]
+     fn load_file_from_mix_cache_survives_theater_replacement_and_normalizes_case() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: vec![NamedArchive {
+                 name: "base.mix".to_string(),
+                 archive: make_new_format_mix("base.bin", b"base"),
+@@ -1899,6 +1971,7 @@
+     #[test]
+     fn archive_lookup_matches_nested_leaf_aliases() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: vec![NamedArchive {
+                 name: "language.mix -> audio.mix".to_string(),
+                 archive: make_new_format_mix("audio.idx", b"test"),
+@@ -1932,6 +2005,7 @@
+     fn registering_nested_archive_appends_without_displacing_first_winner() {
+         let nested_bytes = make_new_format_mix_bytes("duplicate.bin", b"late");
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: vec![
+                 NamedArchive {
+                     name: "early.mix".to_string(),
+@@ -1969,6 +2043,7 @@
+     #[test]
+     fn neutral_archive_registration_preserves_md_first_winner() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: Vec::new(),
+             archive_catalog: vec![
+                 NamedArchive {
+@@ -2013,6 +2088,7 @@
+     #[test]
+     fn neutral_archive_registration_stops_when_md_archive_is_missing() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: Vec::new(),
+             archive_catalog: vec![NamedArchive {
+                 name: "ra2.mix -> neutral.mix".to_string(),
+@@ -2039,6 +2115,7 @@
+     #[test]
+     fn load_file_from_mix_fills_from_loose_before_mix_and_stays_sticky() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: vec![NamedArchive {
+                 name: "first.mix".to_string(),
+                 archive: make_new_format_mix("ra2md.csf", b"archived"),
+@@ -2051,7 +2128,7 @@
+                 LooseAsset {
+                     path: PathBuf::from("RA2MD.CSF"),
+                     source_name: "loose:RA2MD.CSF".to_string(),
+-                    bytes: OnceLock::from(Some(Box::from(&b"loose"[..]))),
++                    bytes: OnceLock::from(Some(Arc::new(b"loose".to_vec()))),
+                 },
+             )]),
+             audio_pair: SelectedAudioPair::default(),
+@@ -2091,6 +2168,7 @@
+     #[test]
+     fn theater_group_replaces_old_archives_and_repeated_identity_is_noop() {
+         let mut manager = AssetManager {
++            memory_sources: HashMap::new(),
+             archives: vec![NamedArchive {
+                 name: "base.mix".to_string(),
+                 archive: make_new_format_mix("base.bin", b"base"),
+@@ -2177,4 +2255,54 @@
+             ["temperat.mix", "isotemmd.mix"]
+         );
+     }
+-}
++    #[test]
++    fn memory_constructor_preserves_native_priority_and_shares_owned_storage() {
++        let mut files = Vec::new();
++        for name in [
++            "langmd.mix",
++            "language.mix",
++            "ra2md.mix",
++            "ra2.mix",
++            "cachemd.mix",
++            "cache.mix",
++            "localmd.mix",
++            "local.mix",
++            "conqmd.mix",
++            "conquer.mix",
++            "cameomd.mix",
++            "cameo.mix",
++            "mapsmd03.mix",
++            "multimd.mix",
++        ] {
++            files.push((
++                name.to_string(),
++                make_new_format_mix_bytes("duplicate.bin", name.as_bytes()),
++            ));
++        }
++        let input_pointer = files[0].1.as_ptr();
++        let manager =
++            AssetManager::from_memory_files(files, MediaArchiveMode::STOCK_DIGITAL).unwrap();
++        let first = manager.get_ref("duplicate.bin").unwrap();
++        assert_eq!(first, b"langmd.mix");
++        assert_eq!(
++            first.as_ptr(),
++            input_pointer.wrapping_add(22),
++            "owned MIX buffer was transferred without a full archive copy"
++        );
++        let second = manager.clone();
++        assert_eq!(
++            first.as_ptr(),
++            second.get_ref("duplicate.bin").unwrap().as_ptr()
++        );
++        assert_eq!(
++            &manager.registered_archive_names()[..2],
++            &["langmd.mix", "language.mix"]
++        );
++        assert!(
++            !manager
++                .registered_archive_names()
++                .iter()
++                .any(|n| n.contains("mov") || n.contains("theme"))
++        );
++    }
++}
+--- a/src/assets/mix_archive.rs
++++ b/src/assets/mix_archive.rs
+@@ -93,7 +93,8 @@
+ 
+ #[derive(Clone)]
+ enum MixBytes {
+-    Owned(Arc<[u8]>),
++    Owned(Arc<Vec<u8>>),
++    #[cfg(not(target_arch = "wasm32"))]
+     Mapped(Arc<memmap2::Mmap>),
+ }
+ 
+@@ -106,7 +107,7 @@
+ 
+ impl MixData {
+     fn from_owned(data: Vec<u8>) -> Self {
+-        let bytes: Arc<[u8]> = data.into();
++        let bytes = Arc::new(data);
+         let len = bytes.len();
+         Self {
+             bytes: MixBytes::Owned(bytes),
+@@ -115,6 +116,7 @@
+         }
+     }
+ 
++    #[cfg(not(target_arch = "wasm32"))]
+     fn from_mapped(map: memmap2::Mmap) -> Self {
+         let bytes = Arc::new(map);
+         let len = bytes.len();
+@@ -128,6 +130,7 @@
+     fn as_slice(&self) -> &[u8] {
+         let bytes = match &self.bytes {
+             MixBytes::Owned(data) => &data[..],
++            #[cfg(not(target_arch = "wasm32"))]
+             MixBytes::Mapped(map) => &map[..],
+         };
+         &bytes[self.start..self.start + self.len]
+@@ -240,10 +243,18 @@
+     }
+ 
+     /// Load a MIX archive from a file path.
++    #[cfg(not(target_arch = "wasm32"))]
+     pub fn load(path: &Path) -> Result<Self, AssetError> {
+         let file = File::open(path)?;
+         let data = unsafe { memmap2::MmapOptions::new().map(&file)? };
+         Self::from_data(MixData::from_mapped(data))
++    }
++
++    #[cfg(target_arch = "wasm32")]
++    pub fn load(_path: &Path) -> Result<Self, AssetError> {
++        Err(AssetError::AssetNotFound {
++            name: "filesystem unavailable in browser; register memory assets".into(),
++        })
+     }
+ 
+     /// Look up a file by name. Returns the raw bytes if found.
+--- a/src/headless_scenario.rs
++++ b/src/headless_scenario.rs
+@@ -179,15 +179,37 @@
+     seed: u32,
+     launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
+ ) -> Result<HeadlessScenario, String> {
+-    let mut assets =
++    let assets =
+         AssetManager::new(retail_dir, MediaArchiveMode::STOCK_DIGITAL).map_err(|error| {
+             format!(
+                 "open retail MIX archives in {}: {error}",
+                 retail_dir.display()
+             )
+         })?;
++    load_with_launch_and_assets(assets, map_file_name, seed, launch)
++}
++
++/// Browser/native integration entry retaining the exact retail initialization funnel.
++pub fn load_session_with_assets(
++    assets: AssetManager,
++    map_file_name: &str,
++    seed: u32,
++    session: SkirmishLaunchSession,
++) -> Result<HeadlessScenario, String> {
++    let launch = crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(session)
++        .map_err(|error| format!("resolve Battle launch: {error}"))?;
++    load_with_launch_and_assets(assets, map_file_name, seed, launch)
++}
++
++fn load_with_launch_and_assets(
++    mut assets: AssetManager,
++    map_file_name: &str,
++    seed: u32,
++    launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
++) -> Result<HeadlessScenario, String> {
++    let retail_dir = assets.ra2_dir().to_path_buf();
+     let mut map = crate::map::source::load_map_by_name_or_path_with_assets(
+-        retail_dir,
++        &retail_dir,
+         map_file_name,
+         &assets,
+     )
+--- a/src/sim/mod.rs
++++ b/src/sim/mod.rs
+@@ -72,6 +72,7 @@
+ pub mod light_sources;
+ pub mod multiplayer_checksum;
+ pub mod native_identity;
++#[cfg_attr(target_arch = "wasm32", path = "parallel_wasm.rs")]
+ pub(crate) mod parallel; // order-preserving work over scoped threads
+ pub mod rng;
+ pub mod scenario_bootstrap;
+--- a/src/sim/movement/path_batch.rs
++++ b/src/sim/movement/path_batch.rs
+@@ -114,7 +114,21 @@
+ 
+ use std::collections::BTreeMap;
+ use std::sync::atomic::{AtomicU64, Ordering};
+-use std::time::{Duration, Instant};
++use std::time::Duration;
++#[cfg(not(target_arch = "wasm32"))]
++use std::time::Instant;
++// This clock feeds diagnostics only, never path budgets or simulation decisions.
++#[cfg(target_arch = "wasm32")]
++struct Instant;
++#[cfg(target_arch = "wasm32")]
++impl Instant {
++    fn now() -> Self {
++        Self
++    }
++    fn elapsed(&self) -> Duration {
++        Duration::ZERO
++    }
++}
+ 
+ use super::foot_path::MoverLift;
+ use super::movement_path::MovePathFailure;
+--- /dev/null
++++ b/src/sim/parallel_wasm.rs
+@@ -0,0 +1,37 @@
++//! Browser execution uses one deterministic worker, retaining item order.
++pub(crate) fn map<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
++    items.iter().map(work).collect()
++}
++pub(crate) fn map_in_order<T: Sync, B, R: Send>(
++    items: &[T],
++    before: impl Fn() -> B + Sync,
++    work: impl Fn(&T, B) -> R + Sync,
++) -> Vec<R> {
++    items.iter().map(|item| work(item, before())).collect()
++}
++pub(crate) fn map_with<T: Sync, S: Clone + Send, R: Send>(
++    items: &[T],
++    mut init: S,
++    work: impl Fn(&mut S, &T) -> R + Sync,
++) -> Vec<R> {
++    items.iter().map(|item| work(&mut init, item)).collect()
++}
++pub(crate) fn select_indices(len: usize, keep: impl Fn(usize) -> bool + Sync) -> Vec<usize> {
++    (0..len).filter(|&i| keep(i)).collect()
++}
++pub(crate) fn filter_map_indices<R: Send>(
++    len: usize,
++    pick: impl Fn(usize) -> Option<R> + Sync,
++) -> Vec<R> {
++    (0..len).filter_map(pick).collect()
++}
++pub(crate) fn for_each_mut<T: Send>(items: &mut [T], work: impl Fn(&mut T) + Sync) {
++    items.iter_mut().for_each(work);
++}
++pub(crate) fn any_index(len: usize, test: impl Fn(usize) -> bool + Sync) -> bool {
++    (0..len).any(test)
++}
++pub(crate) fn alongside(pooled: impl FnOnce() + Send, here: impl FnOnce()) {
++    pooled();
++    here();
++}
+--- a/src/sim/pathfinding/zone_build.rs
++++ b/src/sim/pathfinding/zone_build.rs
+@@ -376,156 +376,151 @@
+     height: u16,
+     edge_buckets: &mut BaseEdgeBuckets,
+ ) -> i32 {
+-    let start_idx = start_y as usize * width as usize + start_x as usize;
+-    let movement_class = movement_classes[start_idx];
+-    let seed_x = i32::from(start_x);
+-    let seed_y = i32::from(start_y);
+-    let Some(mut carried_level) = base_level_at(levels, seed_x, seed_y, width, height) else {
+-        return 0;
+-    };
+-
+-    // The native scan first walks left with a carried <=1 height reference.
+-    // Horizontal scans overwrite prior zone IDs; only vertical recursion tests
+-    // for an unassigned candidate.
+-    let mut left = seed_x;
+-    while let Some(index) = base_record_index(left, seed_y, width, height) {
+-        if movement_classes[index] != movement_class {
+-            break;
+-        }
+-        let Some(level) = base_level_at(levels, left, seed_y, width, height) else {
+-            break;
+-        };
+-        if (i16::from(level) - i16::from(carried_level)).abs() >= 2 {
+-            break;
+-        }
+-        node_indices[index] = node_id;
+-        carried_level = level;
+-        left -= 1;
+-    }
+-    register_scanline_edge(
+-        edge_buckets,
+-        left,
+-        seed_y,
+-        left + 1,
+-        seed_y,
+-        node_id,
+-        movement_class,
+-        node_indices,
+-        levels,
+-        width,
+-        height,
+-    );
+-
+-    // Right starts at the seed but retains the level carried out of the left
+-    // scan. The retail comparison is strictly <4.
+-    let mut right = seed_x;
+-    while let Some(index) = base_record_index(right, seed_y, width, height) {
+-        if movement_classes[index] != movement_class {
+-            break;
+-        }
+-        let Some(level) = base_level_at(levels, right, seed_y, width, height) else {
+-            break;
+-        };
+-        if (i16::from(level) - i16::from(carried_level)).abs() >= 4 {
+-            break;
+-        }
+-        node_indices[index] = node_id;
+-        carried_level = level;
+-        right += 1;
+-    }
+-    register_scanline_edge(
+-        edge_buckets,
+-        right,
+-        seed_y,
+-        right - 1,
+-        seed_y,
+-        node_id,
+-        movement_class,
+-        node_indices,
+-        levels,
+-        width,
+-        height,
+-    );
+-
+-    // Both adjacent-row scans include the two flanks [L-1, R+1]. Their
+-    // current-row reference is one cell right, clamped to R.
+-    let mut scan_x = left;
+-    let run_right = right - 1;
+-    while scan_x <= right {
+-        let candidate_y = seed_y - 1;
+-        let reference_x = (scan_x + 1).min(run_right);
++    // Keep the native depth-first scanline traversal, including the different
++    // above/below return advances, on a heap stack. Large connected retail maps
++    // exhaust JavaScriptCore's machine call stack with the recursive form.
++    struct Frame {
++        seed_x: i32,
++        seed_y: i32,
++        movement_class: u8,
++        left: i32,
++        right: i32,
++        scan_x: i32,
++        below: bool,
++    }
++
++    let mut frames = Vec::<Frame>::new();
++    let mut pending_seed = Some((start_x, start_y));
++    loop {
++        if let Some((start_x, start_y)) = pending_seed.take() {
++            let start_idx = start_y as usize * width as usize + start_x as usize;
++            let movement_class = movement_classes[start_idx];
++            let seed_x = i32::from(start_x);
++            let seed_y = i32::from(start_y);
++            let Some(mut carried_level) = base_level_at(levels, seed_x, seed_y, width, height)
++            else {
++                if let Some(parent) = frames.last_mut() {
++                    parent.scan_x += i32::from(!parent.below);
++                    continue;
++                }
++                return 0;
++            };
++
++            // Horizontal scans overwrite prior IDs. Retain the carried level
++            // from the left scan when restarting at the seed to scan right.
++            let mut left = seed_x;
++            while let Some(index) = base_record_index(left, seed_y, width, height) {
++                if movement_classes[index] != movement_class {
++                    break;
++                }
++                let Some(level) = base_level_at(levels, left, seed_y, width, height) else {
++                    break;
++                };
++                if (i16::from(level) - i16::from(carried_level)).abs() >= 2 {
++                    break;
++                }
++                node_indices[index] = node_id;
++                carried_level = level;
++                left -= 1;
++            }
++            register_scanline_edge(
++                edge_buckets,
++                left,
++                seed_y,
++                left + 1,
++                seed_y,
++                node_id,
++                movement_class,
++                node_indices,
++                levels,
++                width,
++                height,
++            );
++
++            let mut right = seed_x;
++            while let Some(index) = base_record_index(right, seed_y, width, height) {
++                if movement_classes[index] != movement_class {
++                    break;
++                }
++                let Some(level) = base_level_at(levels, right, seed_y, width, height) else {
++                    break;
++                };
++                if (i16::from(level) - i16::from(carried_level)).abs() >= 4 {
++                    break;
++                }
++                node_indices[index] = node_id;
++                carried_level = level;
++                right += 1;
++            }
++            register_scanline_edge(
++                edge_buckets,
++                right,
++                seed_y,
++                right - 1,
++                seed_y,
++                node_id,
++                movement_class,
++                node_indices,
++                levels,
++                width,
++                height,
++            );
++            frames.push(Frame {
++                seed_x,
++                seed_y,
++                movement_class,
++                left,
++                right,
++                scan_x: left,
++                below: false,
++            });
++        }
++
++        let frame = frames.last_mut().expect("active flood-fill frame");
++        if frame.scan_x > frame.right {
++            if !frame.below {
++                frame.below = true;
++                frame.scan_x = frame.left;
++                continue;
++            }
++            let child_advance = frame.right - frame.seed_x - 1;
++            frames.pop();
++            if let Some(parent) = frames.last_mut() {
++                // Above advances past the child's rightmost run cell. Below
++                // rechecks that cell, exactly as the recursive native walk.
++                parent.scan_x += child_advance + i32::from(!parent.below);
++                continue;
++            }
++            return child_advance;
++        }
++
++        // Both rows include the flanks. The reference is one cell right,
++        // clamped to the current run's rightmost cell.
++        let candidate_y = frame.seed_y + if frame.below { 1 } else { -1 };
++        let reference_x = (frame.scan_x + 1).min(frame.right - 1);
+         if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
+-            base_record_index(scan_x, candidate_y, width, height),
+-            base_level_at(levels, scan_x, candidate_y, width, height),
+-            base_level_at(levels, reference_x, seed_y, width, height),
++            base_record_index(frame.scan_x, candidate_y, width, height),
++            base_level_at(levels, frame.scan_x, candidate_y, width, height),
++            base_level_at(levels, reference_x, frame.seed_y, width, height),
+         ) {
+             let neighbor = node_indices[candidate];
+             let height_allowed =
+                 (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2;
+-            if neighbor == 0 && movement_classes[candidate] == movement_class && height_allowed {
+-                let child_advance = flood_fill_node_index(
+-                    scan_x as u16,
+-                    candidate_y as u16,
+-                    node_id,
+-                    movement_classes,
+-                    node_indices,
+-                    levels,
+-                    width,
+-                    height,
+-                    edge_buckets,
+-                );
+-                // Above advances beyond the returned child run.
+-                scan_x += child_advance + 1;
++            if neighbor == 0
++                && movement_classes[candidate] == frame.movement_class
++                && height_allowed
++            {
++                pending_seed = Some((frame.scan_x as u16, candidate_y as u16));
+                 continue;
+             } else if neighbor != 0
+                 && neighbor != node_id
+-                && (height_allowed || movement_class == zone_class::IMPASSABLE)
++                && (height_allowed || frame.movement_class == zone_class::IMPASSABLE)
+             {
+                 edge_buckets.register(neighbor, node_id);
+             }
+         }
+-        scan_x += 1;
+-    }
+-
+-    // Below uses the same range/reference mapping, but rechecks the returned
+-    // child run's rightmost cell once before advancing.
+-    scan_x = left;
+-    while scan_x <= right {
+-        let candidate_y = seed_y + 1;
+-        let reference_x = (scan_x + 1).min(run_right);
+-        if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
+-            base_record_index(scan_x, candidate_y, width, height),
+-            base_level_at(levels, scan_x, candidate_y, width, height),
+-            base_level_at(levels, reference_x, seed_y, width, height),
+-        ) {
+-            let neighbor = node_indices[candidate];
+-            let height_allowed =
+-                (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2;
+-            if neighbor == 0 && movement_classes[candidate] == movement_class && height_allowed {
+-                let child_advance = flood_fill_node_index(
+-                    scan_x as u16,
+-                    candidate_y as u16,
+-                    node_id,
+-                    movement_classes,
+-                    node_indices,
+-                    levels,
+-                    width,
+-                    height,
+-                    edge_buckets,
+-                );
+-                scan_x += child_advance;
+-                continue;
+-            } else if neighbor != 0
+-                && neighbor != node_id
+-                && (height_allowed || movement_class == zone_class::IMPASSABLE)
+-            {
+-                edge_buckets.register(neighbor, node_id);
+-            }
+-        }
+-        scan_x += 1;
+-    }
+-
+-    right - seed_x - 1
++        frame.scan_x += 1;
++    }
+ }
+ 
+ fn base_record_index(x: i32, y: i32, width: u16, height: u16) -> Option<usize> {
+--- a/src/sim/trigger_runtime.rs
++++ b/src/sim/trigger_runtime.rs
+@@ -594,7 +594,7 @@
+     enabled: bool,
+     pending: bool,
+ }
+-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ struct LiveTag {
+     type_index: usize,
+     ///6E4F44 prepends instances, reversing definition-construction order.
+@@ -607,6 +607,33 @@
+     pending: bool,
+     dispatch_guard: bool,
+ }
++// std::Hash bulk-writes primitive usize slices in host word width, even
++// when StateHasher::write_usize is portable. Keep the established 64-bit
++// little-endian stream on wasm32 without changing trigger state or ordering.
++fn hash_index_slice(indices: &[usize], hasher: &mut impl Hasher) {
++    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
++    indices.hash(hasher);
++    #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
++    {
++        indices.len().hash(hasher);
++        let bytes: Vec<u8> = indices
++            .iter()
++            .flat_map(|&value| (value as u64).to_le_bytes())
++            .collect();
++        hasher.write(&bytes);
++    }
++}
++impl Hash for LiveTag {
++    fn hash<H: Hasher>(&self, hasher: &mut H) {
++        self.type_index.hash(hasher);
++        hash_index_slice(&self.triggers, hasher);
++        self.refs.hash(hasher);
++        self.attached_cell.hash(hasher);
++        self.pending.hash(hasher);
++        self.dispatch_guard.hash(hasher);
++    }
++}
++
+ /// Team IDs and Techno stable IDs belong to separate identity domains.
+ #[derive(
+     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+@@ -711,11 +738,15 @@
+         self.definitions.hash(hasher);
+         self.tags.hash(hasher);
+         self.triggers.hash(hasher);
+-        self.tag_order.hash(hasher);
+-        self.trigger_order.hash(hasher);
+-        self.logic_tags.hash(hasher);
+-        self.map_tags.hash(hasher);
+-        self.house_tags.hash(hasher);
++        hash_index_slice(&self.tag_order, hasher);
++        hash_index_slice(&self.trigger_order, hasher);
++        hash_index_slice(&self.logic_tags, hasher);
++        hash_index_slice(&self.map_tags, hasher);
++        self.house_tags.len().hash(hasher);
++        for (owner, indices) in &self.house_tags {
++            owner.hash(hasher);
++            hash_index_slice(indices, hasher);
++        }
+         self.attachments.hash(hasher);
+         self.cell_tags.hash(hasher);
+         self.dirty.hash(hasher);
+@@ -4839,3 +4870,23 @@
+ #[cfg(test)]
+ #[path = "trigger_runtime_scenario_pause_tests.rs"]
+ mod scenario_pause_tests;
++
++#[cfg(test)]
++mod web_index_hash_tests {
++    use super::*;
++    use crate::sim::state_hasher::StateHasher;
++    #[test]
++    fn index_lists_hash_as_canonical_u64_records() {
++        for indices in [vec![], vec![0, 1, 17, 4096]] {
++            let mut actual = StateHasher::new();
++            hash_index_slice(&indices, &mut actual);
++            let mut expected = StateHasher::new();
++            indices
++                .iter()
++                .map(|&n| n as u64)
++                .collect::<Vec<_>>()
++                .hash(&mut expected);
++            assert_eq!(actual.finish(), expected.finish());
++        }
++    }
++}
+--- a/src/sim/world/world_hash.rs
++++ b/src/sim/world/world_hash.rs
+@@ -495,8 +495,8 @@
+ impl Simulation {
+     /// Read-only Rust diagnostic projections through the existing hash owners.
+     /// These are attribution receipts, never gameplay/native golden inputs.
+-    #[cfg(any(test, feature = "test-support"))]
+-    pub(crate) fn hash_owner_diagnostics_for_test(&self) -> [(&'static str, u64); 13] {
++    #[doc(hidden)]
++    pub fn hash_owner_diagnostics_for_test(&self) -> [(&'static str, u64); 13] {
+         fn digest(fold: impl FnOnce(&mut StateHasher)) -> u64 {
+             let mut hasher = StateHasher::new();
+             fold(&mut hasher);

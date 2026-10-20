@@ -1,0 +1,17 @@
+[package]
+name = "vera-web-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "vera-web-native"
+path = "src/bin/native.rs"
+
+[dependencies]
+vera20k-core = { path = "../../vendor/vera20k/src" }
+serde = { workspace = true }
+serde_json = { workspace = true }

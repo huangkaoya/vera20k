@@ -1,0 +1,22 @@
+[package]
+name = "asset-export"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vera20k-core = { path = "../../vendor/vera20k/src" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glam = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+
+# Upstream raster unit tests belong to VERA's client test harness; this CPU
+# export binary exercises the real retail asset chain when run.
+[[bin]]
+name = "asset-export"
+path = "src/main.rs"
+test = false
+bench = false

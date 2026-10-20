@@ -114,7 +114,21 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+// This clock feeds diagnostics only, never path budgets or simulation decisions.
+#[cfg(target_arch = "wasm32")]
+struct Instant;
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    fn now() -> Self {
+        Self
+    }
+    fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
+}
 
 use super::foot_path::MoverLift;
 use super::movement_path::MovePathFailure;

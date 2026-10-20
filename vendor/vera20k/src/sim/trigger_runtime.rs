@@ -594,7 +594,7 @@ struct LiveTrigger {
     enabled: bool,
     pending: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct LiveTag {
     type_index: usize,
     ///6E4F44 prepends instances, reversing definition-construction order.
@@ -607,6 +607,33 @@ struct LiveTag {
     pending: bool,
     dispatch_guard: bool,
 }
+// std::Hash bulk-writes primitive usize slices in host word width, even
+// when StateHasher::write_usize is portable. Keep the established 64-bit
+// little-endian stream on wasm32 without changing trigger state or ordering.
+fn hash_index_slice(indices: &[usize], hasher: &mut impl Hasher) {
+    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+    indices.hash(hasher);
+    #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+    {
+        indices.len().hash(hasher);
+        let bytes: Vec<u8> = indices
+            .iter()
+            .flat_map(|&value| (value as u64).to_le_bytes())
+            .collect();
+        hasher.write(&bytes);
+    }
+}
+impl Hash for LiveTag {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.type_index.hash(hasher);
+        hash_index_slice(&self.triggers, hasher);
+        self.refs.hash(hasher);
+        self.attached_cell.hash(hasher);
+        self.pending.hash(hasher);
+        self.dispatch_guard.hash(hasher);
+    }
+}
+
 /// Team IDs and Techno stable IDs belong to separate identity domains.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -711,11 +738,15 @@ impl TriggerRuntime {
         self.definitions.hash(hasher);
         self.tags.hash(hasher);
         self.triggers.hash(hasher);
-        self.tag_order.hash(hasher);
-        self.trigger_order.hash(hasher);
-        self.logic_tags.hash(hasher);
-        self.map_tags.hash(hasher);
-        self.house_tags.hash(hasher);
+        hash_index_slice(&self.tag_order, hasher);
+        hash_index_slice(&self.trigger_order, hasher);
+        hash_index_slice(&self.logic_tags, hasher);
+        hash_index_slice(&self.map_tags, hasher);
+        self.house_tags.len().hash(hasher);
+        for (owner, indices) in &self.house_tags {
+            owner.hash(hasher);
+            hash_index_slice(indices, hasher);
+        }
         self.attachments.hash(hasher);
         self.cell_tags.hash(hasher);
         self.dirty.hash(hasher);
@@ -4839,3 +4870,23 @@ mod restore_tests;
 #[cfg(test)]
 #[path = "trigger_runtime_scenario_pause_tests.rs"]
 mod scenario_pause_tests;
+
+#[cfg(test)]
+mod web_index_hash_tests {
+    use super::*;
+    use crate::sim::state_hasher::StateHasher;
+    #[test]
+    fn index_lists_hash_as_canonical_u64_records() {
+        for indices in [vec![], vec![0, 1, 17, 4096]] {
+            let mut actual = StateHasher::new();
+            hash_index_slice(&indices, &mut actual);
+            let mut expected = StateHasher::new();
+            indices
+                .iter()
+                .map(|&n| n as u64)
+                .collect::<Vec<_>>()
+                .hash(&mut expected);
+            assert_eq!(actual.finish(), expected.finish());
+        }
+    }
+}

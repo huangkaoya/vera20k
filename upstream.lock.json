@@ -8,7 +8,18 @@
         "src",
         "Cargo.toml",
         "Cargo.lock",
-        "LICENSE-GPL"
+        "LICENSE-GPL",
+        "tools/spatial_oracle/base_zone_repair.json",
+        "tools/spatial_oracle/bridge_base_edges.json",
+        "tools/spatial_oracle/bridge_connectivity.json",
+        "tools/spatial_oracle/bridge_hierarchy.json",
+        "tools/spatial_oracle/bridge_repair_zones.json",
+        "tools/spatial_oracle/fv_cell_attack/zone_cost.json",
+        "tools/spatial_oracle/fv_cell_attack/zone_cost_vectors.json",
+        "tools/spatial_oracle/fv_cell_attack/zone_exits.json",
+        "tools/spatial_oracle/fv_cell_attack/zone_threat.json",
+        "tools/spatial_oracle/path_entry.json",
+        "tools/spatial_oracle/tube_hierarchy.json"
       ],
       "files": {
         "Cargo.lock": {
@@ -7998,6 +8009,50 @@
         "src/util/version.rs": {
           "source_path": "src/util/version.rs",
           "sha256": "28ee7f4d3357ae7f33c20ed5de128b7b967c92d2795c81aaba70653b6140390f"
+        },
+        "tools/spatial_oracle/base_zone_repair.json": {
+          "source_path": "tools/spatial_oracle/base_zone_repair.json",
+          "sha256": "30b02a97d0a0b0b0c9e8ae373ce4270b779d8bf13fd7b157041ab89d931a15c7"
+        },
+        "tools/spatial_oracle/bridge_base_edges.json": {
+          "source_path": "tools/spatial_oracle/bridge_base_edges.json",
+          "sha256": "0c55bdbbc1091dc72b366663fe673b835ae387db4d27c381a83fd15170318f5f"
+        },
+        "tools/spatial_oracle/bridge_connectivity.json": {
+          "source_path": "tools/spatial_oracle/bridge_connectivity.json",
+          "sha256": "06e760748cfce0a59723b8a5e9df50f0ed85e23eaab3978ec12e3209c907d437"
+        },
+        "tools/spatial_oracle/bridge_hierarchy.json": {
+          "source_path": "tools/spatial_oracle/bridge_hierarchy.json",
+          "sha256": "097618ac877ce8e6619640754fcd33e5928b090cd0fa81c544e8a65d4c7b1ea5"
+        },
+        "tools/spatial_oracle/bridge_repair_zones.json": {
+          "source_path": "tools/spatial_oracle/bridge_repair_zones.json",
+          "sha256": "58a5ef6b601614c330b977b6ea88247ce4602e7f34d0912f703a5a7e157a627d"
+        },
+        "tools/spatial_oracle/fv_cell_attack/zone_cost.json": {
+          "source_path": "tools/spatial_oracle/fv_cell_attack/zone_cost.json",
+          "sha256": "9103b471a85be01207d7f1e86dcbeebdb4f578bc5b3a269e385c00e9a3a29493"
+        },
+        "tools/spatial_oracle/fv_cell_attack/zone_cost_vectors.json": {
+          "source_path": "tools/spatial_oracle/fv_cell_attack/zone_cost_vectors.json",
+          "sha256": "9b90eed79df79171938e6d696f07e500bf508cccb3c707968b8392c9d89c4e55"
+        },
+        "tools/spatial_oracle/fv_cell_attack/zone_exits.json": {
+          "source_path": "tools/spatial_oracle/fv_cell_attack/zone_exits.json",
+          "sha256": "4df646e21726f911a3ceae6c71de34f955a177beb08bb512ff94cae892a05c72"
+        },
+        "tools/spatial_oracle/fv_cell_attack/zone_threat.json": {
+          "source_path": "tools/spatial_oracle/fv_cell_attack/zone_threat.json",
+          "sha256": "5ed2c7bc8abb298d5d70ff02751a69917098f768e4ccba8b95f8ff36a1947df5"
+        },
+        "tools/spatial_oracle/path_entry.json": {
+          "source_path": "tools/spatial_oracle/path_entry.json",
+          "sha256": "0fd0d04d65c72d115f29a338083f590d8f4dcfebc4b993648931a0adea6925ef"
+        },
+        "tools/spatial_oracle/tube_hierarchy.json": {
+          "source_path": "tools/spatial_oracle/tube_hierarchy.json",
+          "sha256": "07a99503c2dcc19ac3090cea55e7e119d9efa5dc70026a7e849ba12a8b837f83"
         }
       },
       "status_before": " M Cargo.toml\n M src/app/frame.rs\n M src/app/frontend/fullscreen_movie.rs\n M src/app/frontend/main_menu_shell_render.rs\n M src/app/frontend/shell_layout.rs\n M src/app/frontend/skirmish_shell_render/in_game_shell.rs\n M src/app/handler.rs\n M src/app/initialize.rs\n M src/app/input/camera.rs\n M src/app/input/dispatch.rs\n M src/app/input/keyboard.rs\n M src/app/input/macos_cursor.rs\n M src/app/input/state.rs\n M src/app/mod.rs\n M src/app/presentation/render/draw_passes.rs\n M src/app/renderer_state.rs\n M src/app/shell_main_menu.rs\n M src/app/shell_movies_credits.rs\n M src/app/state.rs\n M src/render/gpu.rs\n M src/render/werhd_menu_movie.rs\n?? android/\n?? art/localization/\n?? src/app/android_main_menu_url.rs\n?? tools/build_android_locale.py\n?? tools/release/\n"

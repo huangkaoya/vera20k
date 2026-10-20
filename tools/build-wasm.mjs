@@ -1,0 +1,10 @@
+import {spawnSync} from 'node:child_process';
+import {mkdirSync,copyFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const target=path.join(root,'.build/cargo');
+const r=spawnSync('cargo',['build','--locked','--release','-p','vera-web-core','--lib','--target','wasm32-unknown-unknown'],{cwd:root,env:{...process.env,CARGO_TARGET_DIR:target,RUSTFLAGS:[process.env.RUSTFLAGS??'', '-C link-arg=-zstack-size=16777216'].filter(Boolean).join(' ')},stdio:'inherit'});
+if(r.status!==0)process.exit(r.status??1);
+mkdirSync(path.join(root,'public/wasm'),{recursive:true});
+copyFileSync(path.join(target,'wasm32-unknown-unknown/release/vera_web_core.wasm'),path.join(root,'public/wasm/vera_web_core.wasm'));

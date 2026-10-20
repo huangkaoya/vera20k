@@ -1,0 +1,10 @@
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+import os from 'node:os';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const target=path.join(root,'.build/cargo');
+let r=spawnSync('cargo',['build','--locked','--release','-p','asset-export'],{cwd:root,env:{...process.env,CARGO_TARGET_DIR:target},stdio:'inherit'});
+if(r.status!==0)process.exit(r.status??1);
+r=spawnSync(path.join(target,'release/asset-export'),['--retail',process.env.VERA_ASSET_ROOT??path.join(os.homedir(),'Library/Application Support/VERA20k/retail-assets'),'--out',path.join(root,'public/generated')],{cwd:root,stdio:'inherit'});
+process.exit(r.status??1);

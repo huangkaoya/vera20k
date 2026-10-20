@@ -495,8 +495,8 @@ fn hash_mission_leaf(leaf: &crate::sim::mission::MissionLeafState, hasher: &mut 
 impl Simulation {
     /// Read-only Rust diagnostic projections through the existing hash owners.
     /// These are attribution receipts, never gameplay/native golden inputs.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hash_owner_diagnostics_for_test(&self) -> [(&'static str, u64); 13] {
+    #[doc(hidden)]
+    pub fn hash_owner_diagnostics_for_test(&self) -> [(&'static str, u64); 13] {
         fn digest(fold: impl FnOnce(&mut StateHasher)) -> u64 {
             let mut hasher = StateHasher::new();
             fold(&mut hasher);

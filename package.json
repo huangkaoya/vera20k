@@ -1,0 +1,30 @@
+{
+  "name": "werhd-vera",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node tools/dev-server.mjs",
+    "typecheck": "tsc --noEmit",
+    "build:wasm": "node tools/build-wasm.mjs",
+    "build:assets": "node tools/build-assets.mjs",
+    "check:assets": "node tools/check-assets.mjs",
+    "build": "node tools/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:parity": "node tools/test-parity.mjs",
+    "test:zone-fill": "node tools/test-zone-fill.mjs",
+    "sync:upstream": "python3 tools/sync_upstream.py sync",
+    "sync:check": "python3 tools/sync_upstream.py check",
+    "sync:patches": "python3 tools/sync_upstream.py patches",
+    "check:isolation": "python3 tools/sync_upstream.py isolation"
+  },
+  "dependencies": {
+    "vite": "7.3.3",
+    "ws": "8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.3",
+    "esbuild": "0.27.7",
+    "typescript": "5.9.3"
+  }
+}

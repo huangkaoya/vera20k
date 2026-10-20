@@ -179,15 +179,37 @@ pub fn load_with_launch(
     seed: u32,
     launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
 ) -> Result<HeadlessScenario, String> {
-    let mut assets =
+    let assets =
         AssetManager::new(retail_dir, MediaArchiveMode::STOCK_DIGITAL).map_err(|error| {
             format!(
                 "open retail MIX archives in {}: {error}",
                 retail_dir.display()
             )
         })?;
+    load_with_launch_and_assets(assets, map_file_name, seed, launch)
+}
+
+/// Browser/native integration entry retaining the exact retail initialization funnel.
+pub fn load_session_with_assets(
+    assets: AssetManager,
+    map_file_name: &str,
+    seed: u32,
+    session: SkirmishLaunchSession,
+) -> Result<HeadlessScenario, String> {
+    let launch = crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(session)
+        .map_err(|error| format!("resolve Battle launch: {error}"))?;
+    load_with_launch_and_assets(assets, map_file_name, seed, launch)
+}
+
+fn load_with_launch_and_assets(
+    mut assets: AssetManager,
+    map_file_name: &str,
+    seed: u32,
+    launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
+) -> Result<HeadlessScenario, String> {
+    let retail_dir = assets.ra2_dir().to_path_buf();
     let mut map = crate::map::source::load_map_by_name_or_path_with_assets(
-        retail_dir,
+        &retail_dir,
         map_file_name,
         &assets,
     )

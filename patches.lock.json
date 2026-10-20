@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "sources": {
+    "vera20k": {
+      "revision": "5450e8a7f7b5f04d88071171f8d72b6bc9091a9f",
+      "files": {
+        "src/Cargo.toml": "7386276f1fc68532e235d0877a97a6f18e3ad1794fc7ff906b772c69840cbb72",
+        "src/assets/asset_manager.rs": "ae3a20e3eeb49f9ae80f88b83813f8a9c1e82bfe17d8e64432ace62027cd2847",
+        "src/assets/mix_archive.rs": "5df2ee094154007c42d37ac384b268af443bd4fdf4b90d41cb274d50fcfbdeb2",
+        "src/headless_scenario.rs": "2d0a444fcb9c58d6561952c22a177fd0dd901ef6ea8de5e1a738832abd873825",
+        "src/sim/mod.rs": "3bb629cb7d519f8cedb88481632c6099bf7f56a7975c8307d742d8096de7d7ed",
+        "src/sim/movement/path_batch.rs": "cb867cc832270e48e4d68acb418b8b670a07979504532a8684010f2783af3f18",
+        "src/sim/parallel_wasm.rs": "2546353acc95c67cd4a610e7a10baf77ffa631c6c80143f779fd879e5e302410",
+        "src/sim/pathfinding/zone_build.rs": "d475b9e28589f2a2cef57502c1774dfd631ab0147335af2b62353fbbb1b49bb7",
+        "src/sim/trigger_runtime.rs": "454623ba1e2127324cc2986cfe188fc978521488c655179a1e3c351bce0f96c8",
+        "src/sim/world/world_hash.rs": "bfddc736eb3bfbe239eb60e810fa5b62bbf51605b8e8abd9ef57c285cb5b1d17"
+      },
+      "patch": "patches/vera20k.patch",
+      "sha256": "93dccdfddb04f3257b5b43fea5708573e49409dc5d6f8351493aa1a04759a372"
+    },
+    "werhd-reference": {
+      "revision": "2ac47a5d6b1891f3c5e60795f51ce2c5c73ca4ed",
+      "files": {},
+      "patch": "patches/werhd-reference.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}
