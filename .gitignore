@@ -4,6 +4,9 @@ dist/
 validation/
 public/generated/
 public/wasm/
+public/native/
+native-client/target/
+native-client/.cargo-run/
 **/__pycache__/
 *.log
 .DS_Store

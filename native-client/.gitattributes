@@ -1,0 +1,25 @@
+# Evidence pins the bytes of Python tool helpers, so they stay LF in every checkout,
+# including Git for Windows' default CRLF conversion. The -text lines below override it.
+tools/**/*.py text eol=lf
+# Native replay and proof identities hash exact bytes, including LF endings.
+tools/rules_oracle/ares_prerequisites.json -text
+tools/spatial_oracle/_factory_infantry_output/** -text
+tools/map_observation.barracks-*.example.json -text
+src/sim/docking/fixtures/building_exit_tables_native.json -text
+src/sim/production/fixtures/infantry_exit_native.json -text
+src/sim/world/fixtures/factory_infantry*.json -text
+src/sim/world/world_spawn/fixtures/infantry_unlimbo*.json -text
+# These imported caller snapshots preserve the recorded extra newline at EOF.
+tools/spatial_oracle/_factory_infantry_output/admitted.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/construction.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/exit.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/factory.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/gate.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/idle.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/phase.py whitespace=-blank-at-eof
+tools/spatial_oracle/_factory_infantry_output/producer.py whitespace=-blank-at-eof
+tools/rules_oracle/ares_armor.json -text
+tools/spatial_oracle/ground_transport_deploy.json -text
+tools/rules_oracle/session_country_starting_ownership.json -text
+tools/rules_oracle/country_veterancy.json -text
+tools/spatial_oracle/no_manual_fire.json -text

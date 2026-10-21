@@ -1,0 +1,74 @@
+import http from 'node:http';
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import {requestPath, openRegularFile, fingerprint, sendFile, sendJson, methods, failRequest, listen, closeServer, httpError} from './services/http-files.mjs';
+import {attachNativeMultiplayer} from './services/native-websocket.mjs';
+import {isNativeAssetName,readNativeResourceManifest,verifyNativeBuild,nativeAssetManifestIdentity} from './native-build-manifest.mjs';
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const isNativeRetailFile = isNativeAssetName;
+export async function createNativeServer({root=projectRoot, host='127.0.0.1', port=5280,
+  verifyBuild=true,requireChecked=false,sourceCheck=false,
+  assetRoot=process.env.VERA_ASSET_ROOT ?? path.join(os.homedir(),'Library/Application Support/VERA20k/retail-assets')} = {}) {
+  root = await fs.realpath(path.resolve(root));
+  const retailRoot = await fs.realpath(path.resolve(assetRoot));
+  const index = await readNativeResourceManifest({assetRoot:retailRoot});
+  const build = verifyBuild ? await verifyNativeBuild({root,requireChecked,sourceCheck}) : null;
+  if(build && build.resourceManifestSha256!==nativeAssetManifestIdentity(index.manifest)) {
+    throw new Error('Native resource manifest differs from the compiled client; rebuild with these resources');
+  }
+  const admitted = new Map();
+  for (const [name, file] of index.allowed) {
+    const opened = await openRegularFile(retailRoot, file.name);
+    admitted.set(name, {...file, fingerprint:fingerprint(opened.stat)});
+    await opened.handle.close();
+  }
+  const nativeRoot = path.join(root,'public/native'), sourceRoot=path.join(root,'web-native');
+  const cache = new Map();
+  const server = http.createServer(async (request,response) => {
+    try {
+      const pathname=requestPath(request);
+      if (!methods(request,response)) return;
+      if (pathname==='/api/health') {
+        let ready=false;
+        try {ready=(await fs.stat(path.join(nativeRoot,'vera20k_bg.wasm'))).isFile();}catch{}
+        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',renderer:'VERA wgpu/WebGPU',multiplayer:{protocol:2,rooms:multiplayer.coordinator.rooms.size},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
+      }
+      if (pathname==='/api/native/resources') {sendJson(request,response,200,index.manifest);return;}
+      if (pathname.startsWith('/retail/')) {
+        const name=pathname.slice('/retail/'.length), item=isNativeRetailFile(name)?admitted.get(name.toLowerCase()):undefined;
+        if (!item) throw httpError(404,'Resource not exposed');
+        await sendFile(request,response,await openRegularFile(retailRoot,item.name),{digest:item.sha256,expectedFingerprint:item.fingerprint});return;
+      }
+      let directory, relative;
+      if (pathname==='/' || pathname==='/index.html') {directory=sourceRoot;relative='index.html';}
+      else if (['/bootstrap.js','/lobby.js','/lobby.css'].includes(pathname)) {directory=sourceRoot;relative=pathname.slice(1);}
+      else if (pathname==='/branding/icon.png' || pathname==='/favicon.ico') {directory=path.join(root,'native-client/art/branding');relative='wannafire-app-icon.png';}
+      else if (pathname==='/fonts/FiraSansCondensed-Medium.ttf' || pathname==='/fonts/FiraSansCondensed-OFL') {
+        directory=path.join(root,'native-client/art/fonts');relative=path.basename(pathname);
+      } else if (pathname.startsWith('/native/') && /\.(?:js|wasm|json)$/.test(pathname)) {
+        directory=nativeRoot;relative=pathname.slice('/native/'.length);
+      } else throw httpError(404,'Route not exposed');
+      const mime=relative.endsWith('.ttf')?'font/ttf':undefined;
+      await sendFile(request,response,await openRegularFile(directory,relative),{cache,mime});
+    }catch(error){failRequest(request,response,error);}
+  });
+  // The HTTP listener is not exposed until the same-origin WebSocket gate is attached.
+  const multiplayer=attachNativeMultiplayer(server,{allowedOrigins:[]});
+  const url=await listen(server,port,host);
+  // Port 0 is useful for integration tests. Admission uses the actual bound origin.
+  multiplayer.allowOrigin(url);
+  const localhostOrigin=new URL(url);localhostOrigin.hostname='localhost';multiplayer.allowOrigin(localhostOrigin.origin);
+  let closing;
+  return {server,url,manifest:index.manifest,multiplayer,close(){return closing??=(async()=>{await multiplayer.close();await closeServer(server);})();}};
+}
+if (process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+  const app=await createNativeServer({port:Number(process.env.PORT??5280)});
+  console.log(`王二火大 · VERA WebGPU ${app.url}`);
+  console.log(`只读游戏资源 ${app.manifest.files.length} 项；${Math.round(app.manifest.totalBytes/1048576)} MB`);
+  let closing=false;
+  const close=async()=>{if(closing)return;closing=true;await app.close();process.exit(0);};
+  process.on('SIGINT',close);process.on('SIGTERM',close);
+}

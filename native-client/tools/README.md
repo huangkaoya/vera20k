@@ -1,0 +1,397 @@
+# Repository tools
+
+Start here before writing a session-local helper. Run commands from the checkout
+root with Python 3.12 or newer (the build runner alone supports 3.11). Individual native tools also require Unicorn;
+see [native setup](native_oracle.md). This index currently covers the shared entry
+points; the exhaustive oracle/tool inventory remains tracked in issue #746.
+
+| Job | Owner / entry point |
+| --- | --- |
+| Observe match data or explicitly enable offline trainer/event tools | [Telemetry dashboard and debug build](telemetry-dashboard/README.md) |
+| Give a new worktree its ignored `ini/` and `config.toml`, or a clone its `config.toml`; report what the game, retail tests and oracles still need | `python -m tools.prepare_checkout` |
+| Run all Python tool and source-skill tests | `python -m tools.run_tests` (below) |
+| Inspect process audio definitions, sample sources and retention evidence | [Process audio catalog owner](audio_catalog_owner.md), `asset sound` |
+| Wait for builds; test, check, lint or build the current checkout; preserve A/B binaries | `python -m tools.cargo_run` (below) |
+| Find a built or preserved host executable for shell use | `python -m tools.cargo_run --resolve asset --profile release` (below) |
+| Run retail corpus checks or export a decoder-baseline candidate | [retail corpus](retail_corpus.md) |
+| Check hermetic gameplay fixtures against production-selected retail sources | [retail fixture contracts](retail_fixture_contracts.md), ordinary library tests with `RA2_DIR` |
+| Inspect exact retail INI values through production sources and readers | [INI lookup](ini_lookup.md), `asset ini-get` |
+| Select media archives without ambient argument parsing | [media policy](media_policy.md) |
+| Inspect/extract/render assets | [asset browser](asset_browser/README.md), `asset` binary |
+| Reproduce FireAt-tail launch goldens | [projectile fixture family](projectile_oracle/README.md) |
+| Reproduce native projectile launch, timer, collision and arc-domain goldens | [projectile comparisons](projectile_oracle/README.md); shared [slope initializer](native_slope.py) |
+| Reproduce palette, scanline, brightness and Ground/Level goldens | [checked palette oracle](palette_oracle/README.md) |
+| Reproduce Unit Foot Z selectors/composition and prepare a cliff comparison map | [checked Foot Z oracle](render_depth_oracle.md) |
+| Reproduce ground-height setters and Unit/Infantry placement leaves | [checked ramp-height oracle](ramp_height_oracle.md) |
+| Reproduce native animation boundary decisions and stores | [checked Anim boundary oracle](anim_oracle/README.md) |
+| Replay the Anytown packet's native witnesses and check its receipt | [checked native replay and receipt](spatial_oracle/anytown_damage/README.md) |
+| Compare empty-IFV bridge pursuit, missiles, collapse, Stop and restoration | [conditional native continuation and input provenance](spatial_oracle/fv_cell_attack/README.md) |
+| Read/disassemble native VAs; scan callers, fields and bytes | [native inspection](native_inspect.md), `python -m tools.native_inspect` |
+| Refresh the compiled mouse-cursor descriptor and action-to-row tables | [mouse cursor tables](mouse_oracle/cursor_table.md), `python -m tools.mouse_oracle.cursor_table` |
+| Compare Ghidra decompiles, callers and native stack frames | [Ghidra comparisons](ghidra_compare.md), `python -m tools.ghidra_compare` |
+| Replay a recorded annotation pass onto another copy of the Ghidra database | [Ghidra annotation passes](ghidra_pass.md), `ApplyGhidraPass.java` |
+| Reproduce Foot coordinates and bridge source-layer / reachability queries | [checked Foot bridge-layer oracle](spatial_oracle/foot_bridge_layer.md) |
+| Run native executable comparisons | [native oracle runner](native_oracle.md) |
+| Reproduce occupied-Building weapon/foundation queries and the scan-bound slice | [garrison queries](garrison_oracle/weapon_range.py), with JSON goldens and coverage sidecar |
+| Preserve failed native execution context and diagnose timeouts | [native failure reports](native_oracle.md#investigating-a-failed-native-run) |
+| Compare shell captures | `python -m tools.shell_capture_diff --help` |
+| Capture and certify shell routes | [shell certification](shell_certification/README.md) |
+| Capture and certify tactical routes | [tactical certification](tactical_certification/README.md) |
+| Measure resident unit-atlas texture pages and sprite counts | [production map observation](map_observation.md#resident-unit-atlas-measurement) |
+| Validate retained map captures or compare exact production observations | [map observation](map_observation.md), `python -m tools.map_observation compare` |
+| Name scenario command targets, inspect timelines and assert observed effects | [named commands and inspection](map_observation.md#named-commands-and-outcome-inspection), `python -m tools.map_observation inspect` |
+| Load a chosen retail map, step, capture and exit | [map observation](map_observation.md), `python -m tools.map_observation` |
+| Run one bounded child with retained diagnostics | `tools.child_process.run_child` (shared by capture wrappers) |
+| Check shell UI matrices | [exact shell matrix](exact_shell_ui_matrix/README.md) |
+| Synchronize authoritative skill sources | `python tools/skill_sync.py --write`, then `--check` |
+
+## Dev chord builds
+
+For the optional browser dashboard and separately gated trainer/event hooks,
+see the [offline debug build](telemetry-dashboard/README.md#offline-trainer-and-event-hooks).
+
+The default `dev-overlays` feature carries the Ctrl+Shift dev chord, including
+the renderer-native diagnostic overlays (cell grid, heightmap, pathgrid, foot
+path, fog), the debug pause and quicksave/quickload. Development builds,
+captures and tests keep it; captures send literal Ctrl+Shift+M/N for
+quicksave/quickload. The release workflow builds `vera20k` with
+`--no-default-features`, so shipped binaries carry no dev chord; build that
+configuration locally with:
+
+```sh
+python -m tools.cargo_run -- build --locked --release --no-default-features --bin vera20k
+```
+
+## Cargo ownership and labeled builds
+
+```sh
+python -m tools.cargo_run -- test --workspace --lib
+python -m tools.cargo_run -- clippy --workspace --lib
+python -m tools.cargo_run --label release-before -- build --locked --release -p vera20k --bin vera20k
+python -m tools.cargo_run --label tests-before -- test --workspace --lib --no-run
+python -m tools.cargo_run --resolve asset --profile release
+python -m tools.cargo_run --resolve vera20k --profile release --from-label release-before
+python -m unittest tools.tests.test_cargo_run -v
+```
+
+`--profile fast` (Cargo.toml) optimizes like `--release` but compiles the workspace crates
+incrementally, so a play-test, capture or other run after an edit rebuilds in a fraction of the
+time. Keep timing and performance numbers on `--release`. The runner records, labels and
+resolves `fast` host executables as it does `release` and `debug` ones.
+
+`--wait-seconds 60` bounds the wait (default one hour). Ctrl-C interrupts the
+runner. It does not kill other owners. Failed commands retain their exit code,
+produce no label and leave compiler diagnostics visible. Source edits during a
+run fail validation even if Cargo succeeds: labelled builds compare file
+contents, other runs compare sizes and timestamps.
+
+One kernel lock in the shared Git directory serializes cooperating worktrees.
+The runner also waits for any observed `cargo` or `rustc` process on this host.
+Unwrapped Cargo can still start after that observation: all sessions must use the
+runner to eliminate the check/start race. This coordinates one repository's
+worktrees; independent repository clones do not share the lock.
+
+`cargo test` holds that lock only while Cargo compiles. Cargo hands each test
+executable to a recorder, and the runner starts them after releasing the lock, with
+the arguments, environment and working directory Cargo gave them. They run at the
+same time (the client suite fills the cores the core suite leaves idle near its
+end); the first streams its output and each later one prints when those before it
+end. Every executable runs to its end, and any failure exits 101. A
+second lock per checkout stays held until the tests finish, so another run from the
+same checkout waits instead of relinking a running test. A runner configured for the
+host target in Cargo configuration takes precedence; the tests then run under the lock.
+
+Every run ends with one stderr line saying where its time went, including after a
+failure, for example
+`cargo_run: 94.2 s in all: 31.0 s waiting for the build lock, 12.1 s cache retention, 48.3 s Cargo, 2.6 s tests`.
+It stays visible when callers keep only the tail of the output.
+
+Each worktree has a separate cache under
+`<cache root>/owned-worktrees/<checkout-path-hash>`, where the cache root is
+`CARGO_TARGET_DIR` when set and otherwise the `target/` of the repository's primary
+checkout (the parent of the common Git directory), never the worktree's own `target/`.
+A checkout therefore has one cache whichever session builds it, as long as every
+session either leaves the variable unset or points it at that same directory; the
+runner notes on stderr when the registry holds another cache for the checkout.
+The first build of a profile (`debug`, `fast` or `release`) in a checkout's cache
+starts from the registry and git dependency units of another live checkout's cache,
+preferring one built from the same `Cargo.lock`, then the most recently used. The
+runner copies them under both locks, as copy-on-write clones where the filesystem
+supports them (APFS, Btrfs, XFS) and plain copies elsewhere, keeping timestamps, and
+prints one `Seeded ...` line. Cargo then reuses every unit whose name and fingerprint
+match and builds the rest. Workspace crates and incremental sessions are never
+copied: Cargo judges them by this checkout's source timestamps, so a copy could pass
+for a build of different source. Cross-target builds are not seeded, and a failed seed
+leaves Cargo to build what it lacks ([_cargo_seed.py](_cargo_seed.py)). Retention
+counts a clone's blocks in full; free space, which the reserve measures, shows the
+real cost. Existing shared caches are neither deleted nor trusted.
+`--target-dir`, `--manifest-path`, `--config` and `--message-format` are reserved
+by the runner. Other Cargo/test arguments and the caller's environment pass through.
+Tests must select `--lib`. The runner does not give a new worktree the ignored `ini/`
+and `config.toml`; `python -m tools.prepare_checkout` does.
+
+A label preserves every executable reported by **that Cargo invocation**, including
+fresh cache hits, under `<git-common-dir>/owned-builds/artifacts/<label>`.
+Executables retain their original basename inside numbered subdirectories.
+The printed directory's `manifest.json` gives the executable filenames, SHA-256s,
+checkout, commit, dirty status, combined tracked/nonignored source hash, command,
+Cargo/Rust versions and common build environment overrides. Labels cannot be
+replaced. This supports builds of selected binaries and `test --lib --no-run`;
+labels are not attached to checks or executed tests. A preserved test binary reads
+its fixtures from the checkout that built it when it runs (`src/test_fixture.rs`),
+so run it from that checkout while it still matches the manifest's source hash.
+
+The manifest identifies source and executable bytes; it is **not** a hermetic
+reproducibility claim. Ignored/local retail inputs, external dependencies, Cargo
+user configuration and arbitrary build-script environment inputs are not sealed.
+Capture and native-oracle tools retain responsibility for their own input evidence.
+Debug-symbol sidecars are not copied. Retention preserves required debug objects
+and sidecars; keep the source checkout when debugging a preserved binary.
+
+Cargo runs check retention automatically, under the same build lock. A retention
+pass inventories every registered cache, which takes seconds and grows with each
+worktree, so the runner starts one only when it can matter:
+
+- **Before compiling**, when the target volume is below the minimum free space
+  (labelled builds also measure the saved-artifact volume).
+- **After compiling**, also after failed builds, at most once every two hours
+  (`AUTOMATIC_INTERVAL_SECONDS`), or at once when a volume is below the minimum
+  or cannot be measured, or when a cache has been abandoned (below) since the
+  newest applied pass. Any applied pass counts, including one that ended
+  blocked or partial; a dry run does not. `--trim-cache` always runs one.
+- **Skipped** while the newest applied pass found nothing removable, finished
+  within that interval and nothing deciding removability has changed since:
+  cache directories, registered roots and profiles, protected executables and
+  which cache profiles are idle. While the reserve is short, only a pass that
+  found it short counts.
+
+Between passes the cache can exceed its budgets; the free-space reserve is still
+measured on every invocation. Defaults are **40 GiB total compiler
+cache**, **16 GiB incremental cache**, and **12 GiB minimum free space** per cache
+volume. A pass that finds the reserve short trims until **8 GiB of headroom**
+above it is free, so the next build does not need another pass at once. Set
+`VERA20K_CACHE_GIB`, `VERA20K_INCREMENTAL_GIB`, `VERA20K_MIN_FREE_GIB` and
+`VERA20K_FREE_HEADROOM_GIB`, or pass `--cache-gib`, `--incremental-gib`, and
+`--min-free-gib` before `--`; they set the policy the next pass applies. Sizes
+accept finite nonnegative decimal GiB.
+Cache budgets are soft: protected files and the working sets of profiles used
+within the hour (below) can keep the cache above them.
+The minimum free-space target also controls build admission: after cleanup, the
+runner measures the target volume again and blocks Cargo below that target.
+Labelled builds also check the saved-artifact volume. Measurement failure blocks
+the build; it never permits unsafe deletion. This reserve cannot predict the
+peak size of a future build or prevent unrelated applications consuming space.
+
+Before a large build, check the free-space result of `--trim-cache --dry-run`. If
+its minimum free-space target remains unmet, resolve the owned retention pressure before
+starting another large build; preserve required files and report any remaining
+shortfall. The runner enforces the free-space admission check for every Cargo
+invocation using the configured target, including checks and unlabelled builds.
+
+Preview or trim without starting Cargo:
+
+```sh
+python -m tools.cargo_run --trim-cache --dry-run
+python -m tools.cargo_run --trim-cache
+```
+
+The owner records every new target (including failed, unlabelled, check and custom
+target invocations) in `owned-builds/cache-roots.json`, with the last run of the
+cache and of each host profile directory it built. Historical labelled roots
+are adopted only when their live checkout/common Git directory and namespace
+prove ownership. A registered cache whose checkout no longer exists is abandoned
+once it has been idle ten minutes (`ABANDONED_SECONDS`), it sits in this repository's
+cache root under its checkout's namespace, and no run holds that checkout's lock.
+Every pass then removes the Cargo profile output in it, whatever the budgets, apart
+from files a preserved or latest build still names; its latest record goes first,
+since only its live checkout could resolve it. Empty directories go with it, and a
+cache left empty leaves the registry. Unregistered or unverifiable caches stay
+untouched.
+Only orphaned `deps/*.rcgu.o`, complete finalized incremental sessions and older
+Mach-O/ELF executables in `deps` are eligible; paths must belong to exact Cargo
+profile directories. An older executable is a `<name>-<16 hex>` file with a newer
+one of the same name beside it, no other link, and no preserved or latest record
+naming it; a checkout whose `cargo_run` holds its lock keeps all of them, since
+its recorded tests may still run. Objects only older executables name become
+eligible after those executables, never ahead of them. Cross-target profiles require
+an executable path reported by Cargo or retained in a preserved build manifest.
+A session counts as complete when it holds only files rustc writes there: its
+dependency graph, query cache, work-product index and metadata, and each codegen
+unit's object and, under ThinLTO (the `fast` profile), pre-LTO bitcode and import
+keys. While any target is unmet a pass first takes the disposable files: orphaned
+objects, older executables and every finalized session but a crate's newest,
+which rustc never reads again, oldest first. A crate's newest finalized session
+is its profile's working set. Working sets leave whole, one cache profile
+directory (`debug`, `fast`, `release`) at a time and least recently used first,
+so the most recent work keeps all of its own. Recency is the last run the
+registry records for that profile, or its cache's last run where none is
+recorded; a run registers when it starts and when Cargo ends. A short reserve evicts profiles in
+that order until the headroom is free; the budgets evict only profiles unused for
+an hour (`ACTIVE_PROFILE_SECONDS`). Working sessions and sessions containing links
+or unknown files stay protected. Shared compiler objects are eligible only when every inode alias
+is accounted for in registered caches and required debug-reference paths survive.
+Unknown external hardlinks remain protected; the cleaner never unlinks a required
+debug path. Cache and reclaimed-space accounting counts each inode once, and
+removing an alias does not claim freed allocation while another alias remains. Source, assets, native evidence,
+libraries, labels, debug sidecars and other executables are never deletion
+candidates. Every saved executable remains protected, including library-test binaries.
+Already absent debug inputs are reported separately as degraded debugging support;
+their absence does not block deletion of independently verified orphan objects.
+Existing dependencies remain protected even when another input of the same binary
+is missing. Restored/mutated dependencies invalidate an in-progress deletion plan.
+This does not restore lost symbols or claim complete debugging support.
+
+Mach-O inspection reads every N_OSO/N_AST reference directly from every symbol
+table/universal slice, including missing inputs that dsymutil's debug-map output
+omits. ELF embedded DWARF uses GNU `readelf`. PE32/PE32+ images without a debug
+directory are checked directly; embedded PE DWARF uses GNU `objdump`. Both DWARF
+readers disable link following and debuginfod servers. PE debug directories
+(including CodeView/PDB and legacy DBG),
+external/split/compressed DWARF and thin archives remain unsupported and stop
+trimming. PE executables and PDBs remain protected, with no new deletion candidacy.
+Malformed inputs, links, unknown formats and inspector failures still block deletion.
+
+Inspection results and preserved SHA checks are reused only while executable
+identity (including inode and ctime), expected checksum and inspector revision match.
+Dependency presence and identity are always checked anew. A pass also stops when the
+registry, a latest record or a label manifest is rewritten under it, but not for a
+ctime change alone: macOS changes theirs some time after each rewrite. Unknown inode identities
+are never reused. Unchanged inspector failures are cached for at most five minutes;
+changing the binary, inspector or readelf identity retries immediately. These caches
+never authorize deletion without fresh inventory and dependency checks. Automatic
+cleanup failure reports its reason; Cargo can proceed only when a fresh
+measurement meets the configured free-space reserve. Explicit trimming returns
+nonzero on inspection/deletion errors. The opt-in compiled checks run with
+`VERA20K_CACHE_NATIVE_TEST=1 python -m unittest tools.tests.test_cargo_macho tools.tests.test_cargo_cache_native`.
+
+Saved builds have a separate, explicit lifecycle. Default to unlabelled iteration;
+preserve only binaries needed for active comparisons, captures or debugging.
+Prefer `fast` binaries for ordinary captures and label debug tests selectively.
+Evidence should reference the shared label, manifest, binary hash and results
+instead of creating additional executable copies.
+
+Run retirement, including its dry run, only to retire owned labels or to investigate
+disk pressure; preserve required binaries, dependencies and evidence.
+After a validated chain merges, review its exact owned labels. Keep the final
+build and relevant control/debug binaries still required; archive manifests,
+checksums, results and native inputs through their evidence owners. Preview
+superseded labels, then apply the same exact selection without `--dry-run`, then
+trim rebuildable compiler caches:
+
+```sh
+python -m tools.cargo_run --retire-label old-test-v1 --retire-label old-release-v1 --dry-run
+python -m tools.cargo_run --retire-label old-test-v1 --retire-label old-release-v1
+python -m tools.cargo_run --trim-cache
+```
+
+Retirement never selects labels by age or glob and never touches their former
+checkout, compiler cache or external evidence. Original manifests and checksums
+are durably recorded in `owned-builds/label-retirements/` before deletion; retired
+executables themselves are not backed up. Partial failures retain progress receipts.
+All selected labels are preflighted for hashes, unexpected content, links, shared
+hardlinks and open files. Linux/macOS require working `lsof`; unsupported platforms
+fail closed. Process visibility is limited to the invoking user; stop consumers
+launched outside the shared build owner before retiring their labels. Never
+select by age or glob, touch another task's work, or delete active binaries,
+their required debugging/dependency files, source, assets or native evidence.
+External legacy copies of Rust binaries need a checked retirement owner; do not
+remove them with arbitrary `rm`. This review is manual: the runner has no
+GitHub-aware saved-build retirement. Automatic retention trims compiler caches.
+
+Legacy exported **Rust libtest** copies have an explicit, macOS-only retirement
+mode. Review an exact JSON plan, preview it, then apply that same plan:
+
+```sh
+python -m tools.cargo_run --retire-export-plan /absolute/canonical/export-plan.json --dry-run
+python -m tools.cargo_run --retire-export-plan /absolute/canonical/export-plan.json
+```
+
+The [export-plan contract](cargo_export_retirement.md) defines required fields.
+The mode never discovers files by age, glob or GitHub state and never runs old
+executables. It accepts only identified VERA Rust test harnesses in executable
+Mach-O images; PE/native gamemd, apps, scripts, assets, ambiguous/stripped images,
+links and shared hardlinks are rejected. Original ownership/results references
+and a same-checkout retained libtest replacement must be pinned by SHA-256.
+An explicit review must establish no active or required consumers. Missing debug
+inputs, inspection errors or changed replacements block deletion. Every selection
+preflights under the shared lock before any unlink. Original plan, identities,
+provenance/results references, replacement manifest and progress are durably
+recorded by the existing retirement owner in `owned-builds/label-retirements/`.
+Only exact selected executable files are unlinked; directories, dependency files,
+source, assets and native evidence remain. Old copies lacking pre-existing
+ownership records or debug inputs remain blocked; do not manufacture metadata.
+
+Each attempt writes `owned-builds/retention/<timestamp>-<id>.json`: selected and
+removed files, allocated/logical bytes removed, observed free-space change, errors
+and unmet targets, each cache profile's last use and the profiles whose working
+sets it evicted, in eviction order. A pass removes receipts older than seven days. Dry runs never remove files; their projected space is an estimate.
+APFS clones/snapshots and unrelated volume activity can make observed reclamation
+differ from file allocation; applying a plan rechecks real free space and tries
+additional eligible cold entries when necessary. Plans are never reused for deletion.
+
+`--resolve <BIN> --profile release|fast|debug --from-label <LABEL>` selects a
+preserved executable from that label. It verifies the recorded artifact path,
+host/profile classification and actual SHA-256; missing, ambiguous, malformed or
+changed artifacts fail without falling back to a latest build. This uses the
+same preserved manifest owner as `--label`, including existing schema-1 labels.
+The original build source and toolchain metadata stay in the label's manifest.
+
+For shell use, `--resolve <BIN> --profile release|fast|debug` prints only the absolute
+verified path to stdout. Missing records/files or changed bytes produce a nonzero
+exit and diagnostics on stderr. It never builds or falls back to another profile;
+resolve mode accepts no Cargo arguments, label or build-wait option. For example:
+
+```sh
+asset_bin=$(python -m tools.cargo_run --resolve asset --profile release)
+"$asset_bin" parse-check --all-mixes
+```
+
+Resolution checks recorded binary bytes, not whether they reflect current source.
+Build after source changes; use a preserved label when exact build provenance is
+needed. The Python API permits an omitted profile for the existing MCP preference.
+
+The asset-browser MCP uses `cargo_run.resolve_binary` to discover emitted host
+release/fast/debug executables from the per-checkout record in
+`<git-common-dir>/owned-builds/latest/`. That record is updated atomically after
+successful builds, and discovery verifies executable bytes. Cross-target and
+other custom-profile builds (such as `shipping`) still support explicit
+paths/labels; they are not auto-run by host tooling. Conventional target paths
+are not a fallback.
+
+## Python regression suite
+
+```sh
+python -m pip install -r tools/requirements-test.txt
+python -m tools.run_tests --list
+python -m tools.run_tests
+```
+
+Requires Python 3.12+ (including Windows junction detection). The runner finds
+`test_*.py` recursively under `tools/` and authoritative `.agents/skills/`, including
+folders without `__init__.py`; it excludes generated `.claude` mirrors and the
+machine-local `ghidra-up` skill. It prints every module and its test count, fails
+on import errors or empty test modules, and propagates test failures. Focus a
+module with ordinary `python -m unittest <module> -v` when investigating a failure.
+Agents run it before every PR that changes tools or skills (AGENTS.md). The
+`python-tools` workflow runs the same suite and the skill-mirror check on Linux,
+macOS and Windows when a maintainer dispatches it. No Cargo, game executable, GPU
+or retail install is needed; Unicorn exercises synthetic x86 in the runner failure tests.
+This protects native execution contracts; it does not reproduce retail goldens.
+
+Two existing checks require private sealed evidence and are explicitly skipped
+by default, even when a local `config.toml` happens to exist:
+
+- Tactical environment preflight: the pinned archive and font from
+  `tactical_certification/profiles/soviet-radar-online-v3.json`, a project `config.toml`,
+  and that profile's Windows environment. Set `VERA20K_TEST_PROJECT_DIR` to the
+  configured checkout (defaults to this checkout).
+- Historical title differential: Windows plus `VERA20K_SHELL_GUARD`,
+  `VERA20K_ORACLE_RUNS` and `VERA20K_SHELL_CAPTURE`, pointing to the original sealed
+  title comparison evidence described in the shell-certification tests. Its
+  expected mismatch counts describe that specific historical capture.
+
+`python -m tools.run_tests --retail` opts into **both** checks; missing inputs fail
+instead of silently passing or skipping. For just one, set `VERA20K_TEST_RETAIL=1`
+and run its fully qualified unittest name. Platform-unavailable symlink creation
+may also skip its rejection test with an explicit OS reason. The generated matrix
+check now creates its own artifact, so it runs without a session-local target file.

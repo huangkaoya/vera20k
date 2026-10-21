@@ -1,0 +1,189 @@
+//! Shared ore fixtures for tests.
+//!
+//! Tiberium has one authority: the `OverlayGrid` cell, read through the
+//! overlay and tiberium type registries. Tests seed ore the way a map does, by
+//! placing a tiberium overlay with a density byte, never through a side store.
+
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+use crate::map::resolved_terrain::{
+    ResolvedTerrainCell, ResolvedTerrainGrid, TEST_RETAIL_CLEAR_SPEED_COSTS,
+};
+use crate::rules::ini_parser::IniFile;
+use crate::rules::overlay_types::OverlayTypeRegistry;
+use crate::rules::ruleset::RuleSet;
+use crate::sim::entity_store::EntityStore;
+use crate::sim::intern::StringInterner;
+use crate::sim::miner::ResourceType;
+use crate::sim::occupancy::{OccupancyGrid, RawCellOccupationGrid};
+use crate::sim::overlay_grid::OverlayGrid;
+use crate::sim::tiberium::TiberiumPlacementObjectContext;
+use crate::sim::world::Simulation;
+
+/// Side length of the overlay grid [`place_tiberium`] creates on demand.
+pub(crate) const TEST_GRID_SIZE: u16 = 64;
+
+/// Flat Clear cells that allow tiberium and carry the retail `[Clear]` row,
+/// whose Track entry a new ore Overlay's Mark admission reads
+/// (`CellClass::CheckCellPassability @ 0x004834A0`, called at `0x005FD00C`;
+/// `0x005FD04F` for TIB01).
+pub(crate) fn flat_terrain(width: u16, height: u16) -> ResolvedTerrainGrid {
+    crate::map::resolved_terrain::test_grid(width, height, |rx, ry| ResolvedTerrainCell {
+        speed_costs: TEST_RETAIL_CLEAR_SPEED_COSTS,
+        base_speed_costs: TEST_RETAIL_CLEAR_SPEED_COSTS,
+        ..crate::map::resolved_terrain::test_tiberium_cell(rx, ry)
+    })
+}
+
+/// A world with no objects in it: the live-object half of a
+/// `NewTiberiumAdmission` for tests that are not about the object gate.
+pub(crate) struct NoLiveObjects {
+    entities: EntityStore,
+    occupancy: OccupancyGrid,
+    raw_occupation: RawCellOccupationGrid,
+    rules: RuleSet,
+    interner: StringInterner,
+    terrain_object_cells: BTreeMap<(u16, u16), u64>,
+}
+
+impl NoLiveObjects {
+    pub(crate) fn new() -> Self {
+        Self {
+            entities: EntityStore::new(),
+            occupancy: OccupancyGrid::new(),
+            raw_occupation: RawCellOccupationGrid::new(),
+            rules: RuleSet::from_ini(&IniFile::from_str(
+                "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n",
+            ))
+            .expect("empty rules"),
+            interner: StringInterner::default(),
+            terrain_object_cells: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn context(&self) -> TiberiumPlacementObjectContext<'_> {
+        TiberiumPlacementObjectContext::new(
+            &self.entities,
+            &self.occupancy,
+            &self.raw_occupation,
+            &self.rules,
+            &self.interner,
+            &self.terrain_object_cells,
+        )
+    }
+}
+
+/// Stock-shaped `[Tiberiums]` and `[OverlayTypes]` sections: Riparius (ore,
+/// `Value=25`) on `TIB01..TIB20` at the native overlay indices 102..=121, and
+/// Cruentus (gems, `Value=50`) on `GEM01..GEM12` at 27..=38. Append it to a
+/// test's rules text so `RuleSet::tiberium_types` is populated.
+pub(crate) fn tiberium_rules_text() -> String {
+    let mut text = String::from(
+        "\n[Tiberiums]\n0=Riparius\n1=Cruentus\n\
+         [Riparius]\nImage=1\nValue=25\nGrowth=2200\nGrowthPercentage=0\n\
+         Spread=2200\nSpreadPercentage=0\n\
+         [Cruentus]\nImage=2\nValue=50\nGrowth=10000\nGrowthPercentage=0\n\
+         Spread=10000\nSpreadPercentage=0\n[OverlayTypes]\n",
+    );
+    let mut tiberium_names = Vec::new();
+    for raw_key in (1..=124).filter(|key| *key != 40 && *key != 41) {
+        let name = match raw_key {
+            28..=39 => format!("GEM{:02}", raw_key - 27),
+            105..=124 => format!("TIB{:02}", raw_key - 104),
+            _ => format!("FILL{raw_key:03}"),
+        };
+        text.push_str(&format!("{raw_key}={name}\n"));
+        if name.starts_with("TIB") || name.starts_with("GEM") {
+            tiberium_names.push(name);
+        }
+    }
+    for name in tiberium_names {
+        text.push_str(&format!("[{name}]\nTiberium=yes\nLand=Tiberium\n"));
+    }
+    text
+}
+
+/// The overlay registry matching [`tiberium_rules_text`].
+pub(crate) fn overlay_registry() -> &'static OverlayTypeRegistry {
+    static REGISTRY: OnceLock<OverlayTypeRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        OverlayTypeRegistry::from_ini(&IniFile::from_str(&tiberium_rules_text()), None)
+    })
+}
+
+/// Place ore or gems that yield `bales` bales (1..=11), creating the overlay
+/// grid if the fixture has none. `bales` is the raw density byte:
+/// `CellClass::ReduceTiberium @ 0x00480A80` hands out one bale per density
+/// level and nothing for the bite that clears a density-0 cell.
+pub(crate) fn place_tiberium(
+    sim: &mut Simulation,
+    rx: u16,
+    ry: u16,
+    resource: ResourceType,
+    bales: u8,
+) {
+    let name = match resource {
+        ResourceType::Ore => "TIB01",
+        ResourceType::Gem => "GEM01",
+    };
+    let overlay_id = overlay_registry()
+        .id_for_name(name)
+        .expect("fixture overlay is registered");
+    let grid = sim
+        .overlay_grid
+        .get_or_insert_with(|| OverlayGrid::new(TEST_GRID_SIZE, TEST_GRID_SIZE));
+    grid.place_overlay(rx, ry, overlay_id, bales.clamp(1, 11));
+}
+
+/// [`overlay_registry`] with every stock land row admitting Foot, Track and
+/// Wheel at 100%, so a recalculated ore cell carries a passable `[Tiberium]`
+/// speed row.
+pub(crate) fn overlay_registry_with_land() -> &'static OverlayTypeRegistry {
+    static REGISTRY: OnceLock<OverlayTypeRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut text = tiberium_rules_text();
+        for land in crate::rules::terrain_rules::LandType::ALL {
+            text.push_str(&format!(
+                "[{}]\nFoot=100%\nTrack=100%\nWheel=100%\n",
+                land.section_name()
+            ));
+        }
+        OverlayTypeRegistry::from_ini(&IniFile::from_str(&text), None)
+    })
+}
+
+/// [`place_tiberium`] on a fixture with map cells: the overlay, then the
+/// cell's recalculation through the production path (`CellClass::
+/// RecalcAttributes @ 0x0047D2B0` writes LandType 5 and its speed row), as
+/// an ore cell reads to the harvest scan's Is_Cell_Harvestable.
+pub(crate) fn place_tiberium_on_map(
+    sim: &mut Simulation,
+    cell: (u16, u16),
+    resource: ResourceType,
+    bales: u8,
+) {
+    place_tiberium(sim, cell.0, cell.1, resource, bales);
+    if let (Some(grid), Some(terrain)) = (sim.overlay_grid.as_mut(), sim.resolved_terrain.as_mut())
+    {
+        grid.recalculate_runtime_cell(terrain, overlay_registry_with_land(), cell);
+    }
+}
+
+/// Bales left on a cell (its density byte), or 0 when it holds no tiberium.
+pub(crate) fn bales_at(sim: &Simulation, rx: u16, ry: u16) -> u8 {
+    let Some(grid) = sim.overlay_grid.as_ref() else {
+        return 0;
+    };
+    let cell = grid.cell(rx, ry);
+    match cell.overlay_id {
+        Some(id) if is_tiberium(id) => cell.overlay_data,
+        _ => 0,
+    }
+}
+
+fn is_tiberium(overlay_id: u8) -> bool {
+    overlay_registry()
+        .flags(overlay_id)
+        .is_some_and(|flags| flags.tiberium)
+}

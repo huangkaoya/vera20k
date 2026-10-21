@@ -4,6 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "setup:native-web": "node tools/setup-native-web.mjs",
+    "build:native-web": "node tools/build-native-web.mjs",
+    "start:native-web": "node tools/native-server.mjs",
+    "native:check": "python3 tools/native-source.py check",
+    "native:record": "python3 tools/native-source.py record",
+    "native:sync": "python3 tools/native-source.py sync",
+    "native:test-sync": "python3 tools/native-source-test.py",
     "dev": "node tools/dev-server.mjs",
     "dev:stack": "node tools/run-stack.mjs --dev",
     "start:stack": "node tools/run-stack.mjs",

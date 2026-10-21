@@ -1,0 +1,464 @@
+//! Sidebar gadget flash primitive.
+//!
+//! Mirrors the SBGadgetClass flash sub-struct (+0x34 state / +0x38 period /
+//! +0x3c countdown / +0x1e disabled) and the three driver functions
+//! Start_Flash / Stop_Flash / Flash_AI. One instance per pressable gadget
+//! that may flash. Native entries: Start69DFC0, Stop69DFF0, FlashAI69E010;
+//! tools/sidebar_oracle/tab_flash.json executes their caller and timer states.
+//!
+//! ## Dependency rules
+//! - Part of `sidebar/` — pure data + logic, no rendering or sim dependencies.
+
+/// Persistent flash state for one pressable gadget.
+///
+/// Mirrors three contiguous fields on an SBGadgetClass instance plus the
+/// separate +0x1e disabled gate. All four are byte-for-byte semantic
+/// counterparts of the binary; the field names use plain-English meanings
+/// rather than the binary offsets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GadgetFlash {
+    /// "Draw as pressed" bit. 0 = idle visual, 1 = pressed-look visual.
+    /// Toggled by `tick` when a flash period elapses.
+    pub state: u8,
+
+    /// Toggle interval in ticks AND the "is-flashing" sentinel (non-zero ⇒ active).
+    /// Stays constant for the lifetime of an active flash; reset by `stop`.
+    pub period: u32,
+
+    /// Ticks remaining until the next toggle. On the first cycle this is
+    /// `period + extra_delay`; on every subsequent cycle it resets to `period`.
+    pub countdown: u32,
+
+    /// Auto-stop gate. When set, the next `tick` zeros all three flash fields
+    /// and reports a state change.
+    pub disabled: bool,
+}
+
+impl GadgetFlash {
+    /// StripAI 0x006A8E52..0x006A8E9B (also Sidebar 0x006A76F0): align
+    /// tab pulses to the next ten-frame boundary. At an exact boundary the
+    /// initial delay is ten, not zero. LEA wraps before the signed division.
+    /// Original executed controls: tools/sidebar_oracle/tab_flash.json.
+    pub(crate) fn start_tab_flash(&mut self, frame: i32) -> bool {
+        let delay = 10 - frame % 10;
+        let next_boundary = frame.wrapping_add(delay) / 10;
+        self.start(10, delay as u32, u8::from(next_boundary % 2 == 0))
+    }
+
+    /// Schedule a flash. No-op (returns `false`) if a flash is already active —
+    /// matches the gamemd Start_Flash guard at +0x38 != 0.
+    ///
+    /// `extra_delay` is added to the FIRST countdown only; the steady-state
+    /// toggle interval is `period`.
+    pub fn start(&mut self, period: u32, extra_delay: u32, initial_state: u8) -> bool {
+        if self.period != 0 {
+            return false;
+        }
+        self.period = period;
+        self.countdown = period + extra_delay;
+        self.state = initial_state;
+        true
+    }
+
+    /// Cancel any active flash. No-op (returns `false`) if not currently flashing.
+    /// Field-write order matches the binary: state → countdown → period.
+    pub fn stop(&mut self) -> bool {
+        if self.period == 0 {
+            return false;
+        }
+        self.state = 0;
+        self.countdown = 0;
+        self.period = 0;
+        true
+    }
+
+    /// Advance one game-logic tick. Returns `true` when the visible state
+    /// changed (caller marks redraw / picks a new frame index).
+    pub fn tick(&mut self) -> bool {
+        if self.disabled {
+            if self.period != 0 {
+                self.state = 0;
+                self.countdown = 0;
+                self.period = 0;
+                return true;
+            }
+            return false;
+        }
+        if self.countdown == 0 {
+            return false;
+        }
+        self.countdown -= 1;
+        if self.countdown == 0 {
+            self.state ^= 1;
+            self.countdown = self.period;
+            return true;
+        }
+        false
+    }
+
+    /// True while a flash is scheduled (period != 0).
+    pub fn is_active(&self) -> bool {
+        self.period != 0
+    }
+}
+
+/// Pick a SHP frame index for a 5-frame gadget given its three state bits.
+///
+/// Mirrors the SBGadgetClass::Draw conditional at gamemd's `0x0069DEB0`.
+/// Output indices map to the 5-frame SHP convention used by `tab0N.shp`,
+/// `repair.shp`, and `sell.shp`:
+///   0 = idle, 1 = mode-active, 2 = disabled, 3 = pressed-idle, 4 = pressed-active.
+///
+/// Inputs:
+/// - `disabled`: the gadget's disabled gate.
+/// - `mode_active`: the persistent "this mode is on" / "this tab is selected" bit.
+///   For tabs this is the active-tab bit; for Repair/Sell this is the
+///   mode-on toggle.
+/// - `state`: the transient "drawn as pressed" bit (set by mouse-down OR by
+///   the flash AI's tick toggle).
+///
+/// The function assumes the gadget is pressable (the not-pressable / hover-static
+/// branch from the binary is unused for any of our 5-frame gadgets).
+pub fn frame_select(disabled: bool, mode_active: bool, state: u8) -> u8 {
+    if disabled {
+        return 2;
+    }
+    if state != 0 {
+        if mode_active { 4 } else { 3 }
+    } else if mode_active {
+        1
+    } else {
+        0
+    }
+}
+
+/// Pick a SHP frame index for the 3-frame strip-scroll art (`r-up.shp` /
+/// `r-dn.shp`). The scroll buttons do NOT use the 5-frame tab convention —
+/// their art has exactly 3 frames: 0 = idle, 1 = pressed, 2 = disabled.
+/// The view applies the native `6A6610` capacity-disabled state first.
+pub fn scroll_frame_select(pressed: bool) -> u8 {
+    u8::from(pressed)
+}
+
+/// Persistent flash + mode state for the in-game sidebar gadgets.
+///
+/// Lives on `AppState` (one instance per app session). Ticked once per sim
+/// tick by `sidebar_gadgets::update_sidebar_gadget_state`. Read by the
+/// per-frame `SidebarView` builder to populate gadget `frame_index` fields.
+#[derive(Debug, Clone, Default)]
+pub struct SidebarGadgetState {
+    /// One flash per tab gadget, indexed by `SidebarTab::tab_index()`.
+    /// Building/Defense flash for linked completed buildings; Defense also
+    /// flashes for ready Supers. Infantry has no native ready-flash poll.
+    pub tab_flashes: [GadgetFlash; 4],
+
+    /// Strip availability projected at sidebar refresh (native gadget+1E).
+    /// Native only flips these on the AddCameo/Recalculate transitions, so the
+    /// bit is event-driven state rather than a per-refresh projection.
+    pub tab_disabled: [bool; 4],
+
+    /// Mirrors Display +0x11B0 (set by 4AC8C0). Toggled by clicking the Repair button.
+    /// Mutually exclusive with `sell_mode_on` and `AppState.targeting_mode`.
+    pub repair_mode_on: bool,
+
+    /// Mirrors Display +0x11B1 (set by 4AC660). Toggled by clicking the Sell button.
+    /// Mutually exclusive with `repair_mode_on` and `AppState.targeting_mode`.
+    pub sell_mode_on: bool,
+
+    /// Per-button disabled bits. v1: always false.
+    pub repair_disabled: bool,
+    pub sell_disabled: bool,
+
+    /// Last sim tick the orchestrator processed; used to advance per
+    /// sim-tick delta (catch-up safe).
+    pub last_sim_tick: u64,
+
+    /// Transient pressed-look bits (study G22): true while the gadget driver
+    /// holds the button pressed-inside; popped on drag-off, restored on
+    /// drag-back. Published by `app::input::gadget_input` after every gadget tick.
+    pub tab_pressed: [bool; 4],
+    pub repair_pressed: bool,
+    pub sell_pressed: bool,
+    pub scroll_down_pressed: bool,
+    pub scroll_up_pressed: bool,
+    pub top_pressed: [bool; 2],
+    /// Native constructor6CFE20 starts the bottom bar open.
+    pub command_bar_closed: bool,
+    pub command_pressed: [bool; 11],
+    pub command_thumb_pressed: bool,
+}
+
+impl SidebarGadgetState {
+    /// Advance existing pulses through missed ticks, then perform the current
+    /// frame's poll followed by FlashAI, as Sidebar Action6A77CD/6A7A8C does.
+    /// A newly ready item starts at this frame, rather than consuming ticks
+    /// that passed before it was observed. Repeated renders do not tick again.
+    pub(crate) fn update_tab_flashes(&mut self, tick: u64, frame: i32, ready: [bool; 4]) {
+        let delta = tick.saturating_sub(self.last_sim_tick);
+        for _ in 1..delta {
+            for flash in &mut self.tab_flashes {
+                flash.tick();
+            }
+        }
+        for (flash, ready) in self.tab_flashes.iter_mut().zip(ready) {
+            if ready {
+                flash.start_tab_flash(frame);
+            } else {
+                flash.stop();
+            }
+        }
+        if delta != 0 {
+            for flash in &mut self.tab_flashes {
+                flash.tick();
+            }
+        }
+        self.last_sim_tick = tick;
+    }
+
+    /// Display4AC8C0(0)/4AC660(0): a pending building placement refuses mode
+    /// changes. Power/planning have no active owner yet; a bare superweapon
+    /// target is independent and is not canceled by these calls.
+    pub(crate) fn disable_selection_modes(&mut self, placement_armed: bool) {
+        if !placement_armed {
+            self.repair_mode_on = false;
+            self.sell_mode_on = false;
+        }
+    }
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Native6A6472 enables after Add and6A6820/Recalculate disables after the
+    /// last entry is removed; the retained bit is what the frame table reads.
+    pub(crate) fn set_tab_disabled(&mut self, tab_index: usize, disabled: bool) {
+        self.tab_disabled[tab_index] = disabled;
+        self.tab_flashes[tab_index].disabled = disabled;
+    }
+
+    /// Frame index for a tab gadget. Caller passes whether this tab is the
+    /// currently-active tab (the externally driven latch-ON mirror,
+    /// study §2.5 / G22 Kind 2).
+    pub(crate) fn tab_frame(&self, tab_index: usize, is_active_tab: bool) -> u8 {
+        if self.tab_disabled[tab_index] {
+            return 2;
+        }
+        self.tab_frame_enabled(tab_index, is_active_tab)
+    }
+
+    pub(crate) fn tab_frame_enabled(&self, tab_index: usize, is_active_tab: bool) -> u8 {
+        let flash = &self.tab_flashes[tab_index];
+        // Pressed-look = flash pulse OR live press-hold (study G22).
+        let state = if self.tab_pressed[tab_index] {
+            1
+        } else {
+            flash.state
+        };
+        frame_select(false, is_active_tab, state)
+    }
+
+    /// Frame index for the Repair button. Repair has no flash AI — the state
+    /// bit is the live press-hold; "stays pressed" comes from `mode_active`.
+    pub fn repair_frame(&self) -> u8 {
+        frame_select(
+            self.repair_disabled,
+            self.repair_mode_on,
+            u8::from(self.repair_pressed),
+        )
+    }
+
+    /// Frame index for the Sell button. Same logic as `repair_frame`.
+    pub fn sell_frame(&self) -> u8 {
+        frame_select(
+            self.sell_disabled,
+            self.sell_mode_on,
+            u8::from(self.sell_pressed),
+        )
+    }
+
+    /// Frame index for the strip scroll-down (+page) button. No mode bit, no
+    /// flash — pressed-look only, using the 3-frame R-DN convention.
+    pub fn scroll_down_frame(&self) -> u8 {
+        scroll_frame_select(self.scroll_down_pressed)
+    }
+
+    /// Frame index for the strip scroll-up (−page) button (3-frame R-UP
+    /// convention).
+    pub fn scroll_up_frame(&self) -> u8 {
+        scroll_frame_select(self.scroll_up_pressed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_from_idle_initialises_all_fields() {
+        let mut g = GadgetFlash::default();
+        assert!(g.start(10, 7, 1));
+        assert_eq!(g.period, 10);
+        assert_eq!(g.countdown, 17, "first countdown is period + extra_delay");
+        assert_eq!(g.state, 1);
+        assert!(g.is_active());
+    }
+
+    #[test]
+    fn start_while_active_is_noop() {
+        let mut g = GadgetFlash::default();
+        g.start(10, 7, 1);
+        let snapshot = g;
+        assert!(!g.start(20, 0, 0), "guard returns false");
+        assert_eq!(g.period, snapshot.period);
+        assert_eq!(g.countdown, snapshot.countdown);
+        assert_eq!(g.state, snapshot.state);
+    }
+
+    #[test]
+    fn tick_decrements_countdown_until_toggle() {
+        let mut g = GadgetFlash::default();
+        // First cycle: period=10, extra_delay=5, initial=0 → countdown=15.
+        g.start(10, 5, 0);
+        for _ in 0..14 {
+            assert!(!g.tick(), "no toggle yet");
+        }
+        assert!(g.tick(), "15th tick toggles");
+        assert_eq!(g.state, 1, "state XOR-toggled to 1");
+        assert_eq!(
+            g.countdown, 10,
+            "countdown resets to period, not period+extra"
+        );
+    }
+
+    #[test]
+    fn tick_when_disabled_auto_stops_active_flash() {
+        let mut g = GadgetFlash::default();
+        g.start(10, 0, 1);
+        g.disabled = true;
+        assert!(g.tick(), "auto-stop reports a change");
+        assert_eq!(g.state, 0);
+        assert_eq!(g.countdown, 0);
+        assert_eq!(g.period, 0);
+    }
+
+    #[test]
+    fn aggregator_frame_accessors() {
+        let mut s = SidebarGadgetState::new();
+        // Idle tab → 0; active tab → 1.
+        assert_eq!(s.tab_frame(0, false), 0);
+        assert_eq!(s.tab_frame(0, true), 1);
+        // Flash mid-pulse on tab 3 (Vehicle).
+        s.tab_flashes[3].state = 1;
+        s.tab_flashes[3].period = 10;
+        assert_eq!(s.tab_frame(3, false), 3, "inactive + pressed-look");
+        assert_eq!(s.tab_frame(3, true), 4, "active + pressed-look");
+        // Disabled overrides everything.
+        s.tab_disabled[3] = true;
+        assert_eq!(s.tab_frame(3, true), 2);
+        // Repair/Sell.
+        assert_eq!(s.repair_frame(), 0);
+        s.repair_mode_on = true;
+        assert_eq!(s.repair_frame(), 1);
+        s.repair_disabled = true;
+        assert_eq!(s.repair_frame(), 2);
+        s.sell_mode_on = true;
+        s.sell_disabled = false;
+        assert_eq!(s.sell_frame(), 1);
+    }
+
+    #[test]
+    fn frame_select_table() {
+        // (disabled, mode_active, state) → expected frame
+        let cases: &[(bool, bool, u8, u8)] = &[
+            (false, false, 0, 0), // idle
+            (false, true, 0, 1),  // mode-active
+            (true, false, 0, 2),  // disabled (mode and state ignored)
+            (true, true, 0, 2),
+            (true, false, 1, 2),
+            (true, true, 1, 2),
+            (false, false, 1, 3), // pressed-idle
+            (false, true, 1, 4),  // pressed-active
+        ];
+        for &(disabled, mode_active, state, expected) in cases {
+            let got = frame_select(disabled, mode_active, state);
+            assert_eq!(
+                got, expected,
+                "frame_select(disabled={disabled}, mode_active={mode_active}, state={state}) expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_buttons_use_three_frame_convention() {
+        // R-UP.SHP / R-DN.SHP have exactly 3 frames: 0 = idle, 1 = pressed,
+        // 2 = disabled — NOT the 5-frame tab convention (pressed at 3).
+        assert_eq!(scroll_frame_select(false), 0, "idle selects frame 0");
+        assert_eq!(scroll_frame_select(true), 1, "pressed selects frame 1");
+        let mut s = SidebarGadgetState::new();
+        assert_eq!(s.scroll_down_frame(), 0);
+        assert_eq!(s.scroll_up_frame(), 0);
+        s.scroll_down_pressed = true;
+        assert_eq!(s.scroll_down_frame(), 1, "pressed-look is frame 1");
+        assert_eq!(s.scroll_up_frame(), 0, "the pair is independent");
+        s.scroll_down_pressed = false;
+        s.scroll_up_pressed = true;
+        assert_eq!(s.scroll_down_frame(), 0);
+        assert_eq!(s.scroll_up_frame(), 1);
+    }
+}
+#[test]
+fn native_tab_flash_phase_and_timer_controls() {
+    let rows = crate::test_fixture::json("tools/sidebar_oracle/tab_flash.json");
+    for row in rows.as_array().unwrap() {
+        let input = &row["input"];
+        let prior = input["prior"].as_array();
+        let mut flash = GadgetFlash {
+            state: prior.map_or(0, |p| p[0].as_u64().unwrap() as u8),
+            period: prior.map_or(0, |p| p[1].as_u64().unwrap() as u32),
+            countdown: prior.map_or(0, |p| p[2].as_u64().unwrap() as u32),
+            disabled: false,
+        };
+        // The original poll supplies the admission; this comparison tests
+        // the shared phase/timer port, not a second Rust ready predicate.
+        if row["stop"] == "0x6a8ea0" {
+            flash.start_tab_flash(input["frame"].as_i64().unwrap() as i32);
+        } else {
+            flash.stop();
+        }
+        let state =
+            |flash: &GadgetFlash| serde_json::json!([flash.state, flash.period, flash.countdown]);
+        assert_eq!(state(&flash), row["output"], "{input}");
+        let mut tick = 0;
+        for checkpoint in row["history"].as_array().unwrap() {
+            let until = checkpoint["ticks"].as_u64().unwrap();
+            while tick < until {
+                flash.tick();
+                tick += 1;
+            }
+            assert_eq!(state(&flash), checkpoint["state"], "{input}, tick {tick}");
+        }
+    }
+}
+
+#[test]
+fn tab_flash_catchup_starts_new_ready_state_at_current_frame() {
+    let mut caught_up = SidebarGadgetState::default();
+    let mut stepped = SidebarGadgetState::default();
+    caught_up.update_tab_flashes(0, 0, [false; 4]);
+    for tick in 0..=100 {
+        stepped.update_tab_flashes(tick, tick as i32, [tick == 100, false, false, false]);
+    }
+    caught_up.update_tab_flashes(100, 100, [true, false, false, false]);
+    assert_eq!(caught_up.tab_flashes[0].countdown, 19);
+    for tick in 101..=200 {
+        stepped.update_tab_flashes(tick, tick as i32, [true, false, false, false]);
+    }
+    caught_up.update_tab_flashes(200, 200, [true, false, false, false]);
+    let flash = caught_up.tab_flashes[0];
+    assert_eq!(flash.state, stepped.tab_flashes[0].state);
+    assert_eq!(flash.countdown, stepped.tab_flashes[0].countdown);
+    caught_up.update_tab_flashes(200, 200, [true, false, false, false]);
+    assert_eq!(caught_up.tab_flashes[0].countdown, flash.countdown);
+    caught_up.update_tab_flashes(201, 201, [false; 4]);
+    assert!(!caught_up.tab_flashes[0].is_active());
+}

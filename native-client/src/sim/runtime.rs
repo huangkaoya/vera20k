@@ -1,0 +1,1273 @@
+//! Construction and frame API around Simulation and its bound match resources.
+//!
+//! App, headless and replay execution use SimRuntime. SimResources binds the
+//! rules/art registry, overlay registry and base terrain template;
+//! advance_frame reads these without caller-substituted per-frame resources.
+//! Simulation owns live mutable terrain and gameplay state, including the
+//! trigger runtime's definitions, which it reads from the map once at
+//! scenario init.
+//! SimView provides immutable access for presentation and diagnostics.
+//!
+//! Dependency rules: part of sim/; never depends on render/, ui/,
+//! audio/ or net/.
+
+use crate::map::resolved_terrain::TerrainTileAnimation;
+use crate::rules::ruleset::RuleSet;
+use crate::sim::anim_class::{AnimDrawRuntime, AnimWorldCoord};
+use crate::sim::components::AnimClassSpawnDescriptor;
+use crate::sim::world::Simulation;
+
+/// Per-match resource inputs bound at construction and read during frame advancement.
+pub struct SimResources {
+    /// Rules-semantic overlay registry for the loaded match.
+    pub overlay_registry: crate::rules::overlay_types::OverlayTypeRegistry,
+    /// The immutable base resolved-terrain template: source-derived, used for
+    /// static rendering and snapshot restore. Never the live runtime grid -
+    /// the simulation owns and rebuilds its own live resolved terrain (F08
+    /// naming, bound as an F07 cone).
+    pub terrain_template: Option<crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    /// The complete immutable match rules (including the sole ArtRegistry).
+    pub rules: crate::rules::ruleset::RuleSet,
+}
+
+impl SimResources {
+    /// Empty pre-bind resources for fixture and fallback construction.
+    pub fn empty() -> Self {
+        Self {
+            overlay_registry: crate::rules::overlay_types::OverlayTypeRegistry::empty(),
+            rules: crate::rules::ruleset::RuleSet::from_ini(
+                &crate::rules::ini_parser::IniFile::from_str(""),
+            )
+            .expect("empty rules parse"),
+            terrain_template: None,
+        }
+    }
+}
+
+/// The runtime owner: one deterministic simulation plus its bound resources.
+pub struct SimRuntime {
+    pub simulation: Simulation,
+    pub resources: SimResources,
+}
+
+impl SimRuntime {
+    /// Test adapter for an existing simulation with empty resource inputs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_simulation(simulation: Simulation) -> Self {
+        Self {
+            simulation,
+            resources: SimResources::empty(),
+        }
+    }
+
+    /// Immutable read facade for presentation and diagnostics.
+    pub fn view(&self) -> SimView<'_> {
+        SimView {
+            simulation: &self.simulation,
+        }
+    }
+}
+
+/// Immutable borrow facade over simulation state for presentation and diagnostics.
+pub struct SimView<'a> {
+    simulation: &'a Simulation,
+}
+
+impl<'a> SimView<'a> {
+    /// Full immutable state access for consumers without a narrower view method.
+    pub fn simulation(&self) -> &'a Simulation {
+        self.simulation
+    }
+
+    pub fn interner(&self) -> &'a crate::sim::intern::StringInterner {
+        &self.simulation.interner
+    }
+
+    pub fn entities(&self) -> &'a crate::sim::entity_store::EntityStore {
+        self.simulation.entities()
+    }
+
+    pub fn session(&self) -> &'a crate::sim::scenario_session::ScenarioSession {
+        &self.simulation.session
+    }
+
+    pub fn fog(&self) -> &'a crate::sim::vision::FogState {
+        &self.simulation.fog
+    }
+
+    /// The houses' ally graph, which fog and visibility questions ask.
+    pub fn house_alliances(&self) -> &'a crate::map::houses::HouseAllianceMap {
+        self.simulation.house_alliances.as_map()
+    }
+
+    pub fn houses(&self) -> &'a crate::sim::houses::Houses {
+        &self.simulation.houses
+    }
+
+    pub fn resolved_terrain(
+        &self,
+    ) -> Option<&'a crate::map::resolved_terrain::ResolvedTerrainGrid> {
+        self.simulation.resolved_terrain.as_ref()
+    }
+
+    pub fn overlay_grid(&self) -> Option<&'a crate::sim::overlay_grid::OverlayGrid> {
+        self.simulation.overlay_grid.as_ref()
+    }
+
+    /// Logic scheduling order, consumed separately by the radar pipeline.
+    pub fn logic_order(&self) -> &'a [u64] {
+        self.simulation.logic_order()
+    }
+
+    pub fn display_layers(&self) -> &'a super::world::display_layers::DisplayLayers {
+        self.simulation.display_layers()
+    }
+
+    /// Pending radar-terrain batch for the minimap dirty gate. Presentation
+    /// acknowledges this exact generation only after a completed update.
+    pub fn radar_terrain_dirty(&self) -> (&'a [(u16, u16)], u64) {
+        (
+            self.simulation.dirty_cells.radar(),
+            self.simulation.dirty_cells.radar_generation(),
+        )
+    }
+
+    /// Current normalized MapClass LocalSize authority plus the generation of
+    /// successful trigger-action-40 writers that rebuilt radar/scroll state.
+    pub fn playfield_authority(&self) -> (Option<crate::map::playfield::PlayfieldBounds>, u64) {
+        (
+            self.simulation.playfield_bounds(),
+            self.simulation.playfield_revision(),
+        )
+    }
+}
+
+impl SimRuntime {
+    /// Clear the exact radar-terrain batch a completed presentation update read
+    /// ([`DirtyCells::acknowledge_radar`](crate::sim::dirty_cells::DirtyCells::acknowledge_radar)).
+    /// The marks are presentation handoff state, so this consumption cannot
+    /// mutate lockstep state.
+    pub fn acknowledge_radar_terrain_dirty(&mut self, generation: u64) -> bool {
+        self.simulation.dirty_cells.acknowledge_radar(generation)
+    }
+
+    /// One Ordinary-lane frame for side binaries (parity-digest, sim-bench):
+    /// the same bound-resource transaction as `advance_frame`, with the
+    /// crate-private frame output discarded so no internal type goes public.
+    pub fn advance_frame_for_tooling(
+        &mut self,
+        commands: &[crate::sim::command::CommandEnvelope],
+        tick_ms: u32,
+    ) -> Result<(), crate::sim::world::FrameAdvanceError> {
+        self.advance_frame(
+            commands,
+            tick_ms,
+            crate::sim::world::TickLane::Ordinary,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .map(|_| ())
+    }
+
+    /// The production frame transaction: advance one lane-tagged frame using
+    /// the bound immutable resources. Callers cannot substitute rules, maps,
+    /// registries, definitions, or navigation (the simulation pins its own
+    /// canonical path snapshot internally).
+    pub fn advance_frame(
+        &mut self,
+        commands: &[crate::sim::command::CommandEnvelope],
+        tick_ms: u32,
+        lane: crate::sim::world::TickLane,
+        effects: crate::sim::world::FrameEffects<'_>,
+    ) -> Result<crate::sim::world::SimFrameOutput, crate::sim::world::FrameAdvanceError> {
+        self.simulation.advance_app_frame(
+            commands,
+            &self.resources.rules,
+            Some(&self.resources.overlay_registry),
+            tick_ms,
+            lane,
+            effects,
+        )
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SimRuntime {
+    /// Replace a same-content restored simulation in place. Resource ownership
+    /// never changes and callers must already have a running match.
+    pub fn replace_simulation(&mut self, simulation: Simulation) {
+        self.simulation = simulation;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_trigger_state_reaches_bound_frames_and_survives_restore() {
+        use crate::sim::snapshot::GameSnapshot;
+        use crate::sim::trigger_runtime::TriggerEffect;
+        use crate::sim::world::TickLane;
+
+        let map = crate::map::map_file::MapFile::from_bytes(
+            b"[Map]\nTheater=TEMPERATE\nSize=0,0,40,40\nLocalSize=2,2,36,32\n\
+              [IsoMapPack5]\n1=CAAEABUAAAAAEQAA\n\
+              [VariableNames]\n9=Ready,1\n\
+              [Triggers]\nREADY=Neutral,<none>,Ready,0,1,1,1,0\nDISABLED=Neutral,<none>,Disabled,1,1,1,1,0\n\
+              [Tags]\nTREADY=0,Ready,READY\nTDISABLED=0,Disabled,DISABLED\n\
+              [Events]\nREADY=1,36,0,9\nDISABLED=1,47,0,0\n\
+              [Actions]\nREADY=1,46,0,0,0,0,0,0,A\nDISABLED=1,46,0,0,0,0,0,0,B\n",
+        ).expect("authored trigger map");
+        let mut sim = Simulation::new();
+        let terrain =
+            crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(0, 0, Vec::new());
+        populate_staged_scenario_with_generated_inits(
+            &mut sim,
+            &map,
+            &terrain,
+            "TEMPERATE",
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            None,
+            crate::map::basic::BridgeDestroyabilityMode::CampaignOrEditor,
+            &crate::sim::scenario_session::ScenarioDescriptor::default(),
+            None,
+            |_| {},
+        )
+        .expect("shared fresh-map construction");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        let before_first_frame = GameSnapshot::save(&runtime.simulation, 0, 0, "trigger_owner", 0);
+        let run = |runtime: &mut SimRuntime| {
+            runtime
+                .advance_frame(
+                    &[],
+                    67,
+                    TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("bound production frame")
+                .trigger_effects
+        };
+        let expected = vec![TriggerEffect::InputLockChanged {
+            locked: true,
+            was_locked: false,
+        }];
+        assert_eq!(run(&mut runtime), expected);
+        let after_first_frame = GameSnapshot::save(&runtime.simulation, 0, 0, "trigger_owner", 0);
+
+        // The replacement owns saved state; retained resources must not seed
+        // defaults or replay already executed one-shot actions during handoff.
+        let mut restored = GameSnapshot::load(&after_first_frame).unwrap().sim;
+        restored.restore_after_snapshot_load().unwrap();
+        runtime.replace_simulation(restored);
+        assert!(run(&mut runtime).is_empty());
+        let mut restored = GameSnapshot::load(&before_first_frame).unwrap().sim;
+        restored.restore_after_snapshot_load().unwrap();
+        runtime.replace_simulation(restored);
+        assert_eq!(run(&mut runtime), expected);
+    }
+
+    #[test]
+    fn staged_campaign_selects_current_house_after_roster_construction() {
+        let map = crate::map::map_file::MapFile::from_bytes(
+            b"[Map]\nTheater=TEMPERATE\nSize=0,0,40,40\nLocalSize=2,2,36,32\n[Basic]\nPlayer=Alpha\n[Houses]\n7=Zulu\n2=Alpha\n[Zulu]\n[Alpha]\n[IsoMapPack5]\n1=CAAEABUAAAAAEQAA\n",
+        ).expect("minimal authored map");
+        let roster = crate::map::houses::parse_house_roster(&map.ini, &[], None);
+        let descriptor = crate::sim::scenario_session::ScenarioDescriptor::default();
+        let mut sim = Simulation::new();
+        sim.interner.intern("alpha");
+        let terrain =
+            crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(0, 0, Vec::new());
+        populate_staged_scenario_with_generated_inits(
+            &mut sim,
+            &map,
+            &terrain,
+            "TEMPERATE",
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            None,
+            crate::map::basic::BridgeDestroyabilityMode::CampaignOrEditor,
+            &descriptor,
+            None,
+            |sim| {
+                crate::sim::scenario_bootstrap::initialize_map_roster_houses(
+                    sim,
+                    &roster,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
+                    None,
+                );
+                crate::sim::scenario_bootstrap::initialize_campaign_current_house(
+                    &mut sim.session,
+                    &mut sim.houses,
+                    &map.ini,
+                );
+            },
+        )
+        .expect("staged map-roster construction");
+        let selected = sim.interner.get("Alpha").unwrap();
+        assert_eq!(sim.session.current_house(), Some(selected));
+        assert!(sim.houses[&selected].is_human() && sim.houses[&selected].player_control());
+        let first = sim.interner.get("Zulu").unwrap();
+        assert_eq!(sim.houses.order(), [first, selected]);
+        assert!(!sim.houses[&first].is_human() && !sim.houses[&first].player_control());
+    }
+
+    /// F07 matrix: the runtime always uses bound navigation and resources —
+    /// both production install paths keep the match resources. The map-load
+    /// install binds them from the load result; the in-scenario restore path
+    /// (quickload / save-load panel) must CARRY the surviving resources, not
+    /// rebind empty ones.
+    #[test]
+    fn runtime_always_uses_bound_navigation_and_resources() {
+        let mut saved = Simulation::new();
+        let mut waypoints = std::collections::HashMap::new();
+        waypoints.insert(
+            0,
+            crate::map::waypoints::Waypoint {
+                index: 0,
+                rx: 93,
+                ry: 106,
+            },
+        );
+        waypoints.insert(
+            701,
+            crate::map::waypoints::Waypoint {
+                index: 701,
+                rx: 122,
+                ry: 135,
+            },
+        );
+        saved.session.install_waypoints(&waypoints);
+        let mut original = SimRuntime {
+            simulation: Simulation::new(),
+            resources: SimResources::empty(),
+        };
+
+        original.replace_simulation(saved);
+        let rebound = original;
+        assert_eq!(
+            rebound.simulation.session.waypoint_cell(0),
+            Some((93, 106)),
+            "restore must retain the saved Scenario waypoint authority"
+        );
+        assert_eq!(
+            rebound.simulation.session.waypoint_cell(701),
+            Some((122, 135))
+        );
+    }
+
+    /// The crate regeneration rung is guarded in the master frame by
+    /// `if let Some(overlay_registry)`, a Rust availability gate with no native
+    /// counterpart. Prove the SOLE production frame entry point always binds
+    /// one, so that gate can never silently disable
+    /// `MapClass__UpdateCrateRegenTimers @ 0x0056BBE0` in a real match.
+    #[test]
+    fn crate_regen_rung_runs_in_every_production_frame() {
+        use crate::sim::crates::CrateSlot;
+        use crate::sim::crates::tests::{crate_registry, crate_ruleset, sim_with_grid};
+
+        let mut simulation = sim_with_grid(0x62);
+        simulation.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        simulation.session.game_options_mut_for_test().crates = true;
+        let due = CrateSlot {
+            start_frame: -1,
+            aux: 0,
+            duration: 0,
+            cell_x: 15,
+            cell_y: 15,
+        };
+        *simulation.crate_authority.slot_mut_for_test(0) = due;
+
+        let mut resources = SimResources::empty();
+        resources.rules = crate_ruleset("");
+        resources.overlay_registry = crate_registry();
+        let mut runtime = SimRuntime {
+            simulation,
+            resources,
+        };
+
+        let _ = runtime
+            .advance_frame(
+                &[],
+                33,
+                crate::sim::world::TickLane::Ordinary,
+                crate::sim::world::FrameEffects::default(),
+            )
+            .expect("fixture frame must complete");
+
+        assert_ne!(
+            runtime.simulation.crate_authority.slots()[0],
+            due,
+            "SimRuntime::advance_frame must reach the crate regeneration rung"
+        );
+    }
+
+    #[test]
+    fn gsi_04_12_generated_funnel_projects_preconsumed_words_without_scenario_draw() {
+        use crate::map::entities::{EntityCategory, MapEntity};
+        use crate::rules::ini_parser::IniFile;
+        use crate::sim::game_entity::GeneratedTechnoInit;
+        use crate::sim::world::GeneratedTechnoInitTable;
+
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=MTNK\n\n[MTNK]\nStrength=300\nSpeed=6\n",
+        ))
+        .expect("generated projection rules");
+        let entity = MapEntity {
+            owner: "Americans".to_string(),
+            type_id: "MTNK".to_string(),
+            health: 256,
+            cell_x: 7,
+            cell_y: 9,
+            facing: 0,
+            category: EntityCategory::Unit,
+            sub_cell: 0,
+            veterancy: Some(0),
+            high: false,
+            mission: None,
+            recruitable_a: true,
+            recruitable_b: true,
+            structure_upgrades: [None, None, None],
+            structure_ai_sellable: false,
+            structure_ai_repairable: false,
+            structure_online: true,
+            trigger_tag: None,
+        };
+        let inits = GeneratedTechnoInitTable::try_new([GeneratedTechnoInit {
+            entity_index: 0,
+            techno_type: "MTNK".to_string(),
+            cell: (7, 9),
+            techno_ctor_random_word: 0xA55A,
+            native_unique_id: 0,
+        }])
+        .expect("one exact generated binding");
+        let mut sim = Simulation::with_seed(0xC701_0412);
+        let owner = sim.interner.intern("Americans");
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
+        let before = sim.scenario_rng.logical_state();
+
+        assert_eq!(
+            project_map_entities(&mut sim, &[entity], &rules, None, None, Some(&inits),)
+                .expect("generated funnel projection"),
+            1
+        );
+        assert_eq!(sim.scenario_rng.logical_state(), before);
+        assert_eq!(
+            sim.entities()
+                .values()
+                .next()
+                .expect("projected MTNK")
+                .techno_ctor_random_word(),
+            0xA55A
+        );
+    }
+}
+
+fn project_map_entities(
+    sim: &mut Simulation,
+    entities: &[crate::map::entities::MapEntity],
+    rules: &crate::rules::ruleset::RuleSet,
+    resolved_terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    generated_inits: Option<&crate::sim::world::GeneratedTechnoInitTable>,
+) -> Result<u32, crate::sim::world::GeneratedTechnoInitError> {
+    if let Some(generated_inits) = generated_inits {
+        sim.spawn_generated_from_map_with_resolved(
+            entities,
+            rules,
+            resolved_terrain,
+            generated_inits,
+        )
+    } else {
+        Ok(sim.spawn_from_map_with_resolved_and_overlay_registry(
+            entities,
+            rules,
+            resolved_terrain,
+            overlay_registry,
+        ))
+    }
+}
+
+/// Construct the post-map-section terrain-attached AnimClass set.
+///
+/// gamemd-derived: the final `MapClass::InitCellAttributes @ 0x00568BB0`
+/// anti-diagonal pass calls `CellClass::RecalcAttributes @ 0x0047D2B0`; the
+/// constructor row at 0x0047DA3B..0x0047DA5F supplies delay 0, signed loop -1,
+/// flags 0x1600 and constructor ZAdjust 0. The delay-zero constructor calls
+/// `Middle`, then the producer writes the tile ZAdjust; the descriptor carries
+/// the producer's explicit +0x196/+0x197 state into the Rust object.
+pub fn spawn_terrain_tile_animations(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    tile_animations: &[TerrainTileAnimation],
+) -> Vec<u64> {
+    const TILE_ANIM_DRAW_FLAGS: u32 = 0x1600;
+    let mut spawned = Vec::with_capacity(tile_animations.len());
+    for tile in tile_animations {
+        let type_name = sim.interner.intern(&tile.anim_name);
+        let descriptor = AnimClassSpawnDescriptor {
+            type_name,
+            rx: tile.rx,
+            ry: tile.ry,
+            sub_x: crate::util::fixed_math::SimFixed::from_num(
+                tile.world_x
+                    .wrapping_sub(i32::from(tile.rx).wrapping_mul(256)),
+            ),
+            sub_y: crate::util::fixed_math::SimFixed::from_num(
+                tile.world_y
+                    .wrapping_sub(i32::from(tile.ry).wrapping_mul(256)),
+            ),
+            z: u8::try_from(
+                tile.world_z
+                    .div_euclid(crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS),
+            )
+            .unwrap_or(0),
+            delay: 0,
+            loop_count: -1,
+            draw_flags: TILE_ANIM_DRAW_FLAGS,
+            z_adjust: 0,
+            reverse: false,
+            use_cell_drawer: true,
+            terrain_attached: true,
+            draw_runtime: AnimDrawRuntime::default(),
+            owner: None,
+        };
+        let id = sim
+            .spawn_anim_at_world(
+                rules,
+                descriptor,
+                AnimWorldCoord {
+                    x: tile.world_x,
+                    y: tile.world_y,
+                    z: tile.world_z,
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "resolved terrain animation [{}] must be bound before map spawn: {error}",
+                    tile.anim_name
+                )
+            });
+        assert!(
+            sim.substrate
+                .set_terrain_anim_z_adjust_after_construction(id, tile.z_adjust),
+            "terrain animation {id} disappeared before its producer ZAdjust write"
+        );
+        spawned.push(id);
+    }
+    spawned
+}
+
+/// Populate the one Simulation that already owns the post-prefix load cursors.
+///
+/// Fresh-load orchestration stages this owner before terrain Fill.  Keeping the
+/// object-section funnel separate from construction prevents a later shadow
+/// Simulation from replacing the registries and identities that OverlayPack
+/// finalization has already touched.
+#[derive(Debug, thiserror::Error)]
+enum ScenarioPopulationError {
+    #[error(transparent)]
+    GeneratedTechno(#[from] crate::sim::world::GeneratedTechnoInitError),
+    #[error(transparent)]
+    NativeIdentity(#[from] crate::sim::native_identity::NativeMapTubeConstructionError),
+}
+
+pub fn populate_staged_scenario_with_generated_inits<F>(
+    sim: &mut Simulation,
+    map_data: &crate::map::map_file::MapFile,
+    resolved_terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+    theater_name: &str,
+    rules: &crate::rules::ruleset::RuleSet,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
+    bridge_destroyability_mode: crate::map::basic::BridgeDestroyabilityMode,
+    descriptor: &crate::sim::scenario_session::ScenarioDescriptor,
+    generated_inits: Option<&crate::sim::world::GeneratedTechnoInitTable>,
+    initialize_houses_before_objects: F,
+) -> Result<(), crate::sim::world::GeneratedTechnoInitError>
+where
+    F: FnOnce(&mut Simulation),
+{
+    match populate_staged_scenario_inner(
+        sim,
+        map_data,
+        resolved_terrain,
+        theater_name,
+        rules,
+        overlay_registry,
+        overlay_grid,
+        None,
+        bridge_destroyability_mode,
+        descriptor,
+        generated_inits,
+        initialize_houses_before_objects,
+    ) {
+        Ok(()) => Ok(()),
+        Err(ScenarioPopulationError::GeneratedTechno(error)) => Err(error),
+        Err(ScenarioPopulationError::NativeIdentity(_)) => {
+            unreachable!("generated/compatibility population cannot consume native map IDs")
+        }
+    }
+}
+
+fn populate_staged_scenario_inner<F>(
+    sim: &mut Simulation,
+    map_data: &crate::map::map_file::MapFile,
+    resolved_terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+    theater_name: &str,
+    rules: &crate::rules::ruleset::RuleSet,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
+    authored_overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    bridge_destroyability_mode: crate::map::basic::BridgeDestroyabilityMode,
+    descriptor: &crate::sim::scenario_session::ScenarioDescriptor,
+    generated_inits: Option<&crate::sim::world::GeneratedTechnoInitTable>,
+    initialize_houses_before_objects: F,
+) -> Result<(), ScenarioPopulationError>
+where
+    F: FnOnce(&mut Simulation),
+{
+    if !sim.trigger_definitions_prepared() {
+        // Generated/compatibility callers have no process asset ingress.
+        // Prepare their actual map definitions before the first attachment;
+        // ordinary/headless loading already bound fixed AIMD and EVA here.
+        let teams = crate::rules::team_ai_ini::TeamAiIniRegistry::from_sources(
+            &crate::rules::ini_parser::IniFile::empty(),
+            &map_data.ini,
+            descriptor.game_mode_nonzero,
+        );
+        sim.initialize_trigger_definitions(map_data, &teams, None, None);
+    }
+    // Active YR `ScenarioClass__Full_Init @ 0x00686B20` calls
+    // `ScenarioClass__Create_Houses @ 0x00687F10` before
+    // `TerrainClass__Read_Map_Section @ 0x0071CA70` and every Techno section.
+    // Keep the app-specific roster construction outside sim while making that
+    // order an explicit prerequisite of the shared object-construction funnel.
+    // Keep scenario state on the staged owner throughout construction and
+    // handoff. Later live Tag construction can safely publish into this owner.
+    sim.session.install_waypoints(&map_data.waypoints);
+    initialize_houses_before_objects(sim);
+    // Frame tripwire: every MP start waypoint must sit inside the session
+    // bounds (= the fog window, cell-array frame). A start outside means the
+    // descriptor was fed wrong-frame bounds (e.g. raw [Map] Size=) and the
+    // player's own base would be permanently shrouded.
+    for (idx, (rx, ry)) in &descriptor.mp_start_waypoints {
+        if *rx >= descriptor.map_width || *ry >= descriptor.map_height {
+            log::error!(
+                "MP start waypoint {idx} at ({rx},{ry}) lies outside session bounds {}x{} — wrong coordinate frame?",
+                descriptor.map_width,
+                descriptor.map_height
+            );
+            debug_assert!(
+                false,
+                "start waypoint outside session bounds (coordinate-frame mismatch)"
+            );
+        }
+    }
+    sim.install_resolved_terrain_for_new_map(resolved_terrain.clone());
+    // Active `CellClass` overlay identity exists before the Techno map
+    // sections are read. Install the already-resolved grid now so every
+    // UnitClass virtual Unlimbo sees ore, walls, and structural bridges.
+    // This live grid then accumulates Cell+122 history, so finalization keeps
+    // it and uses its own overlay_grid argument only when none is installed.
+    // The staged owner has no grid before this point.
+    if let Some(grid) = overlay_grid {
+        sim.install_overlay_grid_for_load(grid.clone());
+    }
+    // Wire the cliff/slope coefficients from [General] into the live World config;
+    // it otherwise holds compiled vanilla defaults and never sees a modded INI.
+    sim.install_terrain_speed_rules(&rules.general);
+    // Normal loading first clips/normalizes LocalSize through
+    // `MapClass::Set_Clipped_LocalSize @ 0x00567230`; every playfield consumer
+    // then shares those stored fields and the same isometric-diamond test.
+    sim.install_playfield_from_map_header(&map_data.header);
+    sim.install_authored_cell_trigger_tags(map_data);
+    let bridge_destroyable = map_data
+        .special_flags
+        .effective_destroyable_bridges(bridge_destroyability_mode);
+    let bridge_strength = rules.bridge_rules.strength;
+    sim.install_bridge_runtime(
+        crate::sim::bridge_state::BridgeRuntimeState::from_resolved_terrain_with_map_size(
+            resolved_terrain,
+            bridge_destroyable,
+            bridge_strength,
+            (map_data.header.width as i32, map_data.header.height as i32),
+        ),
+    );
+    sim.resolve_rule_animation_lists(rules);
+    // gamemd `TerrainClass::Read_Map_Section` runs while the map sections are
+    // walked, ahead of `[Units]`/`[Aircraft]`/`[Infantry]`/`[Structures]`: every
+    // tree owns its cell before the first map object is placed on it. The
+    // ore-spawner animation index is attached later, once the terrain SHP frame
+    // counts are known.
+    let constructed = if let Some(overlay_registry) = authored_overlay_registry {
+        crate::sim::terrain_spawn::construct_authored_terrain_objects(
+            sim,
+            &map_data.terrain_objects,
+            rules,
+            theater_name.eq_ignore_ascii_case("SNOW"),
+            overlay_registry,
+        )?
+    } else {
+        crate::sim::terrain_spawn::construct_terrain_objects(
+            sim,
+            &map_data.terrain_objects,
+            rules,
+            theater_name.eq_ignore_ascii_case("SNOW"),
+        )
+    };
+    if constructed > 0 {
+        log::info!("Constructed {constructed} map terrain objects before map entities");
+    }
+    if let Some(overlay_registry) = authored_overlay_registry {
+        // The live grid is read through a temporary view and handed back.
+        let live_grid = sim.take_overlay_grid_for_load();
+        let stats = initialize_native_tiberium_queues(
+            sim,
+            &map_data.basic,
+            &map_data.special_flags,
+            rules,
+            overlay_registry,
+            live_grid.as_ref(),
+            (map_data.header.width as u16, map_data.header.height as u16),
+        );
+        if let Some(grid) = live_grid {
+            sim.install_overlay_grid_for_load(grid);
+        }
+        if let Some(stats) = stats {
+            log::info!(
+                "Initialized authored native tiberium queues before Technos: {} growth, {} spread",
+                stats.growth_entries,
+                stats.spread_entries,
+            );
+        }
+    }
+    let authored_entity_terrain =
+        authored_overlay_registry.and_then(|_| sim.resolved_terrain.as_ref().cloned());
+    let entity_terrain = authored_entity_terrain.as_ref().unwrap_or(resolved_terrain);
+    if !map_data.entities.is_empty() || generated_inits.is_some() {
+        let _count: u32 = project_map_entities(
+            sim,
+            &map_data.entities,
+            rules,
+            Some(entity_terrain),
+            overlay_registry,
+            generated_inits,
+        )?;
+        let miner_count: usize = sim
+            .entities()
+            .values()
+            .filter(|e| e.miner.is_some())
+            .count();
+        log::info!("Miner components attached: {}", miner_count);
+    }
+    if authored_overlay_registry.is_none() && !resolved_terrain.tile_animations().is_empty() {
+        let spawned = spawn_terrain_tile_animations(sim, rules, resolved_terrain.tile_animations());
+        log::info!(
+            "Spawned {} terrain-attached animations after map objects",
+            spawned.len()
+        );
+    }
+    if authored_overlay_registry.is_none() {
+        // Authored materialization runs the same line-marker owner below at
+        // its final InitCellAttributes sweep. The eager/generated route has
+        // already installed its final live grid here.
+        let shape = crate::map::authored_overlay::NativeOverlayMapShape::new(
+            map_data.header.width as i32,
+            map_data.header.height as i32,
+        );
+        let bounds = crate::sim::scenario_bootstrap::NativeStartBounds::from_session(
+            sim,
+            sim.resolved_terrain.as_ref().expect("populated map cells"),
+        );
+        let terrain = sim.resolved_terrain.as_mut().expect("populated map cells");
+        sim.trigger_runtime.initialize_cell_trigger_lines(
+            bounds,
+            terrain,
+            shape
+                .recalc_cells()
+                .into_iter()
+                .map(|(x, y)| (i32::from(x), i32::from(y))),
+        );
+    }
+    sim.classify_map_triggers(rules);
+    Ok(())
+}
+
+/// Native growth-then-spread queue initialization from a read-only view of
+/// the then-current cells. Authored `Full_Init` runs it between the Terrain
+/// and Techno sections; a generated launch runs it in the
+/// `RandomMapGenerator::Generate @ 0x00598960` tail after the generator
+/// constructors and before `InitCellAttributes(1)` germinates the densities.
+///
+/// gamemd-derived: `TiberiumClass::InitGrowthQueues_All @ 0x00722D00` then
+/// `TiberiumClass::InitSpreadQueues_All @ 0x00722240`, each freeing and
+/// rebuilding every TiberiumClass's queue from the current cell state.
+/// Returns `None` when no overlay grid exists (queues reset empty).
+pub fn initialize_native_tiberium_queues(
+    sim: &mut Simulation,
+    basic: &crate::map::basic::BasicSection,
+    special_flags: &crate::map::basic::SpecialFlagsSection,
+    rules: &RuleSet,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
+    native_rect: (u16, u16),
+) -> Option<crate::sim::ore_growth::NativeTiberiumRebuildStats> {
+    sim.ore_growth_config
+        .reload_for_scenario(basic, special_flags, &sim.session);
+    let (width, height) = overlay_grid
+        .map(|grid| (grid.width(), grid.height()))
+        .or_else(|| {
+            sim.resolved_terrain
+                .as_ref()
+                .map(|terrain| (terrain.width(), terrain.height()))
+        })
+        .unwrap_or((0, 0));
+    sim.ore_growth_state.reset_for_cell_array(width, height);
+    // `CellClass+0xE4 FirstObject != 0` at this point: terrain objects plus
+    // every ground-list Techno already constructed (none on an authored load,
+    // the generator's own Technos on a generated one).
+    let mut source_object_cells = sim
+        .terrain_objects
+        .cell_index()
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    source_object_cells.extend(
+        sim.substrate
+            .occupancy
+            .occupied_cells_on_layer(crate::sim::movement::locomotor::MovementLayer::Ground),
+    );
+    let Some(overlay_grid) = overlay_grid else {
+        // No overlay grid: no stores to seed, but keep the `[Map] Size` rect
+        // so a later snapshot restore rebuilds from it, not the storage dims.
+        sim.ore_growth_state.reset_native_tiberium_classes_for_rect(
+            native_rect,
+            0,
+            sim.session.binary_frame(),
+        );
+        return None;
+    };
+    Some(
+        sim.ore_growth_state
+            .rebuild_native_tiberium_queues_from_overlays(
+                overlay_grid,
+                overlay_registry,
+                &rules.tiberium_types,
+                sim.resolved_terrain.as_ref(),
+                &source_object_cells,
+                sim.ore_growth_config.grows(),
+                sim.ore_growth_config.spreads(),
+                sim.session.binary_frame(),
+                native_rect,
+            ),
+    )
+}
+
+#[derive(Debug)]
+pub struct AuthoredScenarioLoadOutput {
+    pub resolved_terrain: crate::map::resolved_terrain::ResolvedTerrainGrid,
+    pub overlay_grid: crate::sim::overlay_grid::OverlayGrid,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthoredScenarioLoadError {
+    #[error(transparent)]
+    NativeIdentity(#[from] crate::sim::native_identity::NativeMapTubeConstructionError),
+    #[error(transparent)]
+    TubeRegistry(#[from] crate::map::resolved_terrain::NativeTubeRegistryBindError),
+    #[error(transparent)]
+    OverlayPacks(#[from] crate::map::map_file::OverlayPacksAlreadyConsumed),
+    #[error(transparent)]
+    OverlayFinalize(
+        #[from]
+        crate::map::authored_overlay::AuthoredOverlayFinalizeError<
+            crate::sim::world::authored_load_host::SimulationAuthoredLoadError,
+        >,
+    ),
+    #[error(transparent)]
+    GeneratedTechno(#[from] crate::sim::world::GeneratedTechnoInitError),
+}
+
+/// Consume the fresh authored map-load corridor on the one staged Simulation.
+/// One `LoadCellRecalcState` and one native-ID cursor span raw Tubes,
+/// OverlayPack + first Recalc, Terrain/queues/Technos/Smudges, scalar deletion,
+/// and the final anti-diagonal Recalc sweep.
+pub fn finalize_and_populate_staged_authored_scenario<F>(
+    sim: &mut Simulation,
+    map_data: &mut crate::map::map_file::MapFile,
+    terrain_fill: crate::map::resolved_terrain::AuthoredTerrainFill,
+    theater_data: &crate::map::theater::TheaterData,
+    assets: &crate::assets::asset_manager::AssetManager,
+    rules: &mut RuleSet,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    overlay_shp_ids: &std::collections::BTreeSet<u8>,
+    signed_new_ini_format: i32,
+    lat_enabled: bool,
+    cliff_back_impassability: u8,
+    theater_ext: &str,
+    theater_name: &str,
+    bridge_destroyability_mode: crate::map::basic::BridgeDestroyabilityMode,
+    descriptor: &crate::sim::scenario_session::ScenarioDescriptor,
+    initialize_houses_before_objects: F,
+) -> Result<AuthoredScenarioLoadOutput, AuthoredScenarioLoadError>
+where
+    F: FnOnce(&mut Simulation, &RuleSet),
+{
+    // Immutable load parameters, never republished as runtime owners. Only ART
+    // can change in the scoped hosts below; these small snapshots let Recalc
+    // retain its inputs across both sweeps while constructors borrow current
+    // rules. Copying RuleSet or ART would hide newly bound constructor metadata.
+    let terrain_rules = rules.terrain_rules.clone();
+    let tiberium_types = rules.tiberium_types.clone();
+    let mut terrain = terrain_fill.into_pending_grid();
+    let native_tubes = sim.take_native_map_tubes_receipt()?;
+    terrain.bind_native_map_tubes(native_tubes)?;
+    let mut recalc = crate::map::resolved_terrain::LoadCellRecalcState::for_authored_load(
+        map_data,
+        theater_data,
+        assets,
+        &terrain_rules,
+        overlay_registry,
+        lat_enabled,
+        cliff_back_impassability,
+        terrain.cells().len(),
+        sim.session.pixel_conversion_bounds(),
+    );
+    let shape = crate::map::authored_overlay::NativeOverlayMapShape::new(
+        i32::try_from(map_data.header.width).unwrap_or(i32::MAX),
+        i32::try_from(map_data.header.height).unwrap_or(i32::MAX),
+    );
+    let packs = map_data.take_authored_overlay_packs()?;
+    let payload = {
+        let mut host = crate::sim::world::authored_load_host::SimulationAuthoredLoadHost::new(
+            sim,
+            rules,
+            assets,
+            theater_ext,
+            theater_name,
+        );
+        crate::map::authored_overlay::AuthoredOverlayFinalizer::with_recalc(
+            &mut terrain,
+            &mut recalc,
+            shape,
+            overlay_registry,
+            &tiberium_types,
+            overlay_shp_ids,
+            signed_new_ini_format,
+            descriptor.game_mode_nonzero,
+            &mut host,
+        )
+        .run(packs)?
+    };
+    let overlay_grid = crate::sim::overlay_grid::OverlayGrid::from_finalized_map_payload(payload);
+
+    match populate_staged_scenario_inner(
+        sim,
+        map_data,
+        &terrain,
+        theater_name,
+        rules,
+        Some(overlay_registry),
+        Some(&overlay_grid),
+        Some(overlay_registry),
+        bridge_destroyability_mode,
+        descriptor,
+        None,
+        |sim| initialize_houses_before_objects(sim, rules),
+    ) {
+        Ok(()) => {}
+        Err(ScenarioPopulationError::GeneratedTechno(error)) => return Err(error.into()),
+        Err(ScenarioPopulationError::NativeIdentity(error)) => return Err(error.into()),
+    }
+
+    let mut terrain = sim
+        .take_resolved_terrain_for_load()
+        .expect("authored object population keeps the live terrain installed");
+    let mut overlay_grid = sim
+        .take_overlay_grid_for_load()
+        .expect("authored object population keeps the live overlay installed");
+
+    // SmudgeClass constructors consume identity before Unlimbo/placement can
+    // reject a row. Install the resulting first-sweep grid now; the shared
+    // post-map finalizer preserves it instead of rebuilding against later
+    // final-sweep cells.
+    for entry in &map_data.smudges {
+        if rules.smudge_types.find_by_name(&entry.type_name).is_some() {
+            let _native_unique_id = sim.next_native_load_id()?;
+        }
+    }
+    sim.install_smudge_grid(crate::sim::smudge_grid::SmudgeGrid::from_map_entries(
+        &map_data.smudges,
+        &rules.smudge_types,
+        &terrain,
+        &overlay_grid,
+        terrain.width(),
+        terrain.height(),
+    ));
+
+    let removed = sim.scalar_delete_load_terrain_anims();
+    if removed > 0 {
+        log::info!("Scalar-deleted {removed} first-sweep terrain animations");
+    }
+    // `MapClass::InitCellAttributes @ 0x00568BB0` with argument 0 calls
+    // `CellClass::Get_Tiberium_Value @ 0x00485020` for every real cell before
+    // that cell's Recalc and sums the returns with wrapping machine arithmetic;
+    // `ScenarioClass::Full_Init @ 0x00686B20` stores the return at
+    // `MapClass+0x134` (`0x0087F91C`).
+    let mut tiberium_value_total: i32 = 0;
+    //568CDB..568DCA reads each retained CellTag before its Recalc. This
+    //read-only definition decision spends no RNG/native IDs and only ORs
+    //line bits that neither tiberium valuation nor Recalc changes.
+    let bounds = crate::sim::scenario_bootstrap::NativeStartBounds::from_session(sim, &terrain);
+    sim.trigger_runtime.initialize_cell_trigger_lines(
+        bounds,
+        &mut terrain,
+        shape
+            .recalc_cells()
+            .into_iter()
+            .map(|(x, y)| (i32::from(x), i32::from(y))),
+    );
+    {
+        let mut host = crate::sim::world::authored_load_host::SimulationAuthoredLoadHost::new(
+            sim,
+            rules,
+            assets,
+            theater_ext,
+            theater_name,
+        );
+        for (x, y) in shape.recalc_cells() {
+            let Some(index) = terrain.native_fixed_cell_index(x, y) else {
+                debug_assert!(false, "final authored iterator reached an unallocated cell");
+                continue;
+            };
+            recalc.clear_terrain_anim_latch(index);
+            let (rx, ry) = (x as u16, y as u16);
+            let current = overlay_grid
+                .finalized_map_cell(rx, ry)
+                .expect("final authored iterator coordinate remains in the live overlay grid");
+            tiberium_value_total =
+                tiberium_value_total.wrapping_add(crate::map::tiberium_cell::tiberium_value(
+                    current.overlay_id(),
+                    current.state(),
+                    overlay_registry,
+                    &tiberium_types,
+                ));
+            let finalized = crate::map::authored_overlay::recalc_final_authored_overlay_cell(
+                &mut terrain,
+                &mut recalc,
+                index,
+                current,
+                &mut host,
+            )?;
+            let written = overlay_grid.write_finalized_map_cell(rx, ry, finalized);
+            debug_assert!(written);
+        }
+    }
+    sim.record_authored_tiberium_value_total(tiberium_value_total);
+    let bridge_destroyable = map_data
+        .special_flags
+        .effective_destroyable_bridges(bridge_destroyability_mode);
+    let bridge_state =
+        crate::sim::bridge_state::BridgeRuntimeState::from_resolved_terrain_with_map_size(
+            &terrain,
+            bridge_destroyable,
+            rules.bridge_rules.strength,
+            (map_data.header.width as i32, map_data.header.height as i32),
+        );
+
+    let final_terrain = terrain.clone();
+    let final_overlay = overlay_grid.clone();
+    sim.install_resolved_terrain_for_new_map(terrain);
+    sim.install_overlay_grid_for_load(overlay_grid);
+    sim.install_bridge_runtime(bridge_state);
+    Ok(AuthoredScenarioLoadOutput {
+        resolved_terrain: final_terrain,
+        overlay_grid: final_overlay,
+    })
+}
+
+/// A building as the map-wall owner search measures it: its GetCoords
+/// (vt+0x48, [`object_get_coords`]). The target is a Cell, so5F6360 applies
+/// no Building-foundation discount; dimensions belong to GetCoords alone.
+/// Serves the wall-owner search `0x0047D210`, which `InitCellAttributes @ 0x00568BB0`
+/// runs per cell; it also tests IsAlive (`+0x90`) and Marked (`+0x74`).
+///
+/// [`object_get_coords`]: crate::sim::movement::ground_pose::object_get_coords
+pub fn map_wall_owner_candidate_from_building(
+    entity: &crate::sim::game_entity::GameEntity,
+    resolved_terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+    house_wall_owner: bool,
+) -> crate::sim::overlay_grid::MapWallOwnerCandidate {
+    let coords =
+        crate::sim::movement::ground_pose::object_get_coords(entity, Some(resolved_terrain));
+    crate::sim::overlay_grid::MapWallOwnerCandidate {
+        owner: entity.owner(),
+        world_x: coords.x,
+        world_y: coords.y,
+        world_z: coords.z,
+        object_alive: entity.lifecycle.object_alive(),
+        cell_marked: entity.lifecycle.cell_marked(),
+        house_wall_owner,
+    }
+}
+
+/// Post-funnel scenario finalization shared by the app loader and the
+/// headless loader (F09). The ordering is part of the construction contract:
+/// ore-spawner terrain seeding, map-wall owner reconstruction from the
+/// spawned structures, overlay-grid installation, smudge-grid seeding, then
+/// the authoritative post-map tail (`ScenarioClass::Post_Map_Init` cone).
+pub fn finalize_constructed_scenario(
+    sim: &mut Simulation,
+    map_data: &crate::map::map_file::MapFile,
+    rules: &RuleSet,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    overlay_grid: crate::sim::overlay_grid::OverlayGrid,
+    house_roster: &crate::map::houses::HouseRoster,
+    skirmish_session: Option<&crate::sim::scenario_bootstrap::MatchLaunchDescriptor>,
+) -> crate::sim::scenario_post_map::ScenarioPostMapOutput {
+    // Population and starting-unit Unlimbo mutate the live Cell+122 bytes.
+    // The loader argument is a presentation/materialization view taken before
+    // those events; never replace their retained history with that older copy.
+    // Every production caller installs the live grid first, so the argument
+    // is only the fallback for callers that never populated one.
+    let mut overlay_grid = sim.take_overlay_grid_for_load().unwrap_or(overlay_grid);
+    // Attach the TIBTRE ore-spawner animation index to the terrain objects
+    // constructed ahead of the map entities. Its authoritative raw SHP count
+    // is rules-owned; presentation atlases retain only body-frame ranges.
+    let seeded_terrain = crate::sim::terrain_spawn::seed_terrain_spawner_animation(
+        &sim.interner,
+        &mut sim.terrain_objects,
+        &sim.session,
+        rules,
+    );
+    if seeded_terrain > 0 {
+        log::info!(
+            "Seeded {} ore-spawning terrain objects (TIBTRE)",
+            seeded_terrain,
+        );
+    }
+    // Move the already-resolved CellClass overlay state into Simulation,
+    // then reconstruct map-wall ownership now that buildings exist.
+    if let Some(rt) = sim.resolved_terrain.as_ref() {
+        let (grid_width, grid_height) = (overlay_grid.width(), overlay_grid.height());
+        let buildings: Vec<crate::sim::overlay_grid::MapWallOwnerCandidate> = sim
+            .substrate
+            .entities
+            .values()
+            .filter(|entity| entity.category() == crate::map::entities::EntityCategory::Structure)
+            .map(|entity| {
+                let country = sim
+                    .houses
+                    .get(&entity.owner())
+                    .and_then(|house| house.country())
+                    .map(|country| sim.interner.resolve(country));
+                map_wall_owner_candidate_from_building(
+                    entity,
+                    rt,
+                    crate::sim::house_state::resolve_wall_owner(rules, country),
+                )
+            })
+            .collect();
+        overlay_grid.reconstruct_map_wall_owners(rt, overlay_registry, &buildings);
+        sim.install_overlay_grid_for_load(overlay_grid);
+        log::info!(
+            "Overlay grid initialized: {}x{}, {} entries",
+            grid_width,
+            grid_height,
+            map_data.overlays.len(),
+        );
+    }
+    // Seed smudge grid from map [Smudge] entries. Requires terrain +
+    // overlay grids built above so placement gates (slope, overlay,
+    // accepts_smudge) can reject invalid map entries at load.
+    if sim.smudge_grid.is_none()
+        && let (Some(rt), Some(overlay)) =
+            (sim.resolved_terrain.as_ref(), sim.overlay_grid.as_ref())
+    {
+        let grid_width = rt.width();
+        let grid_height = rt.height();
+        let smudges = crate::sim::smudge_grid::SmudgeGrid::from_map_entries(
+            &map_data.smudges,
+            &rules.smudge_types,
+            rt,
+            overlay,
+            grid_width,
+            grid_height,
+        );
+        sim.install_smudge_grid(smudges);
+        log::info!(
+            "Smudge grid initialized: {}x{}, {} entries",
+            grid_width,
+            grid_height,
+            map_data.smudges.len(),
+        );
+    }
+    // The caller submits one immutable initialization command; Simulation owns
+    // every match-affecting write and Scenario RNG draw in the post-map tail.
+    let campaign_new_game_map = sim
+        .session
+        .campaign_mission_counter()
+        .filter(|_| !sim.session.game_mode_nonzero())
+        .map(|_| map_data);
+    let output =
+        sim.finalize_scenario_post_map(crate::sim::scenario_post_map::ScenarioPostMapInput {
+            map_width: map_data.header.width as u16,
+            map_height: map_data.header.height as u16,
+            fill_silos: map_data.basic.fill_silos.unwrap_or(false),
+            rules,
+            overlay_registry,
+            house_roster,
+            skirmish_session,
+            campaign_new_game_map,
+        });
+    sim.lighting_sources.discard_pending();
+    output
+}
+#[test]
+fn finalization_keeps_live_neighbor_counts_instead_of_the_loader_copy() {
+    use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
+    use crate::sim::overlay_grid::OverlayGrid;
+    let map = crate::map::map_file::MapFile::from_bytes(
+            b"[Map]\nTheater=TEMPERATE\nSize=0,0,4,4\nLocalSize=0,0,4,4\n[IsoMapPack5]\n1=CAAEABUAAAAAEQAA\n"
+        ).unwrap();
+    let rules = SimResources::empty().rules;
+    let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+        &crate::rules::ini_parser::IniFile::from_str(""),
+        None,
+    );
+    let roster = crate::map::houses::parse_house_roster(&map.ini, &[], Some(&rules));
+    let mut sim = Simulation::new();
+    sim.resolved_terrain = Some(ResolvedTerrainGrid::from_cells(
+        8,
+        8,
+        (0..8)
+            .flat_map(|y| (0..8).map(move |x| test_flat_cell(x, y)))
+            .collect(),
+    ));
+    let stale = OverlayGrid::new(8, 8);
+    sim.overlay_grid = Some(stale.clone());
+    sim.overlay_grid
+        .as_mut()
+        .unwrap()
+        .adjust_foot_neighbor_source(sim.resolved_terrain.as_ref(), (3, 3), true);
+    let expected = sim
+        .overlay_grid
+        .as_ref()
+        .unwrap()
+        .retained_neighbor_counts()
+        .to_vec();
+    finalize_constructed_scenario(&mut sim, &map, &rules, &registry, stale, &roster, None);
+    assert_eq!(
+        sim.overlay_grid
+            .as_ref()
+            .unwrap()
+            .retained_neighbor_counts(),
+        expected
+    );
+}

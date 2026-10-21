@@ -1,0 +1,6 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "werhd-vera-native-upload",
+  "compatibility_date": "2026-10-19",
+  "r2_buckets": [{"binding": "NATIVE_DATA", "bucket_name": "ra2res", "remote": true}]
+}

@@ -1,0 +1,615 @@
+name: Release
+
+# Downloadable builds of the game for players who do not compile it. This
+# project changes too fast for every main commit to be a release, so there are
+# two kinds, both started by hand:
+#
+#   dev build -- dispatch with `promote` empty. Builds all platforms and runs the
+#                library tests on each at the same time; nothing is tagged or
+#                published unless every build and every test run passes (publish
+#                mode `none` runs them too). Names every archive after its build
+#                time and the commit it was built from, tags it v<Cargo.toml
+#                version>-<build time>, and lists the commits since the previous
+#                release of either kind. Publishes a draft pre-release by
+#                default, so a bad build is discarded instead of shipped. Only
+#                the newest published dev builds are kept.
+#   release   -- dispatch with `promote` set to the tag of a published dev build
+#                that testers played. Publishes the same archives as release
+#                v<version>, checked against their checksums and build
+#                provenance and never rebuilt: the stable toolchain can change
+#                between runs. Only their names change, to plain
+#                vera20k-<version>-<platform> ones. Its notes list the commits
+#                since the previous release. It is a draft, for notes written for
+#                players; once published, it is the repository's Latest release.
+#                Then raise the Cargo.toml version, so later dev builds carry the
+#                next one; a dev build refuses to start until it is above every
+#                release.
+#
+# The job that creates a tag also publishes its release: GitHub suppresses
+# `on: push` for refs written with GITHUB_TOKEN, so a tag created by a job can
+# never start another workflow.
+#
+# Archives hold the game program, config.toml.example, the license, the
+# third-party notices (THIRD_PARTY_LICENSES.html) and a README.txt made from
+# .github/release/README.txt.in. They never hold game files: this repository
+# ships no retail assets, and neither do its releases (README.md, README.txt.in).
+on:
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: 'Release: the dev build tag to promote. Empty = build a new dev build.'
+        type: string
+        required: false
+      tag:
+        description: 'Dev build tag. Empty = v<Cargo.toml version>-<build time>.'
+        type: string
+        required: false
+      publish:
+        description: 'Dev build: publish how? "none" only uploads workflow artifacts.'
+        type: choice
+        options: [draft, prerelease, none]
+        default: draft
+
+permissions:
+  contents: read
+
+env:
+  # rust-lld ships with rustup and links much faster than link.exe (as in
+  # test.yml). Linking the C runtime statically removes the program's need for
+  # VCRUNTIME140.dll, which Windows does not ship. x86-64 Windows only.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+  # The oldest macOS the Mac build runs on, for rustc, for the C code built
+  # with it, and for the app's Info.plist (.github/release/macos/app.sh).
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  # One cheap job decides the names and the publish mode, so all platform jobs
+  # and the publish job agree instead of each recomputing a date that may roll
+  # over midnight mid-run.
+  prepare:
+    name: prepare
+    # A release reuses a dev build's archives; only a dev build builds.
+    if: inputs.promote == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.names.outputs.version }}
+      stamp: ${{ steps.names.outputs.stamp }}
+      sha: ${{ steps.names.outputs.sha }}
+      tag: ${{ steps.names.outputs.tag }}
+      publish: ${{ steps.names.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The short build sha comes from the checkout, so it is the commit the
+          # archives were actually built from.
+          fetch-depth: 1
+      - name: Decide version, build time, sha, tag and publish mode
+        id: names
+        shell: bash
+        env:
+          # Inputs arrive through env, never interpolated into the script, so a
+          # crafted dispatch cannot inject shell syntax.
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "No [package] version found in Cargo.toml" >&2
+            exit 1
+          fi
+          # A dev build is a pre-release of its version, which sorts before that
+          # version's release. After a release, a dev build of the same or a
+          # lower version would look older than the release it follows.
+          released="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
+            | sed -n 's|.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' | sort -V | tail -n 1)"
+          if [ -n "$released" ] \
+            && [ "$(printf '%s\n' "$released" "$version" | sort -V | tail -n 1)" = "$released" ]; then
+            echo "::error::v$released is released; raise the version in Cargo.toml above $released before the next dev build."
+            exit 1
+          fi
+          # UTC keeps archive names identical for maintainers in any timezone.
+          # YYYYMMDD-HHMMSS: a sortable build time, so two builds of one
+          # Cargo.toml version never collide.
+          stamp="$(date -u +%Y%m%d-%H%M%S)"
+          # Short build sha: the archive name carries the commit it came from,
+          # so a downloaded file can be traced without opening the release.
+          sha="$(git rev-parse --short=7 HEAD)"
+          tag="${INPUT_TAG:-v$version-$stamp}"
+          publish="${INPUT_PUBLISH:-draft}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release plan"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| version | \`$version\` |"
+            echo "| build time | \`$stamp\` (UTC) |"
+            echo "| build commit | \`$sha\` |"
+            echo "| tag | \`$tag\` |"
+            echo "| publish | \`$publish\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+            program: vera20k.exe
+          # The oldest supported Ubuntu runner, so the build also runs on
+          # distributions with an older glibc.
+          - os: ubuntu-22.04
+            target: linux-x64
+            program: vera20k
+          - os: macos-latest
+            target: macos-arm64
+            program: vera20k
+    steps:
+      # The program embeds text files (shaders, the capture contract); keep
+      # their LF bytes instead of the Windows runner's CRLF checkout.
+      - name: Check out with LF line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      # Before the build, so a crate with an unrecognized or GPL-incompatible
+      # license stops the release early (.github/release/about.toml).
+      - name: Third-party license notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cargo about generate --locked --fail -c .github/release/about.toml \
+            -o dist/THIRD_PARTY_LICENSES.html .github/release/about.hbs
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Build the game
+        # Shipped binaries leave out the default `dev-overlays` (the Ctrl+Shift dev chord),
+        # and use the whole-program `shipping` profile (Cargo.toml).
+        run: cargo build --profile shipping --locked -p vera20k --no-default-features --bin vera20k
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STAMP: ${{ needs.prepare.outputs.stamp }}
+          SHA7: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Name = version + platform + build time + the commit built. The time
+          # keeps two builds of one Cargo.toml version apart; the short sha makes
+          # a downloaded archive traceable to its commit. A release drops both
+          # (the promote job).
+          name="vera20k-${VERSION}-${{ matrix.target }}-${STAMP}-${SHA7}"
+          mkdir -p "dist/$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          cp "target/shipping/${{ matrix.program }}" config.toml.example LICENSE-GPL \
+            dist/THIRD_PARTY_LICENSES.html "dist/$name/"
+          # The README names the version and build, which stay true when a
+          # release republishes this archive.
+          sed -e "s/@VERSION@/${VERSION}/" -e "s/@BUILD@/${STAMP}/" \
+            .github/release/README.txt.in > "dist/$name/README.txt"
+
+          # Files sit at the archive root so they can be extracted straight into
+          # the game folder.
+          cd "dist/$name"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "../$name.zip" ./* > /dev/null
+          else
+            tar -czf "../$name.tar.gz" ./*
+          fi
+      # Windows also gets an installer of the same files: it finds the Yuri's
+      # Revenge folder and writes config.toml (.github/release/windows).
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STAMP: ${{ needs.prepare.outputs.stamp }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Inno Setup 6 comes with the runner image (actions/runner-images).
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          $dist = (Resolve-Path dist).Path
+          & $iscc "/DAppVersion=$env:VERSION" "/DBuild=$env:STAMP" `
+            "/DPackageDir=$dist\$env:NAME" "/DOutputDir=$dist" `
+            "/DOutputBaseFilename=$env:NAME-setup" .github\release\windows\vera20k.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+      # Install, upgrade and uninstall silently against stand-in game folders, so
+      # a broken installer stops the release here instead of reaching players.
+      - name: Test the Windows installer
+        if: runner.os == 'Windows'
+        # A dialog left open in a silent install waits forever.
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path "dist\$env:NAME-setup.exe").Path
+          $root = Join-Path $env:RUNNER_TEMP 'installer-test'
+          $app = Join-Path $root 'VERA20k'
+          $log = Join-Path $root 'setup.log'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          function Install([string]$Game) {
+            $p = Start-Process $setup -Wait -PassThru -ArgumentList @('/VERYSILENT',
+              '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"", "/DIR=`"$app`"", "/GAMEDIR=`"$Game`"")
+            return $p.ExitCode
+          }
+          # Only the two masters the installer checks; nothing here is game data.
+          function New-Game([string]$Name) {
+            $dir = Join-Path $root $Name
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            foreach ($f in 'ra2md.mix', 'ra2.mix') { Set-Content (Join-Path $dir $f) '' }
+            return $dir
+          }
+          function Read-Config { Get-Content (Join-Path $app 'config.toml') -Raw -Encoding utf8 }
+          function Ra2Dir([string]$Dir) { 'ra2_dir = "' + ($Dir -replace '\\', '/') + '"' }
+          # Non-ASCII from code points, so the script's own encoding cannot matter.
+          $yuri = -join [char[]](0x5C24, 0x91CC, 0x7684, 0x590D, 0x4EC7)
+          $commander = -join [char[]](0x6307, 0x6325, 0x5B98)
+
+          # A folder without the game is refused before anything is installed.
+          $empty = Join-Path $root 'empty'
+          New-Item -ItemType Directory -Force $empty | Out-Null
+          if ((Install $empty) -eq 0) { throw 'setup accepted a folder without Yuri''s Revenge' }
+          if (Test-Path (Join-Path $app 'vera20k.exe')) { throw 'a refused setup installed files' }
+
+          # A fresh install writes config.toml from the example.
+          $first = New-Game 'game one'
+          $code = Install $first
+          if ($code -ne 0) { Get-Content $log; throw "setup failed with exit code $code" }
+          foreach ($f in 'vera20k.exe', 'config.toml', 'config.toml.example', 'README.txt',
+                         'LICENSE-GPL', 'THIRD_PARTY_LICENSES.html') {
+            if (-not (Test-Path (Join-Path $app $f))) { throw "setup did not install $f" }
+          }
+          $config = Read-Config
+          if (-not $config.Contains((Ra2Dir $first))) { throw "config.toml lacks $(Ra2Dir $first)" }
+          if ($config -notmatch '(?m)^settings_dir = "\."\r?$') { throw 'config.toml lacks settings_dir = "."' }
+
+          # An upgrade moves ra2_dir only, keeping the player's own settings.
+          [IO.File]::AppendAllText((Join-Path $app 'config.toml'),
+            "`n[profile]`nname = `"$commander`"`n", [Text.UTF8Encoding]::new($false))
+          $second = New-Game $yuri
+          $code = Install $second
+          if ($code -ne 0) { Get-Content $log; throw "upgrade failed with exit code $code" }
+          $config = Read-Config
+          if (-not $config.Contains((Ra2Dir $second))) { throw "upgrade did not write $(Ra2Dir $second)" }
+          if ([regex]::Matches($config, '(?m)^ra2_dir =').Count -ne 1) { throw 'config.toml repeats ra2_dir' }
+          if (-not $config.Contains("name = `"$commander`"")) { throw 'upgrade lost the [profile] name' }
+          if ([IO.File]::ReadAllBytes((Join-Path $app 'config.toml'))[0] -eq 0xEF) {
+            throw 'config.toml starts with a byte order mark'
+          }
+
+          # Uninstalling removes the program and keeps what the player made.
+          $p = Start-Process (Join-Path $app 'unins000.exe') -Wait -PassThru `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          if ($p.ExitCode -ne 0) { throw "uninstall failed with exit code $($p.ExitCode)" }
+          # The uninstaller finishes in a copy of itself; give it time to.
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path (Join-Path $app 'vera20k.exe')) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+          }
+          if (Test-Path (Join-Path $app 'vera20k.exe')) { throw 'uninstall left vera20k.exe behind' }
+          if (-not (Test-Path (Join-Path $app 'config.toml'))) { throw 'uninstall removed config.toml' }
+          Write-Output 'Installer: refused, installed, upgraded and uninstalled as expected.'
+      # macOS also gets the program as VERA20k.app on a disk image: it keeps its
+      # files in ~/Library/Application Support/VERA20k and finds or asks for the
+      # Yuri's Revenge folder on its first launch (.github/release/macos).
+      - name: macOS app
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STAMP: ${{ needs.prepare.outputs.stamp }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: bash .github/release/macos/app.sh "dist/$NAME" "dist/$NAME.dmg"
+      # Check the image's layout and signature and start the packaged app, so a
+      # broken disk image stops the release here instead of reaching players.
+      - name: Test the macOS app
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        env:
+          STAMP: ${{ needs.prepare.outputs.stamp }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          set -euo pipefail
+          mount="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "dist/$NAME.dmg" > /dev/null
+          trap 'hdiutil detach "$mount" > /dev/null || true' EXIT
+          app="$mount/VERA20k.app"
+          plist="$app/Contents/Info.plist"
+          test -L "$mount/Applications"
+          # The window's arrow and layout (dmg_settings.py).
+          test -f "$mount/.background.tiff"
+          test -f "$mount/.DS_Store"
+          test -f "$app/Contents/Resources/README.txt"
+          test -f "$app/Contents/Resources/VERA20k.icns"
+          test -f "$app/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
+          codesign --verify --strict --verbose=2 "$app"
+          # About VERA20k tells builds apart, and the program and its
+          # Info.plist name the same oldest macOS.
+          build="$(plutil -extract CFBundleVersion raw "$plist")"
+          test "$build" = "${STAMP/-/.}" || { echo "CFBundleVersion is $build" >&2; exit 1; }
+          for minimum in "$(plutil -extract LSMinimumSystemVersion raw "$plist")" \
+            "$(vtool -show-build "$app/Contents/MacOS/VERA20k" | awk '$1 == "minos" { print $2 }')"; do
+            test "$minimum" = "$MACOSX_DEPLOYMENT_TARGET" \
+              || { echo "oldest macOS $minimum, not $MACOSX_DEPLOYMENT_TARGET" >&2; exit 1; }
+          done
+          # Started from the bundle, it works in its data folder: the usage
+          # switch logs there and exits before the folder chooser or a window.
+          data="$HOME/Library/Application Support/VERA20k"
+          rm -rf "$data"
+          (cd / && "$app/Contents/MacOS/VERA20k" -h > /dev/null)
+          grep -q 'VERA20k .* starting' "$data/logs/ra2.log"
+          echo 'macOS app: signed, on the disk image, and starting in its data folder.'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*-setup.exe
+            dist/*.dmg
+          if-no-files-found: error
+
+  # The library tests on each platform a dev build ships, from the commit it
+  # builds. No CI runs by itself, so this is where a change first has to pass on
+  # Windows and Linux before it reaches testers. They run beside the builds,
+  # and `publish` needs them. As in the per-platform workflows, there is no
+  # retail game data here: retail-data tests print SKIPPED and pass.
+  test:
+    # A release republishes a tested dev build's files; only a dev build tests.
+    if: inputs.promote == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        # The per-platform workflows' runners. Linux tests on the current Ubuntu,
+        # not the build's 22.04: rust-cache keys on the OS family, not its
+        # version, so a cache saved on the newer image could hand 22.04 build
+        # scripts linked against a glibc it lacks.
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    uses: ./.github/workflows/test.yml
+    with:
+      os: ${{ matrix.os }}
+
+  publish:
+    name: publish
+    needs: [prepare, build, test]
+    # "none" stops here, with the archives left as workflow artifacts.
+    if: needs.prepare.outputs.publish != 'none'
+    #
+    # MAINTENANCE DECISION, left to the maintainers: `needs: [build, test]`
+    # means one platform failing to build or to pass its tests stops the
+    # release. That is deliberate -- a release that silently lacks macOS is
+    # worse than no release -- but hosted runners do drop jobs ("not acquired
+    # by Runner of type hosted"), and then a fully built Windows and Linux are
+    # discarded too.
+    #
+    # To publish whatever built instead, make the condition above `always() &&
+    # needs.prepare.outputs.publish != 'none' && needs.test.result ==
+    # 'success'`, so the tests still have to pass, and assert the expected
+    # archives exist before `gh release create`; the Checksums step already
+    # fails on a missing file. The trade-off is that a capacity failure would
+    # ship a release missing a platform, so the assertion has to name all three.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # Signed SLSA build provenance: `gh attestation verify <archive>
+      # --repo YuriPlanet/vera20k` proves an archive came from this workflow.
+      id-token: write
+      attestations: write
+    steps:
+      # Notes need real history to list commits since the previous release.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/vera20k-*
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `gh release create TAG dist/*` hands each match to the uploader, so a
+          # leftover directory (or a symlink) would fail or be skipped silently.
+          # Assert the download really left only regular files.
+          nonfile="$(find dist -mindepth 1 -not -type f -print)"
+          if [ -n "$nonfile" ]; then
+            echo "!! non-file entries in dist/, refusing to publish:" >&2
+            echo "$nonfile" >&2
+            exit 1
+          fi
+          cd dist
+          sha256sum vera20k-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Write release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STAMP: ${{ needs.prepare.outputs.stamp }}
+          COMMIT: ${{ github.sha }}
+          DIST: dist
+        run: bash .github/release/notes.sh notes.md
+      - name: Create the tag and the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+          # Creating the tag here, before the release, keeps it pinned to the
+          # commit that was actually built even when dispatching from a branch.
+          # `gh release create --verify-tag` then refuses to invent a different
+          # target.
+          bash .github/release/tag.sh "$TAG" "$GITHUB_SHA"
+
+          # A dev build is a pre-release even as a draft, so publishing the
+          # draft cannot make it the repository's Latest release.
+          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --prerelease
+            --title "VERA20k dev build $TAG" --notes-file notes.md)
+          case "$PUBLISH" in
+            draft)      args+=(--draft) ;;
+            prerelease) ;;
+            *) echo "Unsupported publish mode: $PUBLISH" >&2; exit 1 ;;
+          esac
+          gh release create "$TAG" "${args[@]}" dist/*
+          echo "Published $TAG ($PUBLISH)"
+      - name: Prune old dev builds
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Enough for testers to step back a few builds to find a regression.
+          KEEP_DEV_BUILDS: 10
+        run: |
+          set -euo pipefail
+          # Only published pre-releases with a dev build tag qualify: releases,
+          # drafts and builds dispatched with a custom tag are never deleted.
+          # A release keeps its own copies of a promoted dev build's archives.
+          gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease
+                     and (.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]{8}-[0-9]{6}$")))]
+                  | sort_by(.createdAt) | reverse
+                  | .[(env.KEEP_DEV_BUILDS | tonumber):][] | .tagName' \
+            | while read -r old; do
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+                echo "Pruned dev build $old"
+              done
+
+  # A release is a dev build that testers played, published again under its
+  # version. The archives are the dev build's own, checked against its checksum
+  # list and build provenance, so players get exactly the files that were
+  # tested.
+  promote:
+    name: promote
+    if: inputs.promote != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # `gh attestation verify` reads the dev build's provenance.
+      attestations: read
+    steps:
+      # Notes need real history to list commits since the previous release.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check the dev build and download its archives
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.promote }}
+        run: |
+          set -euo pipefail
+          # The release takes the version from the dev build's tag, which the
+          # archive names already carry.
+          if ! [[ "$FROM" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]{8}-[0-9]{6})$ ]]; then
+            echo "$FROM is not a dev build tag (v<version>-<YYYYMMDD>-<HHMMSS>)." >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          stamp="${BASH_REMATCH[2]}"
+          state="$(gh release view "$FROM" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')"
+          if [ "$state" != 'false true' ]; then
+            echo "$FROM must be a published dev build (pre-release, not a draft)." >&2
+            exit 1
+          fi
+          git fetch --quiet --no-tags origin "+refs/tags/$FROM:refs/tags/$FROM"
+          commit="$(git rev-parse --verify "refs/tags/$FROM^{commit}")"
+
+          mkdir dist
+          gh release download "$FROM" --repo "$GITHUB_REPOSITORY" --dir dist
+          cd dist
+          # Every asset must be a listed archive with its listed checksum and
+          # this workflow's provenance; an asset added to the dev build by hand
+          # would fail here rather than reach players.
+          listed="$(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS.txt | sort)"
+          present="$(for f in *; do
+            if [ -f "$f" ] && [ "$f" != SHA256SUMS.txt ]; then echo "$f"; fi
+          done | sort)"
+          if [ "$listed" != "$present" ]; then
+            echo "!! $FROM's assets differ from its SHA256SUMS.txt:" >&2
+            diff <(echo "$listed") <(echo "$present") >&2 || true
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS.txt
+          for archive in $listed; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" > /dev/null
+            echo "provenance verified: $archive"
+          done
+          # Plain release names: vera20k-<version>-<platform>[-setup].<ext>,
+          # without the dev build's time and commit. Only the names change, so
+          # the checksums are listed again under them, and the provenance,
+          # which is bound to each file's contents, still verifies.
+          version_re="${version//./\\.}"
+          for archive in $listed; do
+            plain="$(sed -E "s/^(vera20k-$version_re-[a-z0-9]+-[a-z0-9]+)-$stamp-[0-9a-f]{7,40}(-setup\.exe|\.zip|\.tar\.gz|\.dmg)$/\1\2/" <<< "$archive")"
+            if [ "$plain" = "$archive" ] || [ -e "$plain" ]; then
+              echo "!! cannot give $archive a plain release name" >&2
+              exit 1
+            fi
+            mv "$archive" "$plain"
+            echo "renamed: $archive -> $plain"
+          done
+          sha256sum vera20k-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            echo "tag=v$version"
+            echo "version=$version"
+            echo "stamp=$stamp"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+      - name: Write release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.source.outputs.tag }}
+          VERSION: ${{ steps.source.outputs.version }}
+          STAMP: ${{ steps.source.outputs.stamp }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+          DIST: dist
+          PROMOTED_FROM: ${{ inputs.promote }}
+        run: bash .github/release/notes.sh notes.md
+      - name: Create the tag and the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.source.outputs.tag }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+          FROM: ${{ inputs.promote }}
+        run: |
+          set -euo pipefail
+          bash .github/release/tag.sh "$TAG" "$COMMIT"
+          # A draft, so the maintainer adds notes for players before publishing.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "VERA20k $TAG" --notes-file notes.md dist/*
+          echo "Drafted release $TAG from dev build $FROM"

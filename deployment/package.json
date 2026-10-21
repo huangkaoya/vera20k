@@ -1,0 +1,19 @@
+{
+  "name": "werhd-vera-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "package": "node prepare-native.mjs",
+    "test": "node --test native-worker.test.mjs",
+    "check": "wrangler deploy --dry-run --outdir generated/worker",
+    "types": "wrangler types generated/worker-configuration.d.ts",
+    "check:types": "node ../node_modules/typescript/bin/tsc -p tsconfig.json",
+    "dev": "wrangler dev --local",
+    "upload": "node upload-native.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261021.1",
+    "wrangler": "4.151.3"
+  }
+}

@@ -27,10 +27,10 @@ async function sha256(file) {
   return hash.digest('hex');
 }
 /** Only an explicit set of regular root files is exposed; personal configuration and media are excluded. */
-export async function createResourceIndex(assetRoot) {
+export async function createResourceIndex(assetRoot, {isAllowed = isPublicRetailFile} = {}) {
   const root = path.resolve(assetRoot), allowed = new Map(), files = [];
   const entries = (await fsp.readdir(root, { withFileTypes: true }))
-    .filter(entry => entry.isFile() && isPublicRetailFile(entry.name))
+    .filter(entry => entry.isFile() && isAllowed(entry.name))
     .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase(), 'en'));
   for (const entry of entries) {
     const filePath = path.join(root, entry.name), stat = await fsp.stat(filePath);
