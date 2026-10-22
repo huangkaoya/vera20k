@@ -7,6 +7,7 @@
     "setup:native-web": "node tools/setup-native-web.mjs",
     "build:native-web": "node tools/build-native-web.mjs",
     "package:toy": "node tools/package-native-toy.mjs",
+    "package:cloudflare": "node tools/package-native-cloudflare.mjs",
     "resources:toy:build": "python3 tools/package-native-resource-shards.py build",
     "resources:toy:check": "python3 tools/package-native-resource-shards.py check",
     "resources:toy:test": "node --expose-gc tools/test-native-resource-shards.mjs",
