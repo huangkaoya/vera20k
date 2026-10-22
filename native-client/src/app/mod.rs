@@ -33,6 +33,7 @@ use crate::util::config::GameConfig;
 
 pub mod app_bundle;
 pub(crate) mod audio_runtime;
+pub(crate) mod browser_shell;
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 #[cfg(target_arch = "wasm32")]

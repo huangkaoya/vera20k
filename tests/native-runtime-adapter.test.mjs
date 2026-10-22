@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createVeraRuntime} from '../web-native/runtime-adapter.js';
 
 test('content is frozen before gameplay while the replaceable network port remains available', async () => {
-  const mounted = [], received = [], events = [];
+  const mounted = [], received = [], events = [], shell = [];
   const module = {
     default: async ({module_or_path}) => { assert.deepEqual([...module_or_path], [0, 97, 115, 109]); },
     configure_content: text => events.push(JSON.parse(text)),
@@ -14,6 +14,7 @@ test('content is frozen before gameplay while the replaceable network port remai
     network_start: config => received.push(config), network_leave() {},
     network_receive() {}, network_drain_outbox: () => '[]',
     network_status: () => ({phase: 'running'}),
+    browser_shell_update: text => shell.push(JSON.parse(text)),
   };
   const runtime = await createVeraRuntime({moduleUrl: '/native/engine.js', engineBytes: new Uint8Array([0, 97, 115, 109]),
     importModule: async url => { assert.equal(url, '/native/engine.js'); return module; }});
@@ -25,6 +26,8 @@ test('content is frozen before gameplay while the replaceable network port remai
   assert.throws(() => runtime.mountResource('optional.mix', new Uint8Array([4])), /运行期间/);
   assert.throws(() => runtime.start('canvas'), /运行期间/);
   runtime.network.network_start('match');
+  runtime.updateShell({schema: 1, lobby: {open: true, name: '指挥官'}});
+  assert.deepEqual(shell, [{schema: 1, lobby: {open: true, name: '指挥官'}}]);
   assert.deepEqual(received, ['match']);
   assert.deepEqual(runtime.networkStatus(), {phase: 'running'});
   assert.deepEqual(mounted, [['core.mix', [1, 2, 3]]]);

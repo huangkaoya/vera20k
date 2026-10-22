@@ -64,7 +64,7 @@ pub(crate) fn main_menu_layout(state: &AppState) -> MainMenuShellLayout {
     } else {
         compute_layout(width, height)
     };
-    if uses_branded_main_menu(state) {
+    if uses_branded_main_menu(state) && !cfg!(target_arch = "wasm32") {
         layout.without_internet()
     } else {
         layout

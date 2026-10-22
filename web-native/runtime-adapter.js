@@ -27,6 +27,7 @@ export async function createVeraRuntime({moduleUrl, engineBytes, importModule = 
       started = true;
     },
     network,
+    updateShell: snapshot => native.browser_shell_update(JSON.stringify(snapshot)),
     sourceRevision: () => native.source_revision(),
     diagnostics: () => native.browser_diagnostics?.(),
     networkStatus: () => native.network_status(),

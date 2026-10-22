@@ -13,6 +13,8 @@ use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::ui::game_screen::GameScreen;
 
 pub(crate) struct FrontendState {
+    /// Native presentation/input for browser content and multiplayer services.
+    pub(crate) browser_shell: crate::app::browser_shell::BrowserShellUi,
     /// External offline launch: returning from the session closes the process for its client.
     pub(crate) external_launch: bool,
     pub(crate) external_launch_error: Option<String>,

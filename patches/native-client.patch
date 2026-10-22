@@ -86790,10 +86790,10 @@ index 312056a1b74195c4d0baf6c848b4606b4b8f65d9..2e17c32972565dd85b608a6e3a31deb0
  
 diff --git a/src/app/browser.rs b/src/app/browser.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..665d7ec8be62742619ee86ab861089a88cf85c74
+index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267f6a02d2d
 --- /dev/null
 +++ b/src/app/browser.rs
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,566 @@
 +//! Browser lifecycle for the ordinary native App, menus and tactical input.
 +//!
 +//! Resource hydration is completed by web_entry before this module starts.
@@ -86915,12 +86915,52 @@ index 0000000000000000000000000000000000000000..665d7ec8be62742619ee86ab861089a8
 +    live: Rc<Cell<bool>>,
 +}
 +
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct BrowserViewport {
++    width: u32,
++    height: u32,
++    dpr_bits: u64,
++}
++
++impl BrowserViewport {
++    fn measured(width: f64, height: f64, dpr: f64) -> Option<Self> {
++        if !width.is_finite()
++            || !height.is_finite()
++            || !dpr.is_finite()
++            || width < 1.0
++            || height < 1.0
++            || dpr <= 0.0
++            || width > u32::MAX as f64
++            || height > u32::MAX as f64
++        {
++            return None;
++        }
++        Some(Self {
++            width: width.round() as u32,
++            height: height.round() as u32,
++            dpr_bits: dpr.to_bits(),
++        })
++    }
++
++    fn current() -> Option<Self> {
++        let window = web_sys::window()?;
++        Self::measured(
++            window.inner_width().ok()?.as_f64()?,
++            window.inner_height().ok()?.as_f64()?,
++            window.device_pixel_ratio(),
++        )
++    }
++}
++
 +pub(super) struct BrowserState {
 +    canvas: HtmlCanvasElement,
 +    pending: Option<PendingInitialization>,
 +    attempted: bool,
 +    last_diagnostics: Option<Instant>,
 +    last_document_hidden: Option<bool>,
++    /// Winit writes explicit canvas CSS dimensions. Observe the browser rather
++    /// than that now-fixed client rect; no resize listeners outlive this owner.
++    last_viewport: Option<BrowserViewport>,
 +}
 +
 +/// Start once, after the retail provider has mounted and hydrated its files.
@@ -86941,6 +86981,7 @@ index 0000000000000000000000000000000000000000..665d7ec8be62742619ee86ab861089a8
 +        attempted: false,
 +        last_diagnostics: None,
 +        last_document_hidden: None,
++        last_viewport: BrowserViewport::current(),
 +    });
 +    BROWSER_PROXY.with(|proxy| *proxy.borrow_mut() = Some(event_loop.create_proxy()));
 +    STARTED.with(|started| started.set(true));
@@ -86969,6 +87010,22 @@ index 0000000000000000000000000000000000000000..665d7ec8be62742619ee86ab861089a8
 +        let Some(state) = self.state.as_mut() else {
 +            return;
 +        };
++        if let Some(browser) = self.browser.as_mut()
++            && let Some(viewport) = BrowserViewport::current()
++            && browser.last_viewport != Some(viewport)
++        {
++            browser.last_viewport = Some(viewport);
++            // Feed the ordinary Resized path so GPU, shell layout, tactical
++            // viewport and native sidebar all agree on the same physical size.
++            let _ = state
++                .platform
++                .window
++                .request_inner_size(winit::dpi::LogicalSize::new(
++                    f64::from(viewport.width),
++                    f64::from(viewport.height),
++                ));
++            state.platform.window.request_redraw();
++        }
 +        if let Some(match_id) = NETWORK_LEAVE.with(|pending| pending.borrow_mut().take()) {
 +            let canceled = NETWORK_START.with(|pending| {
 +                let mut pending = pending.borrow_mut();
@@ -87150,6 +87207,7 @@ index 0000000000000000000000000000000000000000..665d7ec8be62742619ee86ab861089a8
 +            state.platform.window.set_cursor_visible(true);
 +        }
 +        if let Some(browser) = self.browser.as_mut() {
++            browser.last_viewport = None;
 +            if let Some(pending) = browser.pending.take() {
 +                pending.live.set(false);
 +                pending.window.set_cursor_visible(true);
@@ -88222,6 +88280,2597 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +    state.platform.browser_online = !matches!(session.phase, Phase::Stopped | Phase::Finished);
 +    state.match_state.browser_network = Some(session);
 +}
+diff --git a/src/app/browser_shell.rs b/src/app/browser_shell.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..540f46a8f232db38702649174076538a7e28c4e7
+--- /dev/null
++++ b/src/app/browser_shell.rs
+@@ -0,0 +1,1274 @@
++//! Native presentation and input owner for browser services.
++//!
++//! JavaScript owns download/cache and transport operations; it may publish only
++//! these semantic receipts. This owner paints real shell art/font and emits
++//! intents, never simulation commands. No DOM UI or screenshot surface exists.
++mod content;
++mod lobby;
++mod model;
++mod text_input;
++
++use serde::Deserialize;
++use serde_json::{Value, json};
++use winit::event::{ElementState, Ime, MouseButton, TouchPhase, WindowEvent};
++use winit::keyboard::{Key, NamedKey};
++
++use crate::app::{App, AppState};
++use crate::render::batch::SpriteInstance;
++use crate::render::shell_paint::{self, PaintButton, PaintLabel};
++use crate::render::shell_text::ShellAlign;
++use crate::ui::game_screen::GameScreen;
++use crate::ui::shell::geom::RectPx;
++use model::{ContentSnapshot, LobbySnapshot};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Surface {
++    Content,
++    Lobby,
++}
++impl Surface {
++    fn name(self) -> &'static str {
++        match self {
++            Self::Content => "content",
++            Self::Lobby => "lobby",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum EditField {
++    Name,
++    Code,
++}
++
++#[derive(Clone)]
++pub(super) struct Choice {
++    pub label: String,
++    pub action: Value,
++}
++#[derive(Clone)]
++pub(super) enum ControlKind {
++    Button,
++    Check(bool),
++    Edit(EditField),
++    Select(Vec<Choice>),
++}
++#[derive(Clone)]
++pub(super) struct Control {
++    pub id: String,
++    pub label: String,
++    pub rect: RectPx,
++    pub enabled: bool,
++    pub action: Value,
++    pub kind: ControlKind,
++}
++impl Control {
++    pub fn button(
++        id: impl Into<String>,
++        label: impl Into<String>,
++        rect: RectPx,
++        enabled: bool,
++        action: Value,
++    ) -> Self {
++        Self {
++            id: id.into(),
++            label: label.into(),
++            rect,
++            enabled,
++            action,
++            kind: ControlKind::Button,
++        }
++    }
++    pub fn check(
++        id: impl Into<String>,
++        label: impl Into<String>,
++        rect: RectPx,
++        enabled: bool,
++        checked: bool,
++        action: Value,
++    ) -> Self {
++        Self {
++            kind: ControlKind::Check(checked),
++            ..Self::button(id, label, rect, enabled, action)
++        }
++    }
++    fn edit(id: &str, value: &str, rect: RectPx, enabled: bool, field: EditField) -> Self {
++        Self {
++            kind: ControlKind::Edit(field),
++            ..Self::button(id, value, rect, enabled, Value::Null)
++        }
++    }
++    fn select(
++        id: impl Into<String>,
++        label: impl Into<String>,
++        rect: RectPx,
++        enabled: bool,
++        choices: Vec<Choice>,
++    ) -> Self {
++        Self {
++            kind: ControlKind::Select(choices),
++            ..Self::button(id, label, rect, enabled, Value::Null)
++        }
++    }
++}
++pub(super) struct Label {
++    pub text: String,
++    pub rect: RectPx,
++    pub rgb: [f32; 3],
++}
++impl Label {
++    pub fn new(text: impl Into<String>, rect: RectPx) -> Self {
++        Self {
++            text: text.into(),
++            rect,
++            rgb: shell_paint::SHELL_TEXT_RGB_ENABLED,
++        }
++    }
++}
++pub(super) struct ProgressBar {
++    pub rect: RectPx,
++    pub fraction: f32,
++}
++#[derive(Default)]
++pub(super) struct Panel {
++    pub title: String,
++    pub subtitle: String,
++    pub controls: Vec<Control>,
++    pub labels: Vec<Label>,
++    pub bars: Vec<ProgressBar>,
++}
++
++#[derive(Default)]
++pub(crate) struct BrowserShellUi {
++    content: ContentSnapshot,
++    lobby: LobbySnapshot,
++    pressed: Option<String>,
++    focused: Option<String>,
++    popup: Option<String>,
++    name: String,
++    code: String,
++    caret: usize,
++    selection_all: bool,
++    preedit: String,
++    input_generation: u64,
++}
++
++#[derive(Default, Deserialize)]
++#[serde(default)]
++struct Update {
++    schema: u32,
++    content: Option<ContentSnapshot>,
++    lobby: Option<LobbySnapshot>,
++}
++
++#[cfg(target_arch = "wasm32")]
++thread_local! { static PENDING: std::cell::RefCell<Update> = std::cell::RefCell::new(Update::default()); }
++
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn update_snapshot(raw: &str) -> Result<(), String> {
++    if raw.len() > 256 * 1024 {
++        return Err("browser shell snapshot exceeds 256 KiB".into());
++    }
++    let update: Update = serde_json::from_str(raw)
++        .map_err(|error| format!("invalid browser shell snapshot: {error}"))?;
++    if update.schema != 1 {
++        return Err("unsupported browser shell snapshot schema".into());
++    }
++    PENDING.with(|pending| {
++        let mut pending = pending.borrow_mut();
++        if update.content.is_some() {
++            pending.content = update.content;
++        }
++        if update.lobby.is_some() {
++            pending.lobby = update.lobby;
++        }
++    });
++    crate::app::browser::wake();
++    Ok(())
++}
++
++fn emit(surface: Surface, mut action: Value) {
++    if let Some(object) = action.as_object_mut() {
++        object.insert("surface".into(), json!(surface.name()));
++    } else {
++        return;
++    }
++    #[cfg(target_arch = "wasm32")]
++    {
++        let Some(window) = web_sys::window() else {
++            return;
++        };
++        let Ok(detail) = js_sys::JSON::parse(&action.to_string()) else {
++            return;
++        };
++        let init = web_sys::CustomEventInit::new();
++        init.set_detail(&detail);
++        if let Ok(event) =
++            web_sys::CustomEvent::new_with_event_init_dict("vera-shell-action", &init)
++        {
++            let _ = window.dispatch_event(&event);
++        }
++    }
++}
++
++pub(crate) fn surface(state: &AppState) -> Option<Surface> {
++    if state.frontend.screen != GameScreen::MainMenu {
++        return None;
++    }
++    match state.frontend.shell_route {
++        crate::app::shell_route::ShellRoute::BrowserContent => Some(Surface::Content),
++        crate::app::shell_route::ShellRoute::BrowserLobby => Some(Surface::Lobby),
++        _ => None,
++    }
++}
++
++pub(crate) fn open(state: &mut AppState, page: Surface, pack: Option<&str>) {
++    open_impl(state, page, pack, true);
++}
++
++fn open_impl(state: &mut AppState, page: Surface, pack: Option<&str>, notify: bool) {
++    if state.frontend.screen != GameScreen::MainMenu {
++        return;
++    }
++    // Tear down the old dialog's slide/movie ownership, not its game state.
++    crate::app::frontend::main_menu_shell_render::clear_ra2ts_movie_session(state);
++    crate::app::frontend::shell_transition::invalidate_main_menu_dialog_instance(state);
++    state.frontend.shell_exit = None;
++    state.frontend.shell_first_paint_slide = None;
++    state.frontend.shell_slide_active_shell = None;
++    let _ = App::ensure_skirmish_shell_chrome(state);
++    state.frontend.shell_route = match page {
++        Surface::Content => crate::app::shell_route::ShellRoute::BrowserContent,
++        Surface::Lobby => crate::app::shell_route::ShellRoute::BrowserLobby,
++    };
++    let ui = &mut state.frontend.browser_shell;
++    ui.pressed = None;
++    ui.focused = None;
++    ui.popup = None;
++    ui.preedit.clear();
++    ui.selection_all = false;
++    ui.input_generation = ui.input_generation.wrapping_add(1);
++    text_input::blur();
++    match page {
++        Surface::Content => ui.content.open = true,
++        Surface::Lobby => ui.lobby.open = true,
++    }
++    let mut action = json!({"action":"open"});
++    if let Some(pack) = pack {
++        action["pack"] = json!(pack);
++    }
++    if notify {
++        emit(page, action);
++    }
++    state.platform.window.request_redraw();
++}
++
++fn close(state: &mut AppState, notify: bool) {
++    let Some(page) = surface(state) else {
++        return;
++    };
++    state.frontend.browser_shell.pressed = None;
++    state.frontend.browser_shell.popup = None;
++    state.frontend.browser_shell.focused = None;
++    state.frontend.browser_shell.preedit.clear();
++    state.frontend.browser_shell.input_generation = state
++        .frontend
++        .browser_shell
++        .input_generation
++        .wrapping_add(1);
++    text_input::blur();
++    match page {
++        Surface::Content => state.frontend.browser_shell.content.open = false,
++        Surface::Lobby => state.frontend.browser_shell.lobby.open = false,
++    }
++    // Reuse the original menu constructor, including its controller and reveal.
++    App::close_single_player_shell(state);
++    if notify {
++        emit(page, json!({"action":"close"}));
++    }
++    state.platform.window.set_ime_allowed(false);
++    state.platform.window.request_redraw();
++}
++
++pub(crate) fn poll(state: &mut AppState) {
++    #[cfg(target_arch = "wasm32")]
++    {
++        let update = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
++        if let Some(content) = update.content {
++            let wants_open = content.open;
++            state.frontend.browser_shell.content = content;
++            // Content progress is observational. Only a native menu/campaign
++            // action opens this page; background downloads never steal focus.
++            if !wants_open && surface(state) == Some(Surface::Content) {
++                close(state, false);
++            }
++        }
++        if let Some(lobby) = update.lobby {
++            let wants_open = lobby.open;
++            let ui = &mut state.frontend.browser_shell;
++            let editing = ui.focused.as_deref();
++            if editing != Some("lobby.name") {
++                ui.name = lobby.name.clone();
++            }
++            if editing != Some("lobby.code") {
++                ui.code = lobby.code.clone();
++            }
++            ui.lobby = lobby;
++            if wants_open
++                && surface(state) != Some(Surface::Lobby)
++                && state.frontend.screen == GameScreen::MainMenu
++            {
++                // The controller already owns this open receipt. Echoing an
++                // open intent here would clear its newly published error.
++                open_impl(state, Surface::Lobby, None, false);
++            } else if !wants_open && surface(state) == Some(Surface::Lobby) {
++                close(state, false);
++            }
++        }
++    }
++    let view = panel(state);
++    let focused = state.frontend.browser_shell.focused.as_deref();
++    let text_field_active = surface(state) == Some(Surface::Lobby)
++        && view.controls.iter().any(|control| {
++            control.enabled
++                && Some(control.id.as_str()) == focused
++                && matches!(control.kind, ControlKind::Edit(_))
++        });
++    if !text_field_active && text_input::active() {
++        state.frontend.browser_shell.input_generation = state
++            .frontend
++            .browser_shell
++            .input_generation
++            .wrapping_add(1);
++        text_input::blur();
++    }
++    if text_input::active() {
++        App::set_window_active(state, text_input::document_focused());
++    }
++    for input in text_input::drain() {
++        if !accepts_text_input(
++            text_field_active,
++            &input.field,
++            input.generation,
++            state.frontend.browser_shell.focused.as_deref(),
++            state.frontend.browser_shell.input_generation,
++        ) {
++            continue;
++        }
++        match input.kind {
++            text_input::InputKind::Commit(text) | text_input::InputKind::Paste(text) => {
++                state.frontend.browser_shell.preedit.clear();
++                edit(state, None, Some(&text));
++            }
++            text_input::InputKind::Preedit(text) => state.frontend.browser_shell.preedit = text,
++            text_input::InputKind::Key {
++                key,
++                ctrl,
++                meta,
++                shift,
++            } => platform_key(state, &key, ctrl || meta, shift),
++        }
++        state.platform.window.request_redraw();
++    }
++}
++
++fn accepts_text_input(
++    active: bool,
++    field: &str,
++    generation: u64,
++    focused: Option<&str>,
++    current_generation: u64,
++) -> bool {
++    active
++        && matches!(field, "lobby.name" | "lobby.code")
++        && generation == current_generation
++        && Some(field) == focused
++}
++
++fn platform_key(state: &mut AppState, key: &str, command: bool, shift: bool) {
++    if command {
++        if key.eq_ignore_ascii_case("a") {
++            state.frontend.browser_shell.selection_all = true;
++        }
++        return;
++    }
++    match key {
++        "Escape" => {
++            close(state, true);
++        }
++        "Tab" => {
++            let view = panel(state);
++            let all: Vec<_> = view
++                .controls
++                .into_iter()
++                .filter(|control| control.enabled)
++                .collect();
++            if all.is_empty() {
++                return;
++            }
++            let current = all.iter().position(|control| {
++                Some(control.id.as_str()) == state.frontend.browser_shell.focused.as_deref()
++            });
++            let next = if shift {
++                current.unwrap_or(0).checked_sub(1).unwrap_or(all.len() - 1)
++            } else {
++                current.map_or(0, |index| (index + 1) % all.len())
++            };
++            let control = all[next].clone();
++            if matches!(control.kind, ControlKind::Edit(_)) {
++                activate(state, control);
++            } else {
++                state.frontend.browser_shell.focused = Some(control.id);
++                state.frontend.browser_shell.input_generation = state
++                    .frontend
++                    .browser_shell
++                    .input_generation
++                    .wrapping_add(1);
++                text_input::blur();
++            }
++        }
++        "Enter" => {
++            if state.frontend.browser_shell.focused.as_deref() == Some("lobby.code") {
++                if let Some(control) = panel(state)
++                    .controls
++                    .into_iter()
++                    .find(|control| control.id == "lobby.join")
++                {
++                    activate(state, control);
++                }
++            }
++        }
++        "Backspace" => edit(state, Some(NamedKey::Backspace), None),
++        "Delete" => edit(state, Some(NamedKey::Delete), None),
++        "ArrowLeft" => edit(state, Some(NamedKey::ArrowLeft), None),
++        "ArrowRight" => edit(state, Some(NamedKey::ArrowRight), None),
++        "Home" => edit(state, Some(NamedKey::Home), None),
++        "End" => edit(state, Some(NamedKey::End), None),
++        text if text.chars().count() == 1 => edit(state, None, Some(text)),
++        _ => {}
++    }
++}
++
++fn panel(state: &AppState) -> Panel {
++    match surface(state) {
++        Some(Surface::Content) => content::view(&state.frontend.browser_shell.content),
++        Some(Surface::Lobby) => lobby::view(
++            &state.frontend.browser_shell.lobby,
++            &state.frontend.browser_shell.name,
++            &state.frontend.browser_shell.code,
++        ),
++        None => Panel::default(),
++    }
++}
++
++#[derive(Clone, Copy)]
++struct Fit {
++    scale: f32,
++    x: f32,
++    y: f32,
++}
++impl Fit {
++    fn new(width: u32, height: u32) -> Self {
++        let scale = (width as f32 / 800.0).min(height as f32 / 600.0).max(0.1);
++        Self {
++            scale,
++            x: (width as f32 - 800.0 * scale) * 0.5,
++            y: (height as f32 - 600.0 * scale) * 0.5,
++        }
++    }
++    fn rect(self, r: RectPx) -> RectPx {
++        RectPx::new(
++            (self.x + r.x as f32 * self.scale).round() as i32,
++            (self.y + r.y as f32 * self.scale).round() as i32,
++            (r.w as f32 * self.scale).round().max(1.0) as i32,
++            (r.h as f32 * self.scale).round().max(1.0) as i32,
++        )
++    }
++    fn point(self, x: f64, y: f64) -> (i32, i32) {
++        (
++            ((x as f32 - self.x) / self.scale) as i32,
++            ((y as f32 - self.y) / self.scale) as i32,
++        )
++    }
++}
++
++fn controls(state: &AppState, view: &Panel) -> Vec<Control> {
++    let mut result = view.controls.clone();
++    if let Some(id) = state.frontend.browser_shell.popup.as_deref() {
++        if let Some(control) = view
++            .controls
++            .iter()
++            .find(|control| control.id == id && control.enabled)
++        {
++            if let ControlKind::Select(choices) = &control.kind {
++                let height = choices.len() as i32 * 25;
++                let y = (control.rect.y + control.rect.h).min(580 - height).max(70);
++                for (index, choice) in choices.iter().enumerate() {
++                    result.push(Control::button(
++                        format!("popup.{index}"),
++                        &choice.label,
++                        RectPx::new(control.rect.x, y + index as i32 * 25, control.rect.w, 25),
++                        true,
++                        choice.action.clone(),
++                    ));
++                }
++            }
++        }
++    }
++    result
++}
++
++fn activate(state: &mut AppState, control: Control) {
++    if !control.enabled {
++        return;
++    }
++    match control.kind {
++        ControlKind::Edit(field) => {
++            state.frontend.browser_shell.focused = Some(control.id);
++            state.frontend.browser_shell.caret = match field {
++                EditField::Name => state.frontend.browser_shell.name.chars().count(),
++                EditField::Code => state.frontend.browser_shell.code.chars().count(),
++            };
++            state.frontend.browser_shell.popup = None;
++            state.frontend.browser_shell.preedit.clear();
++            state.frontend.browser_shell.selection_all = false;
++            state.frontend.browser_shell.input_generation = state
++                .frontend
++                .browser_shell
++                .input_generation
++                .wrapping_add(1);
++            let generation = state.frontend.browser_shell.input_generation;
++            let field = state
++                .frontend
++                .browser_shell
++                .focused
++                .clone()
++                .unwrap_or_default();
++            text_input::focus(&field, generation);
++            state.platform.window.set_ime_allowed(true);
++        }
++        ControlKind::Select(_) => {
++            let ui = &mut state.frontend.browser_shell;
++            ui.popup = if ui.popup.as_deref() == Some(&control.id) {
++                None
++            } else {
++                Some(control.id.clone())
++            };
++            ui.focused = Some(control.id);
++            ui.preedit.clear();
++            ui.selection_all = false;
++            ui.input_generation = ui.input_generation.wrapping_add(1);
++            text_input::blur();
++            state.platform.window.set_ime_allowed(false);
++        }
++        _ => {
++            state.frontend.browser_shell.popup = None;
++            state.frontend.browser_shell.focused = Some(control.id);
++            state.frontend.browser_shell.preedit.clear();
++            state.frontend.browser_shell.selection_all = false;
++            state.frontend.browser_shell.input_generation = state
++                .frontend
++                .browser_shell
++                .input_generation
++                .wrapping_add(1);
++            text_input::blur();
++            state.platform.window.set_ime_allowed(false);
++            if control.action["action"].as_str() == Some("close") {
++                close(state, true);
++            } else if let Some(page) = surface(state) {
++                emit(page, control.action);
++            }
++        }
++    }
++}
++
++fn click(state: &mut AppState, pressed: bool) {
++    let fit = Fit::new(
++        state.renderer.gpu.config.width,
++        state.renderer.gpu.config.height,
++    );
++    let (x, y) = fit.point(
++        state.match_state.input.cursor_x as f64,
++        state.match_state.input.cursor_y as f64,
++    );
++    let view = panel(state);
++    let all = controls(state, &view);
++    let hit = all
++        .into_iter()
++        .rev()
++        .find(|control| control.enabled && control.rect.contains(x, y));
++    if pressed {
++        state.frontend.browser_shell.pressed = hit.as_ref().map(|control| control.id.clone());
++    } else {
++        let previous = state.frontend.browser_shell.pressed.take();
++        if let Some(control) =
++            hit.filter(|control| Some(control.id.as_str()) == previous.as_deref())
++        {
++            activate(state, control);
++        } else if previous.is_none() {
++            state.frontend.browser_shell.popup = None;
++            state.frontend.browser_shell.focused = None;
++            state.frontend.browser_shell.input_generation = state
++                .frontend
++                .browser_shell
++                .input_generation
++                .wrapping_add(1);
++            text_input::blur();
++            state.platform.window.set_ime_allowed(false);
++        }
++    }
++}
++
++fn edit(state: &mut AppState, key: Option<NamedKey>, text: Option<&str>) {
++    let view = panel(state);
++    if !view.controls.iter().any(|control| {
++        control.enabled
++            && Some(control.id.as_str()) == state.frontend.browser_shell.focused.as_deref()
++            && matches!(control.kind, ControlKind::Edit(_))
++    }) {
++        return;
++    }
++    let ui = &mut state.frontend.browser_shell;
++    let Some(field) = ui.focused.as_deref() else {
++        return;
++    };
++    let (value, limit, is_code) = match field {
++        "lobby.name" => (&mut ui.name, 24, false),
++        "lobby.code" => (&mut ui.code, 12, true),
++        _ => return,
++    };
++    let mut chars: Vec<_> = value.chars().collect();
++    ui.caret = ui.caret.min(chars.len());
++    if ui.selection_all
++        && (text.is_some() || matches!(key, Some(NamedKey::Backspace | NamedKey::Delete)))
++    {
++        chars.clear();
++        ui.caret = 0;
++    }
++    ui.selection_all = false;
++    match key {
++        Some(NamedKey::Backspace) if ui.caret > 0 => {
++            ui.caret -= 1;
++            chars.remove(ui.caret);
++        }
++        Some(NamedKey::Delete) if ui.caret < chars.len() => {
++            chars.remove(ui.caret);
++        }
++        Some(NamedKey::ArrowLeft) => {
++            ui.caret = ui.caret.saturating_sub(1);
++        }
++        Some(NamedKey::ArrowRight) => {
++            ui.caret = (ui.caret + 1).min(chars.len());
++        }
++        Some(NamedKey::Home) => ui.caret = 0,
++        Some(NamedKey::End) => ui.caret = chars.len(),
++        _ => {
++            if let Some(text) = text {
++                for mut ch in text.chars().filter(|ch| !ch.is_control()) {
++                    if chars.len() >= limit {
++                        break;
++                    }
++                    if is_code {
++                        if !ch.is_ascii_alphanumeric() {
++                            continue;
++                        }
++                        ch = ch.to_ascii_uppercase();
++                    }
++                    chars.insert(ui.caret, ch);
++                    ui.caret += 1;
++                }
++            }
++        }
++    }
++    *value = chars.into_iter().collect();
++    let action = if is_code {
++        json!({"action":"setCode","code":value})
++    } else {
++        json!({"action":"setName","name":value})
++    };
++    emit(Surface::Lobby, action);
++}
++
++/// The page consumes its complete native pointer/keyboard stream before either
++/// the retail menu controller or tactical input can see it.
++pub(crate) fn handle_event(state: &mut AppState, event: &WindowEvent) -> bool {
++    if surface(state).is_none() {
++        return false;
++    }
++    match event {
++        WindowEvent::CursorMoved { position, .. } => {
++            state.match_state.input.cursor_x = position.x as f32;
++            state.match_state.input.cursor_y = position.y as f32;
++            state.platform.pointer_in_client = true;
++        }
++        WindowEvent::MouseInput {
++            button: MouseButton::Left,
++            state: edge,
++            ..
++        } => click(state, edge.is_pressed()),
++        WindowEvent::MouseInput {
++            button: MouseButton::Right,
++            state: ElementState::Pressed,
++            ..
++        } => {
++            state.frontend.browser_shell.popup = None;
++        }
++        WindowEvent::KeyboardInput { event, .. } => {
++            if event.state.is_pressed() {
++                match &event.logical_key {
++                    Key::Named(NamedKey::Escape) => {
++                        if state.frontend.browser_shell.popup.take().is_none() {
++                            close(state, true);
++                        }
++                    }
++                    Key::Named(NamedKey::Tab) => {
++                        let view = panel(state);
++                        let controls: Vec<_> =
++                            view.controls.into_iter().filter(|c| c.enabled).collect();
++                        let current = controls.iter().position(|c| {
++                            Some(c.id.as_str()) == state.frontend.browser_shell.focused.as_deref()
++                        });
++                        if !controls.is_empty() {
++                            let backwards = state.platform.live_modifiers.shift_key();
++                            let next = if backwards {
++                                current
++                                    .unwrap_or(0)
++                                    .checked_sub(1)
++                                    .unwrap_or(controls.len() - 1)
++                            } else {
++                                current.map_or(0, |i| (i + 1) % controls.len())
++                            };
++                            let control = controls[next].clone();
++                            state.frontend.browser_shell.focused = Some(control.id.clone());
++                            if matches!(control.kind, ControlKind::Edit(_)) {
++                                activate(state, control);
++                            } else {
++                                state.platform.window.set_ime_allowed(false);
++                            }
++                        }
++                    }
++                    Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp)
++                        if state.frontend.browser_shell.popup.is_some() =>
++                    {
++                        let view = panel(state);
++                        let all = controls(state, &view);
++                        let choices: Vec<_> = all
++                            .iter()
++                            .filter(|control| control.id.starts_with("popup."))
++                            .collect();
++                        if !choices.is_empty() {
++                            let current = choices.iter().position(|control| {
++                                Some(control.id.as_str())
++                                    == state.frontend.browser_shell.focused.as_deref()
++                            });
++                            let backwards = event.logical_key == Key::Named(NamedKey::ArrowUp);
++                            let next = if backwards {
++                                current
++                                    .unwrap_or(0)
++                                    .checked_sub(1)
++                                    .unwrap_or(choices.len() - 1)
++                            } else {
++                                current.map_or(0, |index| (index + 1) % choices.len())
++                            };
++                            state.frontend.browser_shell.focused = Some(choices[next].id.clone());
++                        }
++                    }
++                    Key::Named(NamedKey::Enter | NamedKey::Space) => {
++                        let view = panel(state);
++                        let all = controls(state, &view);
++                        let id = state.frontend.browser_shell.focused.clone();
++                        if let Some(control) = all.into_iter().find(|c| Some(&c.id) == id.as_ref())
++                        {
++                            if matches!(control.kind, ControlKind::Edit(EditField::Code))
++                                && event.logical_key == Key::Named(NamedKey::Enter)
++                            {
++                                if let Some(join) =
++                                    view.controls.into_iter().find(|c| c.id == "lobby.join")
++                                {
++                                    activate(state, join);
++                                }
++                            } else if matches!(control.kind, ControlKind::Edit(_)) {
++                                edit(state, None, event.text.as_deref());
++                            } else {
++                                activate(state, control);
++                            }
++                        }
++                    }
++                    Key::Named(key) => edit(state, Some(*key), None),
++                    Key::Character(_) => {
++                        let select_all = matches!(&event.logical_key,Key::Character(value) if value.eq_ignore_ascii_case("a"))
++                            && (state.platform.live_modifiers.control_key()
++                                || state.platform.live_modifiers.super_key());
++                        if select_all {
++                            state.frontend.browser_shell.selection_all = true;
++                        } else if !state.platform.live_modifiers.control_key()
++                            && !state.platform.live_modifiers.super_key()
++                        {
++                            edit(state, None, event.text.as_deref());
++                        }
++                    }
++                    _ => {}
++                }
++            }
++        }
++        WindowEvent::Ime(Ime::Commit(text)) => {
++            state.frontend.browser_shell.preedit.clear();
++            edit(state, None, Some(text));
++        }
++        WindowEvent::Ime(Ime::Preedit(text, _)) => {
++            state.frontend.browser_shell.preedit = text.clone();
++        }
++        WindowEvent::Touch(touch) => {
++            state.match_state.input.cursor_x = touch.location.x as f32;
++            state.match_state.input.cursor_y = touch.location.y as f32;
++            match touch.phase {
++                TouchPhase::Started => click(state, true),
++                TouchPhase::Ended => click(state, false),
++                TouchPhase::Cancelled => state.frontend.browser_shell.pressed = None,
++                _ => {}
++            }
++        }
++        WindowEvent::Focused(false) => {
++            // The hidden platform IME target is part of this native page.
++            // Canvas -> IME focus is not an application focus loss.
++            if text_input::active() && text_input::document_focused() {
++                return true;
++            }
++            state.frontend.browser_shell.pressed = None;
++            state.frontend.browser_shell.popup = None;
++            return false;
++        }
++        WindowEvent::ModifiersChanged(_) => return false,
++        WindowEvent::CursorEntered { .. } => {
++            state.platform.pointer_in_client = true;
++        }
++        WindowEvent::CursorLeft { .. } => {
++            state.platform.pointer_in_client = false;
++            state.frontend.browser_shell.pressed = None;
++        }
++        WindowEvent::MouseWheel { .. } | WindowEvent::MouseInput { .. } | WindowEvent::Ime(_) => {}
++        _ => return false,
++    }
++    state.platform.window.request_redraw();
++    true
++}
++
++pub(crate) fn render(
++    state: &mut AppState,
++    encoder: &mut wgpu::CommandEncoder,
++    destination: &wgpu::Texture,
++) -> anyhow::Result<()> {
++    use crate::app::frontend::shell_pass::{
++        ShellComposition, TexturedDraw, encode_shell_pass, software_cursor,
++    };
++    let view = panel(state);
++    let all = controls(state, &view);
++    let Some(atlas) = state.frontend.main_menu_shell_chrome.as_ref() else {
++        return Ok(());
++    };
++    let fit = Fit::new(
++        state.renderer.gpu.config.width,
++        state.renderer.gpu.config.height,
++    );
++    let mut art = Vec::new();
++    if let Some(background) = atlas.parent_background_large_mnscrnl {
++        shell_paint::push_entry_sized(
++            &mut art,
++            background,
++            0.0,
++            0.0,
++            [
++                state.renderer.gpu.config.width as f32,
++                state.renderer.gpu.config.height as f32,
++            ],
++            shell_paint::PARENT_BACKGROUND_DEPTH,
++        );
++    }
++    let fill = |out: &mut Vec<SpriteInstance>, rect: RectPx, rgb: [f32; 3], depth: f32| {
++        if let Some(pixel) = atlas.white_pixel {
++            let rect = fit.rect(rect);
++            shell_paint::push_entry_sized(
++                out,
++                pixel,
++                rect.x as f32,
++                rect.y as f32,
++                [rect.w as f32, rect.h as f32],
++                depth,
++            );
++            if let Some(last) = out.last_mut() {
++                last.tint = rgb;
++            }
++        }
++    };
++    // Native shell list/edit bevel, integrated with the original parent art.
++    fill(
++        &mut art,
++        RectPx::new(17, 82, 766, 456),
++        [0.025, 0.035, 0.045],
++        0.00089,
++    );
++    for (rect, color) in [
++        (RectPx::new(16, 81, 768, 2), [0.43, 0.48, 0.5]),
++        (RectPx::new(16, 81, 2, 457), [0.43, 0.48, 0.5]),
++        (RectPx::new(16, 537, 768, 2), [0.15, 0.19, 0.21]),
++        (RectPx::new(783, 81, 2, 458), [0.15, 0.19, 0.21]),
++    ] {
++        fill(&mut art, rect, color, 0.00088);
++    }
++    let mut labels = vec![
++        PaintLabel {
++            text: view.title.clone().into(),
++            rect: fit.rect(RectPx::new(30, 20, 740, 28)),
++            align: ShellAlign::H_CENTER,
++            rgb: shell_paint::SHELL_TEXT_RGB_ENABLED,
++            path_a_reveal: None,
++        },
++        PaintLabel {
++            text: view.subtitle.clone().into(),
++            rect: fit.rect(RectPx::new(32, 53, 736, 22)),
++            align: ShellAlign::H_CENTER,
++            rgb: [0.7, 0.77, 0.8],
++            path_a_reveal: None,
++        },
++    ];
++    for label in &view.labels {
++        labels.push(PaintLabel {
++            text: label.text.clone().into(),
++            rect: fit.rect(label.rect),
++            align: ShellAlign::NONE,
++            rgb: label.rgb,
++            path_a_reveal: None,
++        });
++    }
++    let (cx, cy) = fit.point(
++        state.match_state.input.cursor_x as f64,
++        state.match_state.input.cursor_y as f64,
++    );
++    let mut checkbox_art = Vec::new();
++    let mut popup_art = Vec::new();
++    let mut popup_text = Vec::new();
++    for control in &all {
++        let popup = control.id.starts_with("popup.");
++        let focused = state.frontend.browser_shell.focused.as_deref() == Some(&control.id);
++        let pressed = state.frontend.browser_shell.pressed.as_deref() == Some(&control.id);
++        let mut rect = control.rect;
++        let mut caption = control.label.clone();
++        match &control.kind {
++            ControlKind::Button | ControlKind::Select(_) => {
++                let mut sprites = shell_paint::paint_buttons(
++                    atlas,
++                    &[PaintButton {
++                        rect: fit.rect(control.rect),
++                        pressed,
++                        hovered: control.enabled && control.rect.contains(cx, cy),
++                        enabled: control.enabled,
++                    }],
++                    shell_paint::ButtonPolicy {
++                        art_fit: shell_paint::ArtFit::FitRightAnchored {
++                            panel_w: 156.0,
++                            tile_h: 42.0,
++                        },
++                        hover_flash: false,
++                        art_sink_y: 0.0,
++                    },
++                    web_time::Instant::now(),
++                    None,
++                );
++                if popup {
++                    fill(&mut popup_art, control.rect, [0.035, 0.055, 0.065], 0.00031);
++                    for sprite in &mut sprites {
++                        sprite.depth = 0.00030;
++                    }
++                    popup_art.extend(sprites);
++                } else {
++                    art.extend(sprites);
++                }
++                rect =
++                    crate::app::frontend::shell_pass::owner_draw_button_label_rect(rect, pressed);
++                if matches!(&control.kind, ControlKind::Select(_)) {
++                    caption.push_str("  v");
++                }
++            }
++            ControlKind::Edit(_) => {
++                fill(&mut art, control.rect, [0.32, 0.38, 0.40], 0.00083);
++                fill(
++                    &mut art,
++                    RectPx::new(rect.x + 2, rect.y + 2, rect.w - 4, rect.h - 4),
++                    [0.015, 0.025, 0.03],
++                    0.00082,
++                );
++                rect = RectPx::new(rect.x + 7, rect.y + 3, rect.w - 14, rect.h - 6);
++                if focused {
++                    if state.frontend.browser_shell.selection_all {
++                        fill(
++                            &mut art,
++                            RectPx::new(rect.x, rect.y, rect.w, rect.h),
++                            [0.12, 0.19, 0.25],
++                            0.00080,
++                        );
++                    }
++                    let caret = state
++                        .frontend
++                        .browser_shell
++                        .caret
++                        .min(caption.chars().count());
++                    let mut chars: Vec<_> = caption.chars().collect();
++                    chars.insert(caret, '|');
++                    caption = chars.into_iter().collect();
++                    if !state.frontend.browser_shell.preedit.is_empty() {
++                        caption.push_str(&state.frontend.browser_shell.preedit);
++                    }
++                }
++            }
++            ControlKind::Check(checked) => {
++                let entry = state
++                    .frontend
++                    .skirmish_shell_chrome
++                    .as_ref()
++                    .and_then(|atlas| {
++                        if *checked {
++                            atlas.checkbox_checked_cce_i
++                        } else {
++                            atlas.checkbox_unchecked_cue_i
++                        }
++                    });
++                if let Some(entry) = entry {
++                    let target = fit.rect(RectPx::new(rect.x + 3, rect.y + 5, 18, 18));
++                    checkbox_art.push(SpriteInstance {
++                        position: [target.x as f32, target.y as f32],
++                        size: [target.w as f32, target.h as f32],
++                        uv_origin: entry.uv_origin,
++                        uv_size: entry.uv_size,
++                        depth: 0.00079,
++                        tint: [1.0; 3],
++                        alpha: 1.0,
++                        ..Default::default()
++                    });
++                } else {
++                    caption = format!("[{}] {caption}", if *checked { "X" } else { " " });
++                }
++                rect = RectPx::new(rect.x + 27, rect.y, rect.w - 27, rect.h);
++            }
++        }
++        if focused && !matches!(control.kind, ControlKind::Edit(_)) {
++            fill(
++                if popup { &mut popup_art } else { &mut art },
++                RectPx::new(
++                    control.rect.x + 5,
++                    control.rect.y + control.rect.h - 3,
++                    control.rect.w - 10,
++                    1,
++                ),
++                [0.85, 0.85, 0.35],
++                if popup { 0.00029 } else { 0.00078 },
++            );
++        }
++        let label = PaintLabel {
++            text: caption.into(),
++            rect: fit.rect(rect),
++            align: if matches!(control.kind, ControlKind::Button | ControlKind::Select(_)) {
++                ShellAlign::H_CENTER | ShellAlign::V_CENTER
++            } else {
++                ShellAlign::V_CENTER
++            },
++            rgb: if control.enabled {
++                shell_paint::SHELL_TEXT_RGB_ENABLED
++            } else {
++                [0.40, 0.43, 0.44]
++            },
++            path_a_reveal: None,
++        };
++        if popup {
++            popup_text.push(label);
++        } else {
++            labels.push(label);
++        }
++    }
++    for bar in &view.bars {
++        fill(&mut art, bar.rect, [0.22, 0.27, 0.29], 0.00082);
++        fill(
++            &mut art,
++            RectPx::new(
++                bar.rect.x + 2,
++                bar.rect.y + 2,
++                ((bar.rect.w - 4) as f32 * bar.fraction.clamp(0.0, 1.0)) as i32,
++                bar.rect.h - 4,
++            ),
++            [0.65, 0.7, 0.18],
++            0.00081,
++        );
++    }
++    let text = shell_paint::paint_labels_scaled(&state.renderer.bit_font, &labels, fit.scale);
++    let popup_text = shell_paint::paint_labels_at_depth_scaled(
++        &state.renderer.bit_font,
++        &popup_text,
++        0.0002,
++        fit.scale,
++    );
++    let mut draws = vec![TexturedDraw {
++        texture: &atlas.texture,
++        instances: art,
++    }];
++    if let Some(chrome) = state.frontend.skirmish_shell_chrome.as_ref() {
++        draws.push(TexturedDraw {
++            texture: &chrome.texture,
++            instances: checkbox_art,
++        });
++    }
++    encode_shell_pass(
++        state,
++        encoder,
++        destination,
++        "native browser service shell",
++        ShellComposition {
++            draws: &draws,
++            text: &text,
++            cursor: if popup_art.is_empty() {
++                software_cursor(state, shell_paint::CURSOR_DEPTH)
++            } else {
++                None
++            },
++            effects: None,
++        },
++    );
++    if !popup_art.is_empty() {
++        render_popup_overlay(state, encoder, destination, &popup_art, &popup_text);
++    }
++    Ok(())
++}
++
++/// Shell passthrough batches deliberately use depth=Always. A popup must be
++/// painted after the ordinary font/checkbox batches, rather than depending on
++/// instance Z values to occlude them. Load the same native RGB565 source, then
++/// repaint the software cursor last, as the ordinary shell compositor does.
++fn render_popup_overlay(
++    state: &AppState,
++    encoder: &mut wgpu::CommandEncoder,
++    destination: &wgpu::Texture,
++    art: &[SpriteInstance],
++    text: &[crate::render::shell_text::ShellTextDraw],
++) {
++    let Some(atlas) = state.frontend.main_menu_shell_chrome.as_ref() else {
++        return;
++    };
++    let gpu = &state.renderer.gpu;
++    let batch = &state.renderer.batch_renderer;
++    let art_buffer = batch.create_instance_buffer(gpu, art);
++    let text_buffers: Vec<_> = text
++        .iter()
++        .map(|draw| batch.create_instance_buffer(gpu, &draw.instances))
++        .collect();
++    let cursor =
++        crate::app::frontend::shell_pass::software_cursor(state, shell_paint::CURSOR_DEPTH);
++    let cursor_buffer = cursor.as_ref().and_then(|(_, instance)| {
++        batch.create_instance_buffer(gpu, std::slice::from_ref(instance))
++    });
++    let color = state.renderer.shell_surface_presenter.source_render_view();
++    {
++        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("native browser shell popup over completed labels"),
++            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                view: &color,
++                depth_slice: None,
++                resolve_target: None,
++                ops: wgpu::Operations {
++                    load: wgpu::LoadOp::Load,
++                    store: wgpu::StoreOp::Store,
++                },
++            })],
++            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                view: &state.renderer.depth_view,
++                depth_ops: Some(wgpu::Operations {
++                    load: wgpu::LoadOp::Load,
++                    store: wgpu::StoreOp::Store,
++                }),
++                stencil_ops: None,
++            }),
++            timestamp_writes: None,
++            occlusion_query_set: None,
++        });
++        if let Some((buffer, count)) = art_buffer.as_ref() {
++            batch.draw_with_buffer_passthrough(&mut pass, &atlas.texture, buffer, *count);
++        }
++        for (draw, buffer) in text.iter().zip(&text_buffers) {
++            if let Some((buffer, count)) = buffer.as_ref() {
++                pass.set_scissor_rect(
++                    draw.scissor.x,
++                    draw.scissor.y,
++                    draw.scissor.w,
++                    draw.scissor.h,
++                );
++                batch.draw_with_buffer_passthrough(
++                    &mut pass,
++                    state.renderer.bit_font.atlas(),
++                    buffer,
++                    *count,
++                );
++            }
++        }
++        if let (Some((texture, _)), Some((buffer, count))) = (cursor, cursor_buffer.as_ref()) {
++            pass.set_scissor_rect(0, 0, gpu.config.width, gpu.config.height);
++            batch.draw_with_buffer_passthrough(&mut pass, texture, buffer, *count);
++        }
++    }
++    state
++        .renderer
++        .shell_surface_presenter
++        .encode_present(encoder, destination);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn fitting_keeps_pointer_and_draw_in_same_space() {
++        for (w, h) in [(800, 600), (1280, 720), (640, 480), (1920, 1080)] {
++            let fit = Fit::new(w, h);
++            let rect = fit.rect(RectPx::new(100, 120, 200, 30));
++            let (x, y) = fit.point((rect.x + rect.w / 2) as f64, (rect.y + rect.h / 2) as f64);
++            assert!(RectPx::new(100, 120, 200, 30).contains(x, y));
++        }
++    }
++    #[test]
++    fn snapshots_require_explicit_schema_and_do_not_accept_commands_as_controls() {
++        let update: Update = serde_json::from_str(
++            r#"{"schema":1,"commands":[{"owner":0}],"lobby":{"open":true,"name":"指挥官"}}"#,
++        )
++        .unwrap();
++        assert_eq!(update.schema, 1);
++        assert_eq!(update.lobby.unwrap().name, "指挥官");
++        assert!(update.content.is_none());
++    }
++    #[test]
++    fn stale_paste_cannot_target_another_field_or_page_generation() {
++        assert!(accepts_text_input(
++            true,
++            "lobby.code",
++            9,
++            Some("lobby.code"),
++            9
++        ));
++        assert!(!accepts_text_input(
++            true,
++            "lobby.code",
++            8,
++            Some("lobby.code"),
++            9
++        ));
++        assert!(!accepts_text_input(
++            true,
++            "lobby.code",
++            9,
++            Some("lobby.name"),
++            9
++        ));
++        assert!(!accepts_text_input(
++            false,
++            "lobby.code",
++            9,
++            Some("lobby.code"),
++            9
++        ));
++        assert!(!accepts_text_input(true, "other", 9, Some("other"), 9));
++    }
++}
+diff --git a/src/app/browser_shell/content.rs b/src/app/browser_shell/content.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d67c68a18c87416578a1d0d4e0691aecc8dd2b82
+--- /dev/null
++++ b/src/app/browser_shell/content.rs
+@@ -0,0 +1,326 @@
++//! Native resource-management view over browser-owned content receipts.
++//!
++//! Actions are intents only. The content host owns dependency resolution,
++//! download cancellation, cache verification, and the final activation gate.
++
++use serde_json::json;
++
++use super::model::{ContentItem, ContentJob, ContentSnapshot};
++use super::{Control, Label, Panel, ProgressBar, RectPx};
++
++fn size(bytes: u64) -> String {
++    if bytes < 1024 {
++        format!("{bytes} B")
++    } else if bytes < 1024 * 1024 {
++        format!("{:.1} KB", bytes as f64 / 1024.0)
++    } else if bytes < 1024 * 1024 * 1024 {
++        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
++    } else {
++        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
++    }
++}
++
++fn title(item: &ContentItem) -> &str {
++    if !item.title.is_empty() {
++        return &item.title;
++    }
++    match item.id.as_str() {
++        "skirmish" => "默认遭遇战",
++        "full" => "完整内容",
++        "campaign" => "战役资源",
++        "cinematics" => "过场影片",
++        "music" => "原版音乐",
++        "brandingAnimation" => "菜单动画",
++        _ => &item.id,
++    }
++}
++
++fn progress(job: &ContentJob) -> f32 {
++    if job.total_files == 0 {
++        return 0.0;
++    }
++    // Completed files include cache hits. Wire progress is only the current
++    // unfinished file, capped below one until its SHA verification finishes.
++    let partial = if job.stage != "complete" && job.wire_total_bytes > 0 {
++        (job.wire_bytes as f64 / job.wire_total_bytes as f64).clamp(0.0, 0.98)
++    } else {
++        0.0
++    };
++    ((f64::from(job.completed_files) + partial) / f64::from(job.total_files)).clamp(0.0, 1.0) as f32
++}
++
++pub(super) fn view(snapshot: &ContentSnapshot) -> Panel {
++    let busy = snapshot.downloading || snapshot.activating || snapshot.job.is_some();
++    let mut panel = Panel {
++        title: "资源管理".to_owned(),
++        subtitle: "默认遭遇战 · 可选完整内容 · 下载校验后启用".to_owned(),
++        controls: Vec::new(),
++        labels: vec![
++            Label::new("游戏内容", RectPx::new(28, 100, 344, 24)),
++            Label::new("可选资源包", RectPx::new(400, 100, 372, 24)),
++        ],
++        bars: Vec::new(),
++    };
++
++    for (index, item) in snapshot.profiles.iter().take(2).enumerate() {
++        let y = 132 + index as i32 * 132;
++        panel.controls.push(Control::check(
++            format!("content.profile.{}", item.id),
++            title(item),
++            RectPx::new(28, y, 344, 28),
++            !busy && !item.id.is_empty(),
++            item.checked || snapshot.profile == item.id,
++            json!({"action": "selectProfile", "profile": item.id}),
++        ));
++        panel.labels.push(Label::new(
++            item.description.clone(),
++            RectPx::new(44, y + 32, 320, 36),
++        ));
++        panel.labels.push(Label::new(
++            format!("下载 {} · 原始 {}", size(item.bytes), size(item.raw_bytes)),
++            RectPx::new(44, y + 72, 320, 20),
++        ));
++        panel.labels.push(Label::new(
++            item.cached.clone(),
++            RectPx::new(44, y + 96, 198, 24),
++        ));
++        panel.controls.push(Control::button(
++            format!("content.download.profile.{}", item.id),
++            "下载／校验",
++            RectPx::new(248, y + 94, 116, 28),
++            !busy && !item.id.is_empty() && item.raw_bytes > 0,
++            json!({"action": "download", "id": format!("profile:{}", item.id)}),
++        ));
++    }
++
++    for (index, item) in snapshot.packs.iter().take(4).enumerate() {
++        let y = 132 + index as i32 * 68;
++        panel.controls.push(Control::check(
++            format!("content.pack.{}", item.id),
++            title(item),
++            RectPx::new(400, y, 242, 28),
++            !busy && !item.included && !item.id.is_empty(),
++            item.included || item.checked || snapshot.addons.contains(&item.id),
++            json!({"action": "selectPack", "id": item.id, "checked": !(item.included || item.checked || snapshot.addons.contains(&item.id))}),
++        ));
++        panel.controls.push(Control::button(
++            format!("content.download.pack.{}", item.id),
++            "下载／校验",
++            RectPx::new(652, y, 120, 28),
++            !busy && !item.id.is_empty() && item.raw_bytes > 0,
++            json!({"action": "download", "id": item.id}),
++        ));
++        panel.labels.push(Label::new(
++            item.description.clone(),
++            RectPx::new(400, y + 30, 372, 20),
++        ));
++        panel.labels.push(Label::new(
++            format!("下载 {} · 原始 {}", size(item.bytes), size(item.raw_bytes)),
++            RectPx::new(400, y + 50, 220, 18),
++        ));
++        panel.labels.push(Label::new(
++            if item.included {
++                "方案已包含".to_owned()
++            } else {
++                item.cached.clone()
++            },
++            RectPx::new(624, y + 50, 148, 18),
++        ));
++    }
++
++    panel.labels.push(Label::new(
++        format!(
++            "所选 {} 个文件 · 下载 {} · 原始 {}",
++            snapshot.selection.files,
++            size(snapshot.selection.bytes),
++            size(snapshot.selection.raw_bytes)
++        ),
++        RectPx::new(28, 414, 744, 24),
++    ));
++    if let Some(job) = snapshot.job.as_ref() {
++        let file = if job.file.is_empty() {
++            "正在检查缓存…"
++        } else {
++            &job.file
++        };
++        panel.labels.push(Label::new(
++            format!("{} · {file}", job.title),
++            RectPx::new(28, 442, 744, 20),
++        ));
++        panel.bars.push(ProgressBar {
++            rect: RectPx::new(28, 466, 744, 8),
++            fraction: progress(job),
++        });
++        panel.labels.push(Label::new(
++            format!(
++                "已完成 {}/{} · 当前 {} / {} · 总传输 {} / {}{}",
++                job.completed_files,
++                job.total_files,
++                size(job.wire_bytes),
++                size(job.wire_total_bytes),
++                size(job.transferred_wire_bytes),
++                size(job.total_wire_bytes),
++                if job.stage == "verify" {
++                    " · 正在校验"
++                } else {
++                    ""
++                }
++            ),
++            RectPx::new(28, 480, 744, 20),
++        ));
++    } else {
++        panel.labels.push(Label::new(
++            "缓存命中会跳过下载；可选内容在重新载入后启用。",
++            RectPx::new(28, 442, 744, 22),
++        ));
++        if !snapshot.activation_allowed {
++            panel.labels.push(Label::new(
++                "对局或载入期间可以下载，返回主菜单后才能启用。",
++                RectPx::new(28, 470, 744, 22),
++            ));
++        }
++    }
++    if !snapshot.message.is_empty() || snapshot.error {
++        let message = if snapshot.error {
++            format!(
++                "错误：{}",
++                if snapshot.message.is_empty() {
++                    "资源处理失败，请重试。"
++                } else {
++                    &snapshot.message
++                }
++            )
++        } else {
++            snapshot.message.clone()
++        };
++        panel
++            .labels
++            .push(Label::new(message, RectPx::new(28, 506, 744, 30)));
++    }
++
++    panel.controls.extend([
++        Control::button(
++            "content.download.selection",
++            "下载并校验所选",
++            RectPx::new(28, 548, 176, 34),
++            !busy && snapshot.selection.files > 0,
++            json!({"action": "download", "id": "selection"}),
++        ),
++        Control::button(
++            "content.activate",
++            "启用并重新载入",
++            RectPx::new(216, 548, 208, 34),
++            !busy
++                && snapshot.activation_allowed
++                && snapshot.can_activate
++                && snapshot.selection.files > 0,
++            json!({"action": "activate"}),
++        ),
++        Control::button(
++            "content.cancel",
++            "取消下载",
++            RectPx::new(436, 548, 136, 34),
++            snapshot.downloading || snapshot.job.is_some(),
++            json!({"action": "cancel"}),
++        ),
++        Control::button(
++            "content.close",
++            "返回",
++            RectPx::new(668, 548, 104, 34),
++            true,
++            json!({"action": "close"}),
++        ),
++    ]);
++    panel
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn snapshot() -> ContentSnapshot {
++        serde_json::from_value(json!({
++            "profile": "skirmish", "activationAllowed": true, "canActivate": true,
++            "profiles": [{"id": "skirmish", "rawBytes": 2048}, {"id": "full", "rawBytes": 4096}],
++            "packs": [{"id": "campaign", "rawBytes": 1024}, {"id": "music", "included": true, "rawBytes": 2048}],
++            "selection": {"files": 2, "bytes": 1024, "rawBytes": 2048}
++        }))
++        .unwrap()
++    }
++
++    fn control<'a>(panel: &'a Panel, id: &str) -> &'a Control {
++        panel.controls.iter().find(|item| item.id == id).unwrap()
++    }
++
++    #[test]
++    fn downloads_disable_mutation_and_activation_but_keep_cancel_and_return() {
++        let mut state = snapshot();
++        state.downloading = true;
++        let panel = view(&state);
++        for item in &panel.controls {
++            assert_eq!(
++                item.enabled,
++                matches!(item.id.as_str(), "content.cancel" | "content.close"),
++                "{}",
++                item.id
++            );
++        }
++        state.downloading = false;
++        state.job = Some(ContentJob::default());
++        assert!(!control(&view(&state), "content.activate").enabled);
++    }
++
++    #[test]
++    fn activation_requires_verified_selection_and_an_allowed_native_lifecycle() {
++        let mut state = snapshot();
++        assert!(control(&view(&state), "content.activate").enabled);
++        state.activation_allowed = false;
++        assert!(!control(&view(&state), "content.activate").enabled);
++        state.activation_allowed = true;
++        state.can_activate = false;
++        assert!(!control(&view(&state), "content.activate").enabled);
++        state.can_activate = true;
++        state.selection.files = 0;
++        assert!(!control(&view(&state), "content.activate").enabled);
++        assert!(!control(&view(&state), "content.download.selection").enabled);
++    }
++
++    #[test]
++    fn view_intents_preserve_dependency_ownership_and_stay_inside_logical_screen() {
++        let panel = view(&snapshot());
++        assert!(!control(&panel, "content.pack.music").enabled);
++        assert_eq!(
++            control(&panel, "content.pack.campaign").action,
++            json!({"action":"selectPack","id":"campaign","checked":true})
++        );
++        assert_eq!(
++            control(&panel, "content.download.profile.full").action,
++            json!({"action":"download","id":"profile:full"})
++        );
++        for item in &panel.controls {
++            assert!(item.rect.x >= 0 && item.rect.y >= 0);
++            assert!(item.rect.x + item.rect.w <= 800 && item.rect.y + item.rect.h <= 600);
++            assert!(item.action.get("surface").is_none());
++        }
++    }
++
++    #[test]
++    fn progress_distinguishes_wire_completion_from_verified_files_and_cache_hits() {
++        let mut job = ContentJob {
++            total_files: 2,
++            completed_files: 1,
++            wire_bytes: 100,
++            wire_total_bytes: 100,
++            ..ContentJob::default()
++        };
++        assert!((progress(&job) - 0.99).abs() < 0.0001);
++        job.stage = "complete".to_owned();
++        assert_eq!(progress(&job), 0.5);
++        job.completed_files = 2;
++        assert_eq!(progress(&job), 1.0);
++        job.completed_files = u32::MAX;
++        assert_eq!(progress(&job), 1.0);
++        job.total_files = 0;
++        assert_eq!(progress(&job), 0.0);
++    }
++}
+diff --git a/src/app/browser_shell/lobby.rs b/src/app/browser_shell/lobby.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..03b3b7330e87b38a08fdb94bf5bbe6faf9671f5a
+--- /dev/null
++++ b/src/app/browser_shell/lobby.rs
+@@ -0,0 +1,415 @@
++//! The native lobby is a presentation of server-admitted room configuration.
++use super::model::LobbySnapshot;
++use super::{Choice, Control, EditField, Label, Panel, RectPx};
++use serde_json::{Value, json};
++
++const COUNTRIES: [(&str, &str); 10] = [
++    ("America", "美国"),
++    ("Korea", "韩国"),
++    ("France", "法国"),
++    ("Germany", "德国"),
++    ("GreatBritain", "英国"),
++    ("Libya", "利比亚"),
++    ("Iraq", "伊拉克"),
++    ("Cuba", "古巴"),
++    ("Russia", "苏俄"),
++    ("Yuri", "尤里"),
++];
++const COLORS: [&str; 8] = [
++    "黄色", "红色", "蓝色", "绿色", "橙色", "青色", "紫色", "粉色",
++];
++
++fn player_choices(slot: i32, key: &str, values: Vec<(Value, String)>) -> Vec<Choice> {
++    values
++        .into_iter()
++        .map(|(value, label)| Choice {
++            label,
++            action: json!({"action":"updatePlayer","slot":slot,"player":{key:value}}),
++        })
++        .collect()
++}
++fn settings_choices(key: &str, values: &[(i32, &str)]) -> Vec<Choice> {
++    values
++        .iter()
++        .map(|(value, label)| Choice {
++            label: (*label).into(),
++            action: json!({"action":"updateSettings","settings":{key:value}}),
++        })
++        .collect()
++}
++fn number_label(value: i32, values: &[(i32, &str)]) -> String {
++    values
++        .iter()
++        .find(|(n, _)| *n == value)
++        .map_or_else(|| value.to_string(), |(_, label)| (*label).into())
++}
++
++pub(super) fn view(state: &LobbySnapshot, name: &str, code: &str) -> Panel {
++    let mut panel = Panel {
++        title: "联机作战大厅".into(),
++        subtitle: "王二火大 · 火线冲突 (2) · 与战友一起，再战一局".into(),
++        ..Default::default()
++    };
++    panel.controls.push(Control::button(
++        "lobby.close",
++        "返回主菜单",
++        RectPx::new(32, 550, 175, 32),
++        true,
++        json!({"action":"close"}),
++    ));
++    let busy = state.busy || state.starting || state.match_id.is_some();
++    if let Some(room) = state.room.as_ref() {
++        panel.labels.push(Label::new(
++            format!(
++                "房间 {}    {} / 2    {}",
++                room.code,
++                room.members.len(),
++                if room.is_host {
++                    "你是房主"
++                } else {
++                    "等待房主配置"
++                }
++            ),
++            RectPx::new(34, 94, 730, 23),
++        ));
++        for (label, x, w) in [
++            ("指挥官", 40, 170),
++            ("国家", 215, 135),
++            ("颜色", 360, 115),
++            ("出生点", 485, 115),
++            ("队伍", 610, 145),
++        ] {
++            panel
++                .labels
++                .push(Label::new(label, RectPx::new(x, 125, w, 21)));
++        }
++        let editable = room.is_host && !busy;
++        for (index, member) in room.members.iter().take(2).enumerate() {
++            let y = 151 + index as i32 * 58;
++            let player = room.config.players.iter().find(|p| p.slot == member.slot);
++            panel.labels.push(Label::new(
++                format!(
++                    "{}{}\n{}",
++                    member.name,
++                    if member.host { " · 房主" } else { "" },
++                    if member.ready {
++                        "已准备"
++                    } else {
++                        "未准备"
++                    }
++                ),
++                RectPx::new(40, y, 170, 46),
++            ));
++            let country = player.map_or("America", |p| p.country.as_str());
++            let country_label = COUNTRIES
++                .iter()
++                .find(|(id, _)| *id == country)
++                .map_or(country, |(_, label)| *label);
++            panel.controls.push(Control::select(
++                format!("lobby.player.{}.country", member.slot),
++                country_label,
++                RectPx::new(215, y, 135, 32),
++                editable,
++                player_choices(
++                    member.slot,
++                    "country",
++                    COUNTRIES
++                        .iter()
++                        .map(|(id, label)| (json!(id), (*label).into()))
++                        .collect(),
++                ),
++            ));
++            let color = player.map_or(member.slot, |p| p.color);
++            panel.controls.push(Control::select(
++                format!("lobby.player.{}.color", member.slot),
++                COLORS.get(color.max(0) as usize).copied().unwrap_or("随机"),
++                RectPx::new(360, y, 115, 32),
++                editable,
++                player_choices(
++                    member.slot,
++                    "color",
++                    COLORS
++                        .iter()
++                        .enumerate()
++                        .map(|(i, label)| (json!(i), (*label).into()))
++                        .collect(),
++                ),
++            ));
++            let start = player.map_or(member.slot, |p| p.start);
++            panel.controls.push(Control::select(
++                format!("lobby.player.{}.start", member.slot),
++                format!("{}", start + 1),
++                RectPx::new(485, y, 115, 32),
++                editable,
++                player_choices(
++                    member.slot,
++                    "start",
++                    vec![(json!(0), "1".into()), (json!(1), "2".into())],
++                ),
++            ));
++            let team = player.map_or(-1, |p| p.team);
++            panel.controls.push(Control::select(
++                format!("lobby.player.{}.team", member.slot),
++                number_label(team, &[(-1, "无"), (0, "A"), (1, "B"), (2, "C"), (3, "D")]),
++                RectPx::new(610, y, 145, 32),
++                editable,
++                player_choices(
++                    member.slot,
++                    "team",
++                    vec![
++                        (json!(-1), "无".into()),
++                        (json!(0), "A".into()),
++                        (json!(1), "B".into()),
++                        (json!(2), "C".into()),
++                        (json!(3), "D".into()),
++                    ],
++                ),
++            ));
++        }
++        if room.members.len() < 2 {
++            panel.labels.push(Label::new(
++                "等待另一位指挥官加入…",
++                RectPx::new(215, 212, 540, 30),
++            ));
++        }
++        let settings = &room.config.options;
++        for (key, label, value, x, choices) in [
++            (
++                "credits",
++                "初始资金",
++                settings.credits as i32,
++                40,
++                vec![
++                    (5000, "5,000"),
++                    (10000, "10,000"),
++                    (20000, "20,000"),
++                    (30000, "30,000"),
++                ],
++            ),
++            (
++                "unitCount",
++                "初始部队",
++                settings.unit_count as i32,
++                285,
++                vec![(0, "无"), (5, "5"), (10, "10")],
++            ),
++            (
++                "gameSpeed",
++                "游戏速度",
++                settings.game_speed as i32,
++                530,
++                vec![
++                    (0, "极速"),
++                    (1, "很快"),
++                    (2, "较快"),
++                    (3, "正常"),
++                    (4, "较慢"),
++                    (5, "慢速"),
++                    (6, "最慢"),
++                ],
++            ),
++        ] {
++            panel
++                .labels
++                .push(Label::new(label, RectPx::new(x, 269, 220, 22)));
++            panel.controls.push(Control::select(
++                format!("lobby.settings.{key}"),
++                number_label(value, &choices),
++                RectPx::new(x, 296, 220, 32),
++                editable,
++                settings_choices(key, &choices),
++            ));
++        }
++        for (index, (key, label, checked)) in [
++            ("shortGame", "快速游戏", settings.short_game),
++            ("superWeapons", "超级武器", settings.super_weapons),
++            ("crates", "随机工具箱", settings.crates),
++            ("mcvRepacks", "基地重新部署", settings.mcv_repacks),
++            ("buildOffAlly", "盟友旁建造", settings.build_off_ally),
++            (
++                "destroyableBridges",
++                "可摧毁桥梁",
++                settings.destroyable_bridges,
++            ),
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            let x = 40 + (index % 2) as i32 * 370;
++            let y = 346 + (index / 2) as i32 * 34;
++            panel.controls.push(Control::check(
++                format!("lobby.settings.{key}"),
++                label,
++                RectPx::new(x, y, 350, 29),
++                editable,
++                checked,
++                json!({"action":"updateSettings","settings":{key:!checked}}),
++            ));
++        }
++        panel.controls.push(Control::button(
++            "lobby.leave",
++            "离开房间",
++            RectPx::new(233, 550, 175, 32),
++            !state.busy,
++            json!({"action":"leave"}),
++        ));
++        if room.is_host {
++            panel.controls.push(Control::button(
++                "lobby.start",
++                "开始作战",
++                RectPx::new(548, 550, 220, 32),
++                room.can_start && !busy,
++                json!({"action":"start"}),
++            ));
++        } else {
++            let ready = room
++                .members
++                .iter()
++                .find(|m| m.id == room.local_member_id)
++                .is_some_and(|m| m.ready);
++            panel.controls.push(Control::button(
++                "lobby.ready",
++                if ready {
++                    "取消准备"
++                } else {
++                    "准备就绪"
++                },
++                RectPx::new(548, 550, 220, 32),
++                !busy,
++                json!({"action":"ready"}),
++            ));
++        }
++    } else if state.stopped || state.phase == "stopped" {
++        panel
++            .labels
++            .push(Label::new("对局已停止", RectPx::new(70, 150, 660, 32)));
++        panel.labels.push(Label::new(
++            "请返回主菜单，再开始下一场作战。",
++            RectPx::new(70, 204, 660, 50),
++        ));
++    } else {
++        panel
++            .labels
++            .push(Label::new("指挥官名称", RectPx::new(60, 114, 170, 28)));
++        panel.controls.push(Control::edit(
++            "lobby.name",
++            name,
++            RectPx::new(245, 110, 490, 34),
++            !busy,
++            EditField::Name,
++        ));
++        panel
++            .labels
++            .push(Label::new("建立作战房间", RectPx::new(62, 192, 305, 27)));
++        panel.labels.push(Label::new(
++            "创建后，将房间代码告诉另一位指挥官。",
++            RectPx::new(62, 236, 305, 64),
++        ));
++        panel.controls.push(Control::button(
++            "lobby.create",
++            "创建房间",
++            RectPx::new(62, 324, 305, 36),
++            !busy,
++            json!({"action":"create","name":name}),
++        ));
++        panel
++            .labels
++            .push(Label::new("加入战友", RectPx::new(430, 192, 305, 27)));
++        panel
++            .labels
++            .push(Label::new("房间代码", RectPx::new(430, 236, 305, 25)));
++        panel.controls.push(Control::edit(
++            "lobby.code",
++            code,
++            RectPx::new(430, 270, 305, 34),
++            !busy,
++            EditField::Code,
++        ));
++        panel.controls.push(Control::button(
++            "lobby.join",
++            "加入房间",
++            RectPx::new(430, 324, 305, 36),
++            !busy && !code.trim().is_empty(),
++            json!({"action":"join","code":code,"name":name}),
++        ));
++        panel.labels.push(Label::new(
++            "选定国家、颜色、出生点和队伍，双方准备后由房主开战。",
++            RectPx::new(62, 399, 673, 45),
++        ));
++    }
++    let status = if !state.error.is_empty() {
++        &state.error
++    } else if !state.status.is_empty() {
++        &state.status
++    } else if state.starting {
++        "双方正在载入原生战场…"
++    } else if state.busy {
++        "正在联络…"
++    } else if state.connected {
++        "联机服务已连接"
++    } else {
++        "创建或加入房间后连接联机服务"
++    };
++    let mut label = Label::new(status, RectPx::new(40, 466, 714, 62));
++    if !state.error.is_empty() {
++        label.rgb = [1.0, 0.38, 0.28];
++    }
++    panel.labels.push(label);
++    panel
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn entry_join_requires_a_code_and_forwards_native_edit_values() {
++        let panel = view(&LobbySnapshot::default(), "指挥官", "ABC123");
++        let join = panel
++            .controls
++            .iter()
++            .find(|c| c.id == "lobby.join")
++            .unwrap();
++        assert!(join.enabled);
++        assert_eq!(join.action["code"], "ABC123");
++        assert_eq!(join.action["name"], "指挥官");
++        let empty = view(&LobbySnapshot::default(), "指挥官", "");
++        assert!(
++            !empty
++                .controls
++                .iter()
++                .find(|c| c.id == "lobby.join")
++                .unwrap()
++                .enabled
++        );
++    }
++    #[test]
++    fn guests_cannot_edit_host_settings_or_start() {
++        let state:LobbySnapshot=serde_json::from_value(json!({"room":{"isHost":false,"members":[{"id":"guest","slot":1}],"config":{"players":[{"slot":1,"country":"Yuri"}],"options":{}}}})).unwrap();
++        let panel = view(&state, "", "");
++        assert!(panel.controls.iter().filter(|c|c.id.starts_with("lobby.settings.")||c.id.starts_with("lobby.player.")).all(|c|!c.enabled));
++        assert!(panel.controls.iter().any(|c| c.id == "lobby.ready"));
++        assert!(!panel.controls.iter().any(|c| c.id == "lobby.start"));
++    }
++    #[test]
++    fn host_readiness_and_busy_gate_start() {
++        for (can_start, busy, enabled) in [
++            (true, false, true),
++            (false, false, false),
++            (true, true, false),
++        ] {
++            let state: LobbySnapshot = serde_json::from_value(
++                json!({"busy":busy,"room":{"isHost":true,"canStart":can_start,"members":[]}}),
++            )
++            .unwrap();
++            assert_eq!(
++                view(&state, "", "")
++                    .controls
++                    .iter()
++                    .find(|c| c.id == "lobby.start")
++                    .unwrap()
++                    .enabled,
++                enabled
++            );
++        }
++    }
++}
+diff --git a/src/app/browser_shell/model.rs b/src/app/browser_shell/model.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd96cb95dd263a4da169e1f6a967b7773684abf9
+--- /dev/null
++++ b/src/app/browser_shell/model.rs
+@@ -0,0 +1,205 @@
++//! Presentation receipts from the browser content and lobby owners.
++//!
++//! These DTOs never author downloads, rooms, or simulation state. Missing
++//! presentation fields retain defaults so older browser hosts remain readable.
++
++use serde::Deserialize;
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct ContentSnapshot {
++    pub profile: String,
++    pub addons: Vec<String>,
++    pub profiles: Vec<ContentItem>,
++    pub packs: Vec<ContentItem>,
++    pub selection: ContentSelection,
++    pub job: Option<ContentJob>,
++    pub message: String,
++    pub error: bool,
++    pub downloading: bool,
++    pub activating: bool,
++    pub activation_allowed: bool,
++    pub can_activate: bool,
++    pub open: bool,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct ContentItem {
++    pub id: String,
++    pub title: String,
++    pub description: String,
++    pub bytes: u64,
++    pub raw_bytes: u64,
++    pub cached: String,
++    pub included: bool,
++    pub checked: bool,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct ContentSelection {
++    pub bytes: u64,
++    pub raw_bytes: u64,
++    pub files: u32,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct ContentJob {
++    pub title: String,
++    pub file: String,
++    pub completed_files: u32,
++    pub total_files: u32,
++    pub wire_bytes: u64,
++    pub wire_total_bytes: u64,
++    pub total_wire_bytes: u64,
++    pub transferred_wire_bytes: u64,
++    pub stage: String,
++}
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct LobbySnapshot {
++    pub schema: u32,
++    pub open: bool,
++    pub name: String,
++    pub code: String,
++    pub connected: bool,
++    pub busy: bool,
++    pub status: String,
++    pub error: String,
++    pub match_id: Option<String>,
++    pub starting: bool,
++    pub stopped: bool,
++    pub native_started: bool,
++    pub phase: String,
++    pub room: Option<LobbyRoom>,
++}
++
++impl Default for LobbySnapshot {
++    fn default() -> Self {
++        Self {
++            schema: 1,
++            open: false,
++            name: String::new(),
++            code: String::new(),
++            connected: false,
++            busy: false,
++            status: String::new(),
++            error: String::new(),
++            match_id: None,
++            starting: false,
++            stopped: false,
++            native_started: false,
++            phase: "entry".to_owned(),
++            room: None,
++        }
++    }
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct LobbyRoom {
++    pub code: String,
++    pub is_host: bool,
++    pub local_member_id: String,
++    pub members: Vec<LobbyMember>,
++    pub can_start: bool,
++    pub phase: String,
++    pub config: LobbyConfig,
++    pub status: String,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct LobbyMember {
++    pub id: String,
++    pub name: String,
++    pub ready: bool,
++    pub host: bool,
++    pub slot: i32,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct LobbyConfig {
++    pub map: String,
++    pub seed: u32,
++    pub players: Vec<LobbyPlayer>,
++    pub options: LobbyOptions,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct LobbyPlayer {
++    pub slot: i32,
++    pub name: String,
++    pub country: String,
++    pub color: i32,
++    pub start: i32,
++    pub team: i32,
++    pub human: bool,
++    pub difficulty: String,
++}
++
++#[derive(Clone, Debug, Default, Deserialize)]
++#[serde(default, rename_all = "camelCase")]
++pub(crate) struct LobbyOptions {
++    pub credits: u32,
++    pub unit_count: u32,
++    pub game_speed: u32,
++    pub short_game: bool,
++    pub super_weapons: bool,
++    pub crates: bool,
++    pub mcv_repacks: bool,
++    pub build_off_ally: bool,
++    pub destroyable_bridges: bool,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn partial_content_receipts_keep_safe_disabled_defaults() {
++        let snapshot: ContentSnapshot = serde_json::from_str(
++            r#"{"profile":"skirmish","profiles":[{"id":"skirmish","cached":"已校验缓存"}],"selection":{"files":26,"rawBytes":602239457},"job":{"wireTotalBytes":4110830,"stage":"verify"}}"#,
++        )
++        .unwrap();
++        assert_eq!(snapshot.selection.files, 26);
++        assert_eq!(snapshot.selection.raw_bytes, 602239457);
++        assert_eq!(snapshot.profiles[0].cached, "已校验缓存");
++        assert_eq!(snapshot.job.unwrap().wire_total_bytes, 4110830);
++        assert!(!snapshot.can_activate);
++        assert!(!snapshot.activation_allowed);
++        assert!(!snapshot.error);
++        assert!(snapshot.packs.is_empty());
++    }
++
++    #[test]
++    fn lobby_receipts_preserve_signed_player_settings_and_maximum_seed() {
++        let snapshot: LobbySnapshot = serde_json::from_str(
++            r#"{"open":true,"matchId":null,"phase":"room","room":{"code":"ABCDEF","isHost":true,"localMemberId":"host-id","members":[{"id":"host-id","slot":0,"host":true,"ready":true}],"config":{"seed":4294967295,"players":[{"slot":0,"country":"Yuri","start":-1,"team":-1}],"options":{"unitCount":10,"mcvRepacks":true,"buildOffAlly":false}}}}"#,
++        )
++        .unwrap();
++        assert_eq!(snapshot.schema, 1);
++        assert_eq!(snapshot.phase, "room");
++        assert!(snapshot.match_id.is_none());
++        let room = snapshot.room.unwrap();
++        assert!(room.is_host);
++        assert_eq!(room.local_member_id, "host-id");
++        assert_eq!(room.config.seed, u32::MAX);
++        assert_eq!(room.config.players[0].start, -1);
++        assert_eq!(room.config.players[0].team, -1);
++        assert!(room.config.options.mcv_repacks);
++        assert!(
++            !room.can_start,
++            "absent readiness never enables the start button"
++        );
++        let initial: LobbySnapshot = serde_json::from_str("{}").unwrap();
++        assert_eq!(initial.phase, "entry");
++        assert!(!initial.busy);
++        assert!(initial.room.is_none());
++    }
++}
+diff --git a/src/app/browser_shell/text_input.rs b/src/app/browser_shell/text_input.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..89061b3a25b912151ac1a1813a6c49ce9d064fb8
+--- /dev/null
++++ b/src/app/browser_shell/text_input.rs
+@@ -0,0 +1,341 @@
++//! Invisible browser text-service adapter. Rust retains the visible draft,
++//! selection, layout, and command authority; the DOM holds only an IME's
++//! transient composition and never a copy of the native edit value.
++
++#[derive(Debug)]
++pub(super) struct InputEvent {
++    pub field: String,
++    pub generation: u64,
++    pub kind: InputKind,
++}
++
++#[derive(Debug)]
++pub(super) enum InputKind {
++    Commit(String),
++    Preedit(String),
++    Key {
++        key: String,
++        ctrl: bool,
++        meta: bool,
++        shift: bool,
++    },
++    Paste(String),
++}
++
++#[cfg(target_arch = "wasm32")]
++mod browser {
++    use super::{InputEvent, InputKind};
++    use std::cell::{Cell, RefCell};
++    use std::rc::Rc;
++    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
++    use web_sys::{Event, HtmlElement};
++
++    thread_local! {
++        static BRIDGE: RefCell<Option<Bridge>> = const { RefCell::new(None) };
++        static EVENTS: RefCell<Vec<InputEvent>> = const { RefCell::new(Vec::new()) };
++        static FOCUS_TRANSFER: Cell<bool> = const { Cell::new(false) };
++    }
++    struct Session {
++        field: String,
++        generation: u64,
++        composing: Cell<bool>,
++        echo: RefCell<Option<String>>,
++    }
++    struct Bridge {
++        input: HtmlElement,
++        session: Rc<Session>,
++        listeners: Vec<(&'static str, Closure<dyn FnMut(Event)>)>,
++    }
++    fn property(value: &JsValue, key: &str) -> JsValue {
++        js_sys::Reflect::get(value, &key.into()).unwrap_or(JsValue::UNDEFINED)
++    }
++    fn text(value: &JsValue, key: &str) -> String {
++        property(value, key).as_string().unwrap_or_default()
++    }
++    fn clear(input: &HtmlElement) {
++        let _ = js_sys::Reflect::set(input, &"value".into(), &"".into());
++    }
++    fn bounded(value: String) -> String {
++        value.chars().take(4096).collect()
++    }
++    fn enqueue(session: &Session, kind: InputKind) {
++        EVENTS.with(|events| {
++            let mut events = events.borrow_mut();
++            if events.len() < 256 {
++                events.push(InputEvent {
++                    field: session.field.clone(),
++                    generation: session.generation,
++                    kind,
++                });
++            }
++        });
++        crate::app::browser::wake();
++    }
++    fn key(session: &Session, value: String, event: &Event) {
++        enqueue(
++            session,
++            InputKind::Key {
++                key: bounded(value),
++                ctrl: property(event, "ctrlKey").as_bool().unwrap_or(false),
++                meta: property(event, "metaKey").as_bool().unwrap_or(false),
++                shift: property(event, "shiftKey").as_bool().unwrap_or(false),
++            },
++        );
++    }
++    fn focused(input: &HtmlElement) -> bool {
++        web_sys::window()
++            .and_then(|window| window.document())
++            .and_then(|document| document.active_element())
++            .is_some_and(|element| element == input.clone().unchecked_into::<web_sys::Element>())
++    }
++    fn focus_element(input: &HtmlElement) {
++        if let Ok(method) = property(input, "focus").dyn_into::<js_sys::Function>() {
++            let options = js_sys::Object::new();
++            let _ = js_sys::Reflect::set(&options, &"preventScroll".into(), &JsValue::TRUE);
++            let _ = method.call1(input, &options);
++        }
++    }
++    impl Bridge {
++        fn new(field: &str, generation: u64) -> Result<Self, JsValue> {
++            let document = web_sys::window()
++                .and_then(|window| window.document())
++                .ok_or_else(|| JsValue::from_str("Document is unavailable"))?;
++            let input: HtmlElement = document.create_element("textarea")?.dyn_into()?;
++            for (name, value) in [
++                ("tabindex", "-1"),
++                ("aria-hidden", "true"),
++                ("autocomplete", "off"),
++                ("autocapitalize", "off"),
++                ("spellcheck", "false"),
++                (
++                    "style",
++                    "position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;font-size:16px;",
++                ),
++            ] {
++                input.set_attribute(name, value)?;
++            }
++            document
++                .body()
++                .ok_or_else(|| JsValue::from_str("Document body is unavailable"))?
++                .append_child(&input)?;
++            let mut bridge = Self {
++                input,
++                session: Rc::new(Session {
++                    field: field.to_owned(),
++                    generation,
++                    composing: Cell::new(false),
++                    echo: RefCell::new(None),
++                }),
++                listeners: Vec::new(),
++            };
++            for kind in [
++                "keydown",
++                "keyup",
++                "compositionstart",
++                "compositionupdate",
++                "compositionend",
++                "beforeinput",
++                "input",
++                "paste",
++            ] {
++                let input = bridge.input.clone();
++                let session = Rc::clone(&bridge.session);
++                let listener = Closure::wrap(Box::new(move |event: Event| {
++                    event.stop_propagation();
++                    match kind {
++                        "keydown" => {
++                            let value = text(&event, "key");
++                            if session.composing.get()
++                                || property(&event, "isComposing").as_bool() == Some(true)
++                                || value == "Process"
++                                || property(&event, "keyCode").as_f64() == Some(229.0)
++                            {
++                                return;
++                            }
++                            session.echo.borrow_mut().take();
++                            // A trusted paste must retain its browser default so
++                            // clipboardData is delivered to the paste listener.
++                            let paste = value.eq_ignore_ascii_case("v")
++                                && (property(&event, "ctrlKey").as_bool() == Some(true)
++                                    || property(&event, "metaKey").as_bool() == Some(true));
++                            if !paste {
++                                event.prevent_default();
++                            }
++                            key(&session, value, &event);
++                        }
++                        "compositionstart" => {
++                            session.composing.set(true);
++                            session.echo.borrow_mut().take();
++                        }
++                        "compositionupdate" => {
++                            enqueue(&session, InputKind::Preedit(bounded(text(&event, "data"))))
++                        }
++                        "compositionend" => {
++                            session.composing.set(false);
++                            let mut value = text(&event, "data");
++                            if value.is_empty() {
++                                value = text(&input, "value");
++                            }
++                            value = bounded(value);
++                            *session.echo.borrow_mut() = Some(value.clone());
++                            enqueue(&session, InputKind::Commit(value));
++                            clear(&input);
++                            // Keep the receipt until final input consumes it.
++                            // A microtask can run before that event and would
++                            // make the same composition commit twice. The next
++                            // key/composition/paste also resets this receipt.
++                        }
++                        "beforeinput" if !session.composing.get() => {
++                            let kind = text(&event, "inputType");
++                            if kind.starts_with("delete") {
++                                event.prevent_default();
++                                clear(&input);
++                                key(
++                                    &session,
++                                    if kind.ends_with("Forward") {
++                                        "Delete"
++                                    } else {
++                                        "Backspace"
++                                    }
++                                    .into(),
++                                    &event,
++                                );
++                            }
++                        }
++                        "input"
++                            if !session.composing.get()
++                                && property(&event, "isComposing").as_bool() != Some(true) =>
++                        {
++                            let mut value = text(&input, "value");
++                            if value.is_empty() {
++                                value = text(&event, "data");
++                            }
++                            value = bounded(value);
++                            let echo = session.echo.borrow_mut().take();
++                            if !value.is_empty() && echo.as_deref() != Some(value.as_str()) {
++                                enqueue(&session, InputKind::Commit(value));
++                            }
++                            clear(&input);
++                        }
++                        "paste" => {
++                            event.prevent_default();
++                            session.echo.borrow_mut().take();
++                            let clipboard = property(&event, "clipboardData");
++                            if let Ok(get) =
++                                property(&clipboard, "getData").dyn_into::<js_sys::Function>()
++                            {
++                                if let Ok(value) = get.call1(&clipboard, &"text/plain".into()) {
++                                    if let Some(value) = value.as_string() {
++                                        enqueue(&session, InputKind::Paste(bounded(value)));
++                                    }
++                                }
++                            }
++                            clear(&input);
++                        }
++                        _ => {}
++                    }
++                }) as Box<dyn FnMut(Event)>);
++                bridge
++                    .input
++                    .add_event_listener_with_callback(kind, listener.as_ref().unchecked_ref())?;
++                bridge.listeners.push((kind, listener));
++            }
++            Ok(bridge)
++        }
++    }
++    impl Drop for Bridge {
++        fn drop(&mut self) {
++            for (kind, listener) in &self.listeners {
++                let _ = self
++                    .input
++                    .remove_event_listener_with_callback(kind, listener.as_ref().unchecked_ref());
++            }
++            clear(&self.input);
++            self.input.remove();
++        }
++    }
++    pub(crate) fn focus(field: &str, generation: u64) {
++        if BRIDGE.with(|bridge| {
++            bridge.borrow().as_ref().is_some_and(|bridge| {
++                bridge.session.field == field && bridge.session.generation == generation
++            })
++        }) {
++            return;
++        }
++        drop(BRIDGE.with(|bridge| bridge.borrow_mut().take()));
++        match Bridge::new(field, generation) {
++            Ok(bridge) => {
++                let input = bridge.input.clone();
++                BRIDGE.with(|slot| *slot.borrow_mut() = Some(bridge));
++                // No RefCell borrow may survive focus(): its synchronous focus
++                // edge can reenter the native WindowActive consumer.
++                FOCUS_TRANSFER.with(|transfer| transfer.set(true));
++                focus_element(&input);
++                FOCUS_TRANSFER.with(|transfer| transfer.set(false));
++            }
++            Err(_) => log::warn!("Browser text service is unavailable"),
++        }
++    }
++    pub(crate) fn blur() {
++        let bridge = BRIDGE.with(|bridge| bridge.borrow_mut().take());
++        let restore =
++            bridge.as_ref().is_some_and(|bridge| focused(&bridge.input)) && document_focused();
++        drop(bridge);
++        if restore {
++            if let Some(canvas) = web_sys::window()
++                .and_then(|window| window.document())
++                .and_then(|document| document.get_element_by_id("game"))
++                .and_then(|element| element.dyn_into::<HtmlElement>().ok())
++            {
++                focus_element(&canvas);
++            }
++        }
++    }
++    pub(crate) fn active() -> bool {
++        // Chromium may temporarily expose body as activeElement during the
++        // canvas blur dispatched *inside* input.focus(). Only this synchronous
++        // owned transfer counts; a later real browser/OS blur never does.
++        BRIDGE.with(|bridge| {
++            bridge
++                .borrow()
++                .as_ref()
++                .is_some_and(|bridge| focused(&bridge.input) || FOCUS_TRANSFER.with(Cell::get))
++        })
++    }
++    pub(crate) fn document_focused() -> bool {
++        web_sys::window()
++            .and_then(|window| window.document())
++            .is_some_and(|document| {
++                !document.hidden()
++                    && property(&document, "hasFocus")
++                        .dyn_into::<js_sys::Function>()
++                        .ok()
++                        .and_then(|method| method.call0(&document).ok())
++                        .and_then(|value| value.as_bool())
++                        .unwrap_or(false)
++            })
++    }
++    pub(crate) fn drain() -> Vec<InputEvent> {
++        EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++pub(super) use browser::{active, blur, document_focused, drain, focus};
++
++#[cfg(not(target_arch = "wasm32"))]
++pub(super) fn focus(_field: &str, _generation: u64) {}
++#[cfg(not(target_arch = "wasm32"))]
++pub(super) fn blur() {}
++#[cfg(not(target_arch = "wasm32"))]
++pub(super) fn active() -> bool {
++    false
++}
++#[cfg(not(target_arch = "wasm32"))]
++pub(super) fn document_focused() -> bool {
++    false
++}
++#[cfg(not(target_arch = "wasm32"))]
++pub(super) fn drain() -> Vec<InputEvent> {
++    Vec::new()
++}
 diff --git a/src/app/chinese_ui.rs b/src/app/chinese_ui.rs
 index bfd0a50bec1285aae20014ca6eadd8528c6546d8..96bef50ef3ae515ac77e18ddf7d1353acc33a1d3 100644
 --- a/src/app/chinese_ui.rs
@@ -88417,6 +91066,21 @@ index 66634364f0ea57cb389592e1bae7a658672b3dd5..3200de0e656709ff835587e57883e330
  
  use anyhow::{Context, Result, bail, ensure};
  use serde_json::{Value, json};
+diff --git a/src/app/frame.rs b/src/app/frame.rs
+index 696eecc0cde1d810c366e78e94f4cdb071fd1bc6..ab2ea490603a95bf02fb6c3621b82d2bae659d36 100644
+--- a/src/app/frame.rs
++++ b/src/app/frame.rs
+@@ -437,7 +437,9 @@ impl App {
+                 }
+             }
+             GameScreen::MainMenu => {
+-                if let crate::app::frontend::shell_transition::ShellFirstPaintRenderResult::Rendered {
++                if crate::app::browser_shell::surface(state).is_some() {
++                    crate::app::browser_shell::render(state, &mut encoder, &output.texture)?;
++                } else if let crate::app::frontend::shell_transition::ShellFirstPaintRenderResult::Rendered {
+                     main_menu_entry_token,
+                 } = crate::app::frontend::shell_transition::render_shell_first_paint_slide(
+                     state,
 diff --git a/src/app/frontend/campaign_score_shell_render.rs b/src/app/frontend/campaign_score_shell_render.rs
 index 312ea3a4814847fab8e0b9e7b322c874da2e8e04..e9aea81ca416b620ee1b928f9395b3bebb182ce2 100644
 --- a/src/app/frontend/campaign_score_shell_render.rs
@@ -88488,7 +91152,7 @@ index 45bcf5334c976a738e474cec8def54950aac6b31..d7e3a37c6f5119a557d48867984b3fc2
      );
      let mut labels = Vec::new();
 diff --git a/src/app/frontend/main_menu_shell_render.rs b/src/app/frontend/main_menu_shell_render.rs
-index 4f08804e7ee4d04b2e72c4a9b9d16c431b4d3ac2..efd5f723f87363dc3336d63364fb822d8d3aeedb 100644
+index 4f08804e7ee4d04b2e72c4a9b9d16c431b4d3ac2..8b4d68e906148af2a8bd6cdee0a1dc542b8782fb 100644
 --- a/src/app/frontend/main_menu_shell_render.rs
 +++ b/src/app/frontend/main_menu_shell_render.rs
 @@ -1,7 +1,7 @@
@@ -88500,7 +91164,24 @@ index 4f08804e7ee4d04b2e72c4a9b9d16c431b4d3ac2..efd5f723f87363dc3336d63364fb822d
  
  use anyhow::Result;
  
-@@ -319,8 +319,15 @@ pub(crate) fn ensure_movie_for_current_layout(
+@@ -167,10 +167,16 @@ pub(crate) fn main_menu_title_text(state: &AppState) -> std::borrow::Cow<'_, str
+ }
+ 
+ fn main_menu_status_csf_key(hovered_button: Option<MainMenuControlId>) -> Option<&'static str> {
++    if cfg!(target_arch = "wasm32") && hovered_button == Some(MainMenuControlId::WwOnline0x684) {
++        return None;
++    }
+     hovered_button.map(tooltip_csf_key_for_control)
+ }
+ 
+ fn main_menu_button_text(state: &AppState, id: MainMenuControlId) -> std::borrow::Cow<'_, str> {
++    if cfg!(target_arch = "wasm32") && id == MainMenuControlId::WwOnline0x684 {
++        return "资源管理".into();
++    }
+     if shell_layout::uses_branded_main_menu(state) && id == MainMenuControlId::MoviesAndCredits0x686
+     {
+         return "访问官网".into();
+@@ -319,8 +325,15 @@ pub(crate) fn ensure_movie_for_current_layout(
      }
      clear_ra2ts_movie_session(state);
  
@@ -88518,7 +91199,7 @@ index 4f08804e7ee4d04b2e72c4a9b9d16c431b4d3ac2..efd5f723f87363dc3336d63364fb822d
          let movie = crate::render::werhd_menu_movie::MenuMovieSurface::branded(
              &state.renderer.gpu,
              &state.renderer.batch_renderer,
-@@ -528,6 +535,11 @@ fn render_main_menu_shell_to_target_inner(
+@@ -528,6 +541,11 @@ fn render_main_menu_shell_to_target_inner(
      let sliding = !matches!(slide, MainMenuSlide::Steady);
      let leaving = matches!(slide, MainMenuSlide::Exit(_));
      let movie_shown = !sliding && !backdrop;
@@ -88613,7 +91294,7 @@ index 2864eae956eb24f8588a5267caa652e08b152281..5e3c993807e18fd848f5851430c41a71
          crate::app::frontend::menu_page_render::paint_shell_monitor(state)
      } else {
 diff --git a/src/app/frontend/shell_layout.rs b/src/app/frontend/shell_layout.rs
-index 3982a7a612ca790c063ef8d741bd33456b6ea0d7..95b8ed57d19f0d27de2ab4074e61016592e71f9e 100644
+index 3982a7a612ca790c063ef8d741bd33456b6ea0d7..c6257211a673fb9cdc7d85b4d60bb716b2daa40a 100644
 --- a/src/app/frontend/shell_layout.rs
 +++ b/src/app/frontend/shell_layout.rs
 @@ -52,7 +52,8 @@ pub(crate) fn uses_branded_main_menu(state: &AppState) -> bool {
@@ -88626,8 +91307,17 @@ index 3982a7a612ca790c063ef8d741bd33456b6ea0d7..95b8ed57d19f0d27de2ab4074e610165
      )) && state.platform.capture_client_size.is_none()
  }
  
+@@ -63,7 +64,7 @@ pub(crate) fn main_menu_layout(state: &AppState) -> MainMenuShellLayout {
+     } else {
+         compute_layout(width, height)
+     };
+-    if uses_branded_main_menu(state) {
++    if uses_branded_main_menu(state) && !cfg!(target_arch = "wasm32") {
+         layout.without_internet()
+     } else {
+         layout
 diff --git a/src/app/frontend/shell_transition.rs b/src/app/frontend/shell_transition.rs
-index e8e176f6d2e266091d3f4425fe78fc0608e38f0d..052ae8af53d63a9575042cdf01be9279039f8d4d 100644
+index e8e176f6d2e266091d3f4425fe78fc0608e38f0d..e571babe47fcb7f41b558768ae4d14054860584a 100644
 --- a/src/app/frontend/shell_transition.rs
 +++ b/src/app/frontend/shell_transition.rs
 @@ -13,7 +13,7 @@
@@ -88639,7 +91329,17 @@ index e8e176f6d2e266091d3f4425fe78fc0608e38f0d..052ae8af53d63a9575042cdf01be9279
  
  use anyhow::{Result, bail};
  
-@@ -1275,7 +1275,7 @@ pub(crate) fn render_shell_first_paint_slide(
+@@ -815,6 +815,9 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
+     if state.frontend.screen != GameScreen::MainMenu {
+         return None;
+     }
++    if crate::app::browser_shell::surface(state).is_some() {
++        return None;
++    }
+     // Play_Movie and Show_Credits run after their source dialog is destroyed
+     // and before the next one exists: no shell dialog is showing.
+     if state.frontend.fullscreen_movie.is_some() || state.frontend.credits_roll.is_some() {
+@@ -1275,7 +1278,7 @@ pub(crate) fn render_shell_first_paint_slide(
  mod tests {
      use super::*;
      use crate::ui::shell::static_reveal::{Kind1PaintWindow, Kind1StaticReveal};
@@ -89128,7 +91828,7 @@ index 571ded038dc43fc26de69a9429c2e41878d55067..1cbf351bca480425ed03eb649889c2d8
      let mut lines = Vec::new();
      for paragraph in paragraphs {
 diff --git a/src/app/frontend/state.rs b/src/app/frontend/state.rs
-index 66b83cca0f347ad2cc0e9fc220ee4308a0a3b58a..9f40d96f88be8053277832f7fc2fef654fc8b4cb 100644
+index 66b83cca0f347ad2cc0e9fc220ee4308a0a3b58a..b27189dd747183e04b34226c7dd6e3a3aba7ec88 100644
 --- a/src/app/frontend/state.rs
 +++ b/src/app/frontend/state.rs
 @@ -5,7 +5,7 @@
@@ -89140,6 +91840,15 @@ index 66b83cca0f347ad2cc0e9fc220ee4308a0a3b58a..9f40d96f88be8053277832f7fc2fef65
  
  use super::startup_splash;
  use crate::app::shell_random_map::{RandomMapGenerationJob, RandomMapGenerationRetention};
+@@ -13,6 +13,8 @@ use crate::rules::overlay_types::OverlayTypeRegistry;
+ use crate::ui::game_screen::GameScreen;
+ 
+ pub(crate) struct FrontendState {
++    /// Native presentation/input for browser content and multiplayer services.
++    pub(crate) browser_shell: crate::app::browser_shell::BrowserShellUi,
+     /// External offline launch: returning from the session closes the process for its client.
+     pub(crate) external_launch: bool,
+     pub(crate) external_launch_error: Option<String>,
 diff --git a/src/app/frontend/wol_welcome_render.rs b/src/app/frontend/wol_welcome_render.rs
 index b9a76e103e0c3a6517c593b543ac277d8180c8a4..affd5d2d07fbf2df246d00737c35b3b9860b1bb0 100644
 --- a/src/app/frontend/wol_welcome_render.rs
@@ -89172,7 +91881,7 @@ index b9a76e103e0c3a6517c593b543ac277d8180c8a4..affd5d2d07fbf2df246d00737c35b3b9
      );
      for (button, pressed, enabled) in &painted_buttons {
 diff --git a/src/app/handler.rs b/src/app/handler.rs
-index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b034c3ecf 100644
+index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..c276be92dc54cf247f9f26a581fe77d4768bd34f 100644
 --- a/src/app/handler.rs
 +++ b/src/app/handler.rs
 @@ -66,7 +66,12 @@ impl App {
@@ -89189,7 +91898,7 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b
          if let Some(splash) = state.frontend.startup_splash.as_mut()
              && let Err(err) = splash.resize(&state.renderer.gpu, &state.renderer.batch_renderer)
          {
-@@ -256,6 +261,68 @@ impl ApplicationHandler for App {
+@@ -256,6 +261,71 @@ impl ApplicationHandler for App {
      }
  
      fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -89218,6 +91927,9 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b
 +        }
 +        #[cfg(target_arch = "wasm32")]
 +        self.poll_browser_network();
++        if let Some(state) = self.state.as_mut() {
++            crate::app::browser_shell::poll(state);
++        }
 +        self.wait_for_next_frame(event_loop);
 +        #[cfg(target_arch = "wasm32")]
 +        self.update_browser_diagnostics();
@@ -89258,7 +91970,7 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b
          #[cfg(any(target_os = "ios", target_os = "android"))]
          {
              let was_suspended = self.ios_suspended;
-@@ -357,7 +424,12 @@ impl ApplicationHandler for App {
+@@ -357,7 +427,12 @@ impl ApplicationHandler for App {
          }
      }
  
@@ -89272,7 +91984,17 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b
          #[cfg(any(target_os = "ios", target_os = "android"))]
          {
              if self.ios_suspended && matches!(&event, WindowEvent::RedrawRequested) {
-@@ -1463,7 +1535,20 @@ impl ApplicationHandler for App {
+@@ -629,6 +704,9 @@ impl ApplicationHandler for App {
+         if crate::app::frontend::status_screen::handle_event(state, &event, event_loop) {
+             return;
+         }
++        if crate::app::browser_shell::handle_event(state, &event) {
++            return;
++        }
+ 
+         match event {
+             WindowEvent::CloseRequested => {
+@@ -1463,7 +1541,20 @@ impl ApplicationHandler for App {
          }
      }
  
@@ -89294,7 +92016,7 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b
          #[cfg(any(target_os = "ios", target_os = "android"))]
          if self.ios_suspended {
              event_loop.set_control_flow(ControlFlow::Wait);
-@@ -1547,6 +1632,20 @@ impl ApplicationHandler for App {
+@@ -1547,6 +1638,20 @@ impl ApplicationHandler for App {
                      event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                  }
              } else if state.platform.window_hidden {
@@ -89315,7 +92037,7 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..48bd8a9f20830fd90172bfd8a8cf0f0b
                  if Self::match_runs_while_hidden(state) {
                      // Minimised or fully covered, but the match is not frozen:
                      // keep the world and the audio service advancing without
-@@ -1577,32 +1676,6 @@ impl ApplicationHandler for App {
+@@ -1577,32 +1682,6 @@ impl ApplicationHandler for App {
              }
          }
      }
@@ -89375,7 +92097,7 @@ index 8e2291c31d44870d3ee4edc74be0b56e9930cb18..77ede3a8851ed5f33555e167b8e8414b
              state.platform.window.request_redraw();
          }
 diff --git a/src/app/initialize.rs b/src/app/initialize.rs
-index 7da5e35b9cd34674dc2c01c6d12f4f62b6ec5ab4..361a2135ac7bf2fae16b5977ab5705ece5ba0171 100644
+index 7da5e35b9cd34674dc2c01c6d12f4f62b6ec5ab4..10d02ecc098ba54a934fa542dd241ff546435f5f 100644
 --- a/src/app/initialize.rs
 +++ b/src/app/initialize.rs
 @@ -152,6 +152,20 @@ fn apply_startup_audio_profile(
@@ -89512,6 +92234,14 @@ index 7da5e35b9cd34674dc2c01c6d12f4f62b6ec5ab4..361a2135ac7bf2fae16b5977ab5705ec
                  startup: Default::default(),
                  sim_runtime: None,
                  input: crate::app::input::state::MatchInputState::new(hotkey_bindings),
+@@ -746,6 +823,7 @@ impl App {
+                 ),
+             },
+             frontend: crate::app::frontend::state::FrontendState {
++                browser_shell: Default::default(),
+                 external_launch: false,
+                 external_launch_error: None,
+                 screen: GameScreen::default(),
 diff --git a/src/app/input/camera.rs b/src/app/input/camera.rs
 index 0427397d8be9f3311efd5d3faabc508b92eedb17..73af7d4f081ea6e1f3cf532d90cb22df479bb113 100644
 --- a/src/app/input/camera.rs
@@ -90347,7 +93077,7 @@ index 9a397690e7cf41d01aee73ea976f504ac07ca2f6..86e52d6acb244d44d6a367425fc71c2f
  use crate::sim::telemetry::TimingSample;
  
 diff --git a/src/app/mod.rs b/src/app/mod.rs
-index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..381136b415287717bef8e40989b4226ffefc1faf 100644
+index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e1094baf416 100644
 --- a/src/app/mod.rs
 +++ b/src/app/mod.rs
 @@ -3,7 +3,7 @@
@@ -90359,10 +93089,11 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..381136b415287717bef8e40989b4226f
  
  use anyhow::Result;
  use winit::application::ApplicationHandler;
-@@ -33,6 +33,10 @@ use crate::util::config::GameConfig;
+@@ -33,6 +33,11 @@ use crate::util::config::GameConfig;
  
  pub mod app_bundle;
  pub(crate) mod audio_runtime;
++pub(crate) mod browser_shell;
 +#[cfg(target_arch = "wasm32")]
 +pub mod browser;
 +#[cfg(target_arch = "wasm32")]
@@ -90370,7 +93101,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..381136b415287717bef8e40989b4226f
  pub(crate) mod campaign_defeat;
  pub(crate) mod campaign_victory;
  pub(crate) mod chinese_ui;
-@@ -141,6 +145,8 @@ pub struct App {
+@@ -141,6 +146,8 @@ pub struct App {
      /// Make sure config.toml names a game folder before the window opens
      /// ([`app_bundle`]).
      ask_for_game_folder: bool,
@@ -90379,7 +93110,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..381136b415287717bef8e40989b4226f
  }
  
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -192,6 +198,8 @@ impl App {
+@@ -192,6 +199,8 @@ impl App {
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -90388,7 +93119,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..381136b415287717bef8e40989b4226f
          }
      }
  
-@@ -212,6 +220,8 @@ impl App {
+@@ -212,6 +221,8 @@ impl App {
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -90397,7 +93128,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..381136b415287717bef8e40989b4226f
          }
      }
  
-@@ -234,6 +244,8 @@ impl App {
+@@ -234,6 +245,8 @@ impl App {
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -91153,7 +93884,7 @@ index 50bd28fa2fb05aadd67e6bade3d9d3a8397c2ff7..b371eeddb1be6636f2b9168a70a0d93c
          .as_nanos();
      let seed_dir = std::env::temp_dir().join(format!(
 diff --git a/src/app/shell_campaign.rs b/src/app/shell_campaign.rs
-index 183fd74ae20cd8f4ed355ef4117327b6f2add5d7..54ce034289d103983b8d6edf51817ff722d8c235 100644
+index 183fd74ae20cd8f4ed355ef4117327b6f2add5d7..97ea1dd9f9a3eafa6d028247952eab232ec96626 100644
 --- a/src/app/shell_campaign.rs
 +++ b/src/app/shell_campaign.rs
 @@ -3,7 +3,7 @@
@@ -91174,7 +93905,7 @@ index 183fd74ae20cd8f4ed355ef4117327b6f2add5d7..54ce034289d103983b8d6edf51817ff7
 +            // The ordinary Single Player exit has already torn down its
 +            // dialog. Recreate it before handing optional content to the host.
 +            Self::open_single_player_shell(state);
-+            crate::app::browser::request_content("campaign");
++            crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Content, Some("campaign"));
 +            return;
 +        }
          crate::app::frontend::main_menu_shell_render::clear_ra2ts_movie_session(state);
@@ -91225,7 +93956,7 @@ index 8d6035e2bd0d2bef98566cd8daea08812f1c2dc6..61482202a40818505ee822f9a231e685
          )
      }
 diff --git a/src/app/shell_main_menu.rs b/src/app/shell_main_menu.rs
-index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..70591ff9b56a7eecdc3b8239fe6738f8b13a8937 100644
+index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..b926399d79da36024cad2544231f8b77ceea6f4e 100644
 --- a/src/app/shell_main_menu.rs
 +++ b/src/app/shell_main_menu.rs
 @@ -727,6 +727,16 @@ impl App {
@@ -91257,7 +93988,20 @@ index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..70591ff9b56a7eecdc3b8239fe6738f8
              if inline_main_menu_action(
                  crate::app::frontend::shell_layout::uses_branded_main_menu(state),
                  action,
-@@ -1652,6 +1667,16 @@ Details: {details}"
+@@ -1637,6 +1652,12 @@ Details: {details}"
+     ) {
+         use crate::ui::main_menu_shell::MainMenuShellAction;
+ 
++        #[cfg(target_arch = "wasm32")]
++        if action == MainMenuShellAction::WwOnline {
++            crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Content, None);
++            return;
++        }
++
+         if let Some(inline) = inline_main_menu_action(
+             crate::app::frontend::shell_layout::uses_branded_main_menu(state),
+             action,
+@@ -1652,6 +1673,16 @@ Details: {details}"
                      macos_main_menu_url::open_website();
                      #[cfg(target_os = "android")]
                      android_main_menu_url::open_website();
@@ -91274,14 +94018,14 @@ index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..70591ff9b56a7eecdc3b8239fe6738f8
                  }
              }
              return;
-@@ -1671,7 +1696,12 @@ Details: {details}"
+@@ -1671,7 +1702,12 @@ Details: {details}"
              MainMenuShellAction::MoviesAndCredits => {
                  Self::open_movies_credits_page(state);
              }
 -            MainMenuShellAction::Network => Self::open_lan_lobby(state),
 +            MainMenuShellAction::Network => {
 +                #[cfg(target_arch = "wasm32")]
-+                crate::app::browser::request_network_lobby();
++                crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Lobby, None);
 +                #[cfg(not(target_arch = "wasm32"))]
 +                Self::open_lan_lobby(state);
 +            }
@@ -91636,6 +94380,20 @@ index 69bace9b79483559a190fc9bd2adccccda958ceb..c5d7ecce0e2bb16e3b0f355768574895
      }
  
      #[test]
+diff --git a/src/app/shell_route.rs b/src/app/shell_route.rs
+index ccb9dabb43e974470b345143ae7cd974fbe55446..d80cc1d1963873996499bea8bb1cbae19060b6d4 100644
+--- a/src/app/shell_route.rs
++++ b/src/app/shell_route.rs
+@@ -14,6 +14,9 @@ pub(crate) enum ShellRoute {
+     /// The stock main menu (or its degraded fallback).
+     #[default]
+     MainMenu,
++    /// Browser service pages use the ordinary native shell renderer/input.
++    BrowserContent,
++    BrowserLobby,
+     /// The single-player shell page.
+     SinglePlayer,
+     /// Movies & Credits page `0x101`.
 diff --git a/src/app/shell_saved_games.rs b/src/app/shell_saved_games.rs
 index d7c94469ad8d0413d04bc68b1593ab400cf5447b..4f3dbc35ccb6250a4ea04573573c664b5cddc484 100644
 --- a/src/app/shell_saved_games.rs
@@ -96785,10 +99543,10 @@ index c2a5bcb4cee96dfcd0c0f75dc3333982d1957c94..d401e15ed7425038dd6d05c085d7f5ad
 +}
 diff --git a/src/web_entry.rs b/src/web_entry.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e2c231080f8b663550c8ac860bcf7d24681541a3
+index 0000000000000000000000000000000000000000..798b688444ed54a5567432ed95161361a3abf7ca
 --- /dev/null
 +++ b/src/web_entry.rs
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,109 @@
 +//! Browser boundary for the complete native client. Rules, UI, input and drawing
 +//! remain owned by the original VERA modules.
 +use wasm_bindgen::prelude::*;
@@ -96831,6 +99589,12 @@ index 0000000000000000000000000000000000000000..e2c231080f8b663550c8ac860bcf7d24
 +#[wasm_bindgen]
 +pub fn configure_content(json: &str) -> Result<(), JsValue> {
 +    crate::util::browser_content::configure(json).map_err(|error| JsValue::from_str(&error))
++}
++
++/// Semantic content/lobby receipts only; no battle command admission here.
++#[wasm_bindgen]
++pub fn browser_shell_update(json: &str) -> Result<(), JsValue> {
++    crate::app::browser_shell::update_snapshot(json).map_err(|error| JsValue::from_str(&error))
 +}
 +
 +#[wasm_bindgen]

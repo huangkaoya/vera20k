@@ -1652,6 +1652,12 @@ Details: {details}"
     ) {
         use crate::ui::main_menu_shell::MainMenuShellAction;
 
+        #[cfg(target_arch = "wasm32")]
+        if action == MainMenuShellAction::WwOnline {
+            crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Content, None);
+            return;
+        }
+
         if let Some(inline) = inline_main_menu_action(
             crate::app::frontend::shell_layout::uses_branded_main_menu(state),
             action,
@@ -1698,7 +1704,7 @@ Details: {details}"
             }
             MainMenuShellAction::Network => {
                 #[cfg(target_arch = "wasm32")]
-                crate::app::browser::request_network_lobby();
+                crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Lobby, None);
                 #[cfg(not(target_arch = "wasm32"))]
                 Self::open_lan_lobby(state);
             }

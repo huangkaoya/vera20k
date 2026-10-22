@@ -167,10 +167,16 @@ pub(crate) fn main_menu_title_text(state: &AppState) -> std::borrow::Cow<'_, str
 }
 
 fn main_menu_status_csf_key(hovered_button: Option<MainMenuControlId>) -> Option<&'static str> {
+    if cfg!(target_arch = "wasm32") && hovered_button == Some(MainMenuControlId::WwOnline0x684) {
+        return None;
+    }
     hovered_button.map(tooltip_csf_key_for_control)
 }
 
 fn main_menu_button_text(state: &AppState, id: MainMenuControlId) -> std::borrow::Cow<'_, str> {
+    if cfg!(target_arch = "wasm32") && id == MainMenuControlId::WwOnline0x684 {
+        return "资源管理".into();
+    }
     if shell_layout::uses_branded_main_menu(state) && id == MainMenuControlId::MoviesAndCredits0x686
     {
         return "访问官网".into();

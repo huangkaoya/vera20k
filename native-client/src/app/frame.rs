@@ -437,7 +437,9 @@ impl App {
                 }
             }
             GameScreen::MainMenu => {
-                if let crate::app::frontend::shell_transition::ShellFirstPaintRenderResult::Rendered {
+                if crate::app::browser_shell::surface(state).is_some() {
+                    crate::app::browser_shell::render(state, &mut encoder, &output.texture)?;
+                } else if let crate::app::frontend::shell_transition::ShellFirstPaintRenderResult::Rendered {
                     main_menu_entry_token,
                 } = crate::app::frontend::shell_transition::render_shell_first_paint_slide(
                     state,

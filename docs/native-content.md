@@ -74,12 +74,17 @@ user-provided filename/path, and preserve the same SHA keys across releases.
 It has no DOM, simulation or wasm-bindgen dependency. `content-plan.js` resolves
 profiles, package dependencies, mounting conflicts and the shared gameplay
 identity. A replacement lobby can call these same interfaces before starting
-the VERA simulation. The optional `content-panel.js` UI only selects and caches
-plans; activation is a caller callback and requires a reload of the current
-native client.
+the VERA simulation. `content-controller.js` selects and caches plans without
+creating DOM nodes; activation is a caller callback and requires a reload of
+the current native client. The visible resource page is part of the Rust shell.
 
 `runtime-adapter.js` contains the current wasm loading, content configuration,
 mounting, startup and network port. The current native menu/rendering integration
 stays behind this adapter. A future sim-only integration supplies its own engine
 adapter and match lifecycle while retaining the content catalog and store. Asset
 descriptors contain no native menu types or serialized lobby state.
+
+`shell-bridge.js` carries schema-1 content/lobby snapshots to
+`browser_shell_update` and forwards `vera-shell-action` semantic commands to the
+appropriate hidden controller. It owns no rendering or simulation commands.
+The Rust shell owns both visible pages, including buttons, fields and focus.

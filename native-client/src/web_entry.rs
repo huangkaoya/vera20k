@@ -42,6 +42,12 @@ pub fn configure_content(json: &str) -> Result<(), JsValue> {
     crate::util::browser_content::configure(json).map_err(|error| JsValue::from_str(&error))
 }
 
+/// Semantic content/lobby receipts only; no battle command admission here.
+#[wasm_bindgen]
+pub fn browser_shell_update(json: &str) -> Result<(), JsValue> {
+    crate::app::browser_shell::update_snapshot(json).map_err(|error| JsValue::from_str(&error))
+}
+
 #[wasm_bindgen]
 pub fn start_browser(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
     crate::util::browser_content::freeze();

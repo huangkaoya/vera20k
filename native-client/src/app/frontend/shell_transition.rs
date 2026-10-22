@@ -815,6 +815,9 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
     if state.frontend.screen != GameScreen::MainMenu {
         return None;
     }
+    if crate::app::browser_shell::surface(state).is_some() {
+        return None;
+    }
     // Play_Movie and Show_Credits run after their source dialog is destroyed
     // and before the next one exists: no shell dialog is showing.
     if state.frontend.fullscreen_movie.is_some() || state.frontend.credits_roll.is_some() {

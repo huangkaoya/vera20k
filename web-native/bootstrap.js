@@ -1,6 +1,7 @@
 import {ContentStore} from './content-store.js';
 import {resolveContentPlan} from './content-plan.js';
-import {installContentPanel} from './content-panel.js';
+import {createContentController} from './content-controller.js';
+import {createNativeShellBridge} from './shell-bridge.js';
 import {createVeraRuntime} from './runtime-adapter.js';
 import {installNativeLobby} from './lobby.js';
 
@@ -9,6 +10,8 @@ const startup = document.querySelector('#startup'), canvas = document.querySelec
 const actions = document.querySelector('#startup-actions'), selectionKey = 'vera.content.selection.v1';
 const controller = new AbortController(), size = bytes => `${(bytes / 1048576).toFixed(1)} MB`;
 let runtime, initialized = false, cacheWarning = false;
+const shell = createNativeShellBridge();
+window.addEventListener('pagehide', event => { if (!event.persisted) shell.dispose(); });
 function action(text, callback) {
   const button = document.createElement('button'); button.type = 'button'; button.textContent = text;
   button.addEventListener('click', callback); return button;
@@ -24,7 +27,7 @@ function canonical(value) {
     ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
 }
 function activationAllowed() {
-  if (!runtime || !initialized) return true;
+  if (!runtime || !initialized) return false;
   return runtime.diagnostics()?.mode === 'menu'
     && !['loading', 'ready', 'running', 'finishing'].includes(runtime.networkStatus()?.phase);
 }
@@ -41,14 +44,16 @@ try {
   const plan = resolveContentPlan(catalog, selection), store = new ContentStore({onCacheStatus: event => {
     if (['unavailable', 'write-failed'].includes(event.state)) cacheWarning = true;
   }});
-  const panel = installContentPanel({catalog, store, initialSelection: {profile: plan.profile, addons: plan.addons}, isActivationAllowed: activationAllowed, onActivate: next => {
+  const content = createContentController({catalog, store,
+    onState: state => shell.publish('content', state),
+    initialSelection: {profile: plan.profile, addons: plan.addons}, isActivationAllowed: activationAllowed, onActivate: next => {
     if (!activationAllowed()) throw new Error('请先退出对局，再切换资源');
     const checked = resolveContentPlan(catalog, next);
     localStorage.setItem(selectionKey, JSON.stringify({profile: checked.profile, addons: checked.addons}));
     controller.abort(); location.reload();
   }});
-  window.addEventListener('vera-content-required', event => panel.open({pack: event.detail?.pack}));
-  actions.append(action('取消下载', () => controller.abort()), action('资源管理', () => panel.open()));
+  shell.attach('content', content);
+  actions.append(action('取消下载', () => controller.abort()));
   Object.defineProperty(window, '__veraContent', {value: Object.freeze({profile: plan.profile, addons: plan.addons,
     requiredResourceIdentity: plan.requiredResourceIdentity, catalogIdentity, files: plan.files.length,
     rawBytes: plan.totalBytes, downloadBytes: plan.downloadBytes, capabilities: plan.capabilities})});
@@ -62,6 +67,7 @@ try {
       : `正在载入游戏引擎 ${size(event.attemptWireBytes)} / ${size(event.wireTotalBytes)}`;
   }});
   runtime = await createVeraRuntime({moduleUrl: `/native/vera20k.js?sha256=${build.outputs['vera20k.js'].sha256}`, engineBytes});
+  shell.setRuntime(runtime);
   runtime.configureContent(plan.capabilities);
   const font = new FontFace('Vera UI', 'url(/fonts/FiraSansCondensed-Medium.ttf)', {weight: '500'});
   document.fonts.add(await font.load());
@@ -97,14 +103,16 @@ try {
     });
     observer.observe(canvas, {attributes: true, attributeFilter: ['data-vera-stage', 'data-vera-error']});
   });
-  installNativeLobby({native: runtime.network, canvas});
+  const lobby = installNativeLobby({native: runtime.network, canvas, onState: state => shell.publish('lobby', state)});
+  shell.attach('lobby', lobby);
   runtime.start(canvas);
   runtime.diagnostics(); // Enable the native read-only snapshot before content activation needs it.
   Object.defineProperty(window, '__veraNative', {value: Object.freeze({sourceRevision: runtime.sourceRevision(),
     diagnostics: runtime.diagnostics, networkStatus: runtime.networkStatus})});
-  await ready; initialized = true; startup.hidden = true; canvas.focus();
+  await ready; initialized = true; startup.hidden = true; content.refresh(); canvas.focus();
 } catch (error) {
   controller.abort();
+  shell.dispose();
   status.textContent = error?.name === 'AbortError' ? '下载已取消，已完成校验的缓存会保留。'
     : `游戏启动失败：${error instanceof Error ? error.message : String(error)}`;
   progress.hidden = true; actions.replaceChildren(action('重新载入并重试', () => location.reload()));

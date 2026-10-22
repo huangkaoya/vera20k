@@ -119,12 +119,52 @@ struct PendingInitialization {
     live: Rc<Cell<bool>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrowserViewport {
+    width: u32,
+    height: u32,
+    dpr_bits: u64,
+}
+
+impl BrowserViewport {
+    fn measured(width: f64, height: f64, dpr: f64) -> Option<Self> {
+        if !width.is_finite()
+            || !height.is_finite()
+            || !dpr.is_finite()
+            || width < 1.0
+            || height < 1.0
+            || dpr <= 0.0
+            || width > u32::MAX as f64
+            || height > u32::MAX as f64
+        {
+            return None;
+        }
+        Some(Self {
+            width: width.round() as u32,
+            height: height.round() as u32,
+            dpr_bits: dpr.to_bits(),
+        })
+    }
+
+    fn current() -> Option<Self> {
+        let window = web_sys::window()?;
+        Self::measured(
+            window.inner_width().ok()?.as_f64()?,
+            window.inner_height().ok()?.as_f64()?,
+            window.device_pixel_ratio(),
+        )
+    }
+}
+
 pub(super) struct BrowserState {
     canvas: HtmlCanvasElement,
     pending: Option<PendingInitialization>,
     attempted: bool,
     last_diagnostics: Option<Instant>,
     last_document_hidden: Option<bool>,
+    /// Winit writes explicit canvas CSS dimensions. Observe the browser rather
+    /// than that now-fixed client rect; no resize listeners outlive this owner.
+    last_viewport: Option<BrowserViewport>,
 }
 
 /// Start once, after the retail provider has mounted and hydrated its files.
@@ -145,6 +185,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
         attempted: false,
         last_diagnostics: None,
         last_document_hidden: None,
+        last_viewport: BrowserViewport::current(),
     });
     BROWSER_PROXY.with(|proxy| *proxy.borrow_mut() = Some(event_loop.create_proxy()));
     STARTED.with(|started| started.set(true));
@@ -173,6 +214,22 @@ impl App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if let Some(browser) = self.browser.as_mut()
+            && let Some(viewport) = BrowserViewport::current()
+            && browser.last_viewport != Some(viewport)
+        {
+            browser.last_viewport = Some(viewport);
+            // Feed the ordinary Resized path so GPU, shell layout, tactical
+            // viewport and native sidebar all agree on the same physical size.
+            let _ = state
+                .platform
+                .window
+                .request_inner_size(winit::dpi::LogicalSize::new(
+                    f64::from(viewport.width),
+                    f64::from(viewport.height),
+                ));
+            state.platform.window.request_redraw();
+        }
         if let Some(match_id) = NETWORK_LEAVE.with(|pending| pending.borrow_mut().take()) {
             let canceled = NETWORK_START.with(|pending| {
                 let mut pending = pending.borrow_mut();
@@ -354,6 +411,7 @@ impl App {
             state.platform.window.set_cursor_visible(true);
         }
         if let Some(browser) = self.browser.as_mut() {
+            browser.last_viewport = None;
             if let Some(pending) = browser.pending.take() {
                 pending.live.set(false);
                 pending.window.set_cursor_visible(true);

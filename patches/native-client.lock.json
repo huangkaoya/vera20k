@@ -5,7 +5,7 @@
   "baselineModes": {},
   "patch": {
     "path": "patches/native-client.patch",
-    "sha256": "fe3c680e9416c36b0ba219823681f90553e2cc8fda358f1ff59e59a1fca173ba"
+    "sha256": "c8df1a92ba80a45f5e75aaaf91dbfba0266846bf70eaf8c2abc1f1be8935e247"
   },
   "files": {
     "Cargo.lock": {
@@ -37,7 +37,7 @@
       "mode": "100644"
     },
     "src/app/browser.rs": {
-      "sha256": "01313c5745a16d8facad4111c510ae0cb19fd1bb39be062998cca19738ca12da",
+      "sha256": "149b40bf7c2542088accb9e35f2ab1bd1afcc9b652c0af5f3ef4ccf557b92e1b",
       "mode": "100644"
     },
     "src/app/browser/network_launch.rs": {
@@ -46,6 +46,26 @@
     },
     "src/app/browser_network.rs": {
       "sha256": "222d96de99b922be2ded52c1134adc2554fa407ec9222e9a4fae64037670c211",
+      "mode": "100644"
+    },
+    "src/app/browser_shell.rs": {
+      "sha256": "c99bfb36db218c8799a39beb61eaf00caa14c24823aa7709a61ed9c01692fc55",
+      "mode": "100644"
+    },
+    "src/app/browser_shell/content.rs": {
+      "sha256": "b421670542ca4cab17286b9016408e18a6bb948c8559c27cd1d1840e222c934c",
+      "mode": "100644"
+    },
+    "src/app/browser_shell/lobby.rs": {
+      "sha256": "df3cc0d6300d0a0c45e9e86c87ddc6170411ae5d7b0c4697d7246aa4d2696cea",
+      "mode": "100644"
+    },
+    "src/app/browser_shell/model.rs": {
+      "sha256": "e7c58dbf60010e0917922be75ea19515bc3ce3354a0cf390cd1922556e624bff",
+      "mode": "100644"
+    },
+    "src/app/browser_shell/text_input.rs": {
+      "sha256": "58bcfc81f08dce309b0f8c1dcc838c82c11d2312b8b7308eeeeba1ce43a24286",
       "mode": "100644"
     },
     "src/app/chinese_ui.rs": {
@@ -80,6 +100,10 @@
       "sha256": "8a1f4caaf2280bbfd430186f9f1468ce3a45fe266338103a8879b104a2888772",
       "mode": "100644"
     },
+    "src/app/frame.rs": {
+      "sha256": "512ed06784a2b708c4c60bd23c0cc98411a164179d284c727abc37ba81d2a4c8",
+      "mode": "100644"
+    },
     "src/app/frontend/campaign_score_shell_render.rs": {
       "sha256": "bbc6b97600c67a507122e6a5fc17c7da3016afc231a778cde8c80a71764ae8ed",
       "mode": "100644"
@@ -97,7 +121,7 @@
       "mode": "100644"
     },
     "src/app/frontend/main_menu_shell_render.rs": {
-      "sha256": "9ce00ad799b0684492d5044f7aa172692c2f37ab4467f4f1df6e621d0f777479",
+      "sha256": "5f55efc9da051a6635163191b1e9e76838864f30bd37b87d67378bf209881fab",
       "mode": "100644"
     },
     "src/app/frontend/menu_page_render.rs": {
@@ -117,11 +141,11 @@
       "mode": "100644"
     },
     "src/app/frontend/shell_layout.rs": {
-      "sha256": "2ab87663b14c11ea2dd045f0042d653a7bfd150d22a6c914b5d8233314a13af7",
+      "sha256": "fe011dfe8b1aed8447b1afb41474da389ec56155a3269f071f3118ae6af20ca8",
       "mode": "100644"
     },
     "src/app/frontend/shell_transition.rs": {
-      "sha256": "1fb7fbd25d769c826c8b3f5dfd29c465e20e895f56b5949c89db981cf0480520",
+      "sha256": "7c4536604725e6589dbee1caaa2246c02fcfc9ae046852aec9f4faaef411d3fc",
       "mode": "100644"
     },
     "src/app/frontend/skirmish_session.rs": {
@@ -173,7 +197,7 @@
       "mode": "100644"
     },
     "src/app/frontend/state.rs": {
-      "sha256": "0ed517954f140b4aff79aa2fa1e46b8aae00ff11bc2fe98972735d855876a5cc",
+      "sha256": "00b06e9bc785c0233321bf2763d7fb9a73f48ba23c691acadeed3e45211617e1",
       "mode": "100644"
     },
     "src/app/frontend/wol_welcome_render.rs": {
@@ -181,7 +205,7 @@
       "mode": "100644"
     },
     "src/app/handler.rs": {
-      "sha256": "e1674a54e1c0dd37005e94c23edc1735cd9e264c1940ea415fa2cbf767812b98",
+      "sha256": "c3bed0e01056b4d473820756e22f11890d0cf6cdf6b10274fe5e91a7349a6770",
       "mode": "100644"
     },
     "src/app/in_game.rs": {
@@ -189,7 +213,7 @@
       "mode": "100644"
     },
     "src/app/initialize.rs": {
-      "sha256": "05eb29cf2ce9dfe7ec11898f9cfb3ba6b31302a95a78e7aee06a403cf6486b17",
+      "sha256": "2bccd18959aa230b44e907e80630edf0cb2966a846c68015ed8e1d8fe1001ac7",
       "mode": "100644"
     },
     "src/app/input/camera.rs": {
@@ -297,7 +321,7 @@
       "mode": "100644"
     },
     "src/app/mod.rs": {
-      "sha256": "cc40f6d6318f631180539bd1c6e3600e7b943a4a7ce5eea755fb75cfbee584e6",
+      "sha256": "a886da0352c2b16de8076e6771f3dc61aaf9ea81454d18e8a08e13ac6e9510dc",
       "mode": "100644"
     },
     "src/app/movie_playback.rs": {
@@ -381,7 +405,7 @@
       "mode": "100644"
     },
     "src/app/shell_campaign.rs": {
-      "sha256": "0ebd10d1314e5ab5a0d0985f8f603df4c816e06e18d64c27d25198c91563e395",
+      "sha256": "b65a1a83b446cae65da8af9ac47388989aa93ee5b805b6ea984dcc4e913844c2",
       "mode": "100644"
     },
     "src/app/shell_lan.rs": {
@@ -393,7 +417,7 @@
       "mode": "100644"
     },
     "src/app/shell_main_menu.rs": {
-      "sha256": "516ad8edc87bc7c0b529672302e6567a234f6735d19cd8453490fab2ff2ff4e0",
+      "sha256": "a6ed398ae5c5ddc89b631d71a23d5a2994735b5a2fbbbd5fccb8b98b3e79e548",
       "mode": "100644"
     },
     "src/app/shell_movies_credits.rs": {
@@ -418,6 +442,10 @@
     },
     "src/app/shell_random_map.rs": {
       "sha256": "17eb60334214f36dbf4fb1d2570b4baeccfee11a8643be9a47ffccf34f35136f",
+      "mode": "100644"
+    },
+    "src/app/shell_route.rs": {
+      "sha256": "817ed72d8f380560fa63964cb2df19cbf28b20ff7174c1d7f3e6061a825866bb",
       "mode": "100644"
     },
     "src/app/shell_saved_games.rs": {
@@ -825,7 +853,7 @@
       "mode": "100644"
     },
     "src/web_entry.rs": {
-      "sha256": "f3347a1c5e8c569c8ef657b21b67a43134631dbbaa62fee14b8379422694e6a4",
+      "sha256": "3167fe28a7b67fb5f6c2085f15977df8cce8d48feea36aeb63d5ddbda115779d",
       "mode": "100644"
     }
   }

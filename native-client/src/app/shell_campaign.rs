@@ -26,7 +26,7 @@ impl App {
             // The ordinary Single Player exit has already torn down its
             // dialog. Recreate it before handing optional content to the host.
             Self::open_single_player_shell(state);
-            crate::app::browser::request_content("campaign");
+            crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Content, Some("campaign"));
             return;
         }
         crate::app::frontend::main_menu_shell_render::clear_ra2ts_movie_session(state);

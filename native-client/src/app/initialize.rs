@@ -823,6 +823,7 @@ impl App {
                 ),
             },
             frontend: crate::app::frontend::state::FrontendState {
+                browser_shell: Default::default(),
                 external_launch: false,
                 external_launch_error: None,
                 screen: GameScreen::default(),

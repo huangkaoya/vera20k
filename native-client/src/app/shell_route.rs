@@ -14,6 +14,9 @@ pub(crate) enum ShellRoute {
     /// The stock main menu (or its degraded fallback).
     #[default]
     MainMenu,
+    /// Browser service pages use the ordinary native shell renderer/input.
+    BrowserContent,
+    BrowserLobby,
     /// The single-player shell page.
     SinglePlayer,
     /// Movies & Credits page `0x101`.

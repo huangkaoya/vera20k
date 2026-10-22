@@ -286,6 +286,9 @@ impl ApplicationHandler for App {
         }
         #[cfg(target_arch = "wasm32")]
         self.poll_browser_network();
+        if let Some(state) = self.state.as_mut() {
+            crate::app::browser_shell::poll(state);
+        }
         self.wait_for_next_frame(event_loop);
         #[cfg(target_arch = "wasm32")]
         self.update_browser_diagnostics();
@@ -699,6 +702,9 @@ impl App {
             );
         }
         if crate::app::frontend::status_screen::handle_event(state, &event, event_loop) {
+            return;
+        }
+        if crate::app::browser_shell::handle_event(state, &event) {
             return;
         }
 
