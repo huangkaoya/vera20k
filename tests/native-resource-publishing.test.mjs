@@ -94,6 +94,8 @@ function mockCli() {
     assert.ok(path.isAbsolute(arg('--poster'))); assert.ok(path.isAbsolute(arg('--icon')));
     if (state.behavior === 'reject') throw classifyToyCliError({code: 1,
       stderr: 'Error: status=200 code=307009 message=缺少必要文件 token=DO_NOT_PERSIST_ME'}, 'create');
+    if (state.behavior === 'quota') throw classifyToyCliError({code: 1,
+      stderr: 'Error: status=200 code=-509 message=今日创建数量已达上限，请明天再试'}, 'create');
     if (state.behavior === 'unknown-no-write') throw new Error('DO_NOT_PERSIST_RAW_PROCESS_ERROR');
     const record = {id: 1000 + state.creates, title: arg('--title'),
       url: `https://www.bilibili.com/toy/${arg('--slug')}/index.html`,
@@ -278,6 +280,68 @@ test('explicit reconciliation of an old unknown outcome preserves both observati
   const attempts = (await f.journal()).packs[0].attempts;
   assert.equal(attempts.length, 3); assert.equal(attempts[0].state, 'unknown');
   assert.equal(attempts[1].lastFailure.apiCode, 307009); assert.equal(attempts[2].state, 'submitted');
+});
+
+test('quota rejection stays intact on read-only refresh and default submit never retries it', async t => {
+  const f = await fixture(t, 3), cli = mockCli(), options = {...f.options, run: cli.run, submit: true};
+  await publishResourceShards({...options, limit: 1}); assert.equal(cli.state.creates, 1);
+  cli.state.behavior = 'quota';
+  await assert.rejects(publishResourceShards(options), /-509.*今日创建数量已达上限/);
+  assert.equal(cli.state.creates, 2);
+  const before = (await f.journal()).packs[1];
+  assert.equal(before.state, 'rejected'); assert.equal(before.lastFailure.apiCode, -509);
+  const callsBefore = cli.calls.length;
+  const refreshed = await publishResourceShards({...f.options, run: cli.run, refreshStatus: true});
+  assert.ok(cli.calls.slice(callsBefore).every(args => args[0] === 'mylist'));
+  assert.equal(refreshed.confirmed, 1); assert.equal(refreshed.quotaRejected, 1);
+  assert.equal(refreshed.notSubmitted, 1); assert.equal(refreshed.awaitingReview, 1);
+  assert.deepEqual((await f.journal()).packs[1], before);
+  await assert.rejects(publishResourceShards(options), /需明确 --submit --retry-quota/);
+  assert.equal(cli.state.creates, 2); assert.equal((await f.journal()).packs.length, 2);
+});
+
+test('explicit quota retry permits the same artifact/media once and reuses earlier confirmed IDs', async t => {
+  const f = await fixture(t, 3), cli = mockCli(), options = {...f.options, run: cli.run, submit: true};
+  await publishResourceShards({...options, limit: 1});
+  cli.state.behavior = 'quota'; await assert.rejects(publishResourceShards(options), /-509/);
+  const prior = (await f.journal()).packs[1], originalFirstId = (await f.journal()).packs[0].id;
+  cli.state.behavior = 'success';
+  const completed = await publishResourceShards({...options, retryQuota: true});
+  assert.equal(cli.state.creates, 4); assert.equal(completed.confirmed, 3);
+  assert.equal(completed.quotaRejected, 0); assert.equal(completed.notSubmitted, 0);
+  const journal = await f.journal(), retried = journal.packs[1];
+  assert.equal(journal.packs[0].id, originalFirstId);
+  assert.equal(retried.artifacthash, prior.artifacthash);
+  assert.equal(retried.publishingMetadataHash, prior.publishingMetadataHash);
+  assert.equal(retried.attempts.length, 2); assert.equal(retried.attempts[0].lastFailure.apiCode, -509);
+  assert.equal(retried.attempts[1].state, 'submitted');
+  assert.ok(journal.stagedSources.every(source => source.enabled === false));
+});
+
+test('a still-active quota causes one explicit retry and stops without reaching later packages', async t => {
+  const f = await fixture(t, 2), cli = mockCli(), options = {...f.options, run: cli.run, submit: true};
+  cli.state.behavior = 'quota';
+  await assert.rejects(publishResourceShards(options), /-509/); assert.equal(cli.state.creates, 1);
+  await assert.rejects(publishResourceShards({...options, retryQuota: true}), /-509.*今日创建数量已达上限/);
+  assert.equal(cli.state.creates, 2);
+  const journal = await f.journal();
+  assert.equal(journal.packs.length, 1); assert.equal(journal.packs[0].attempts.length, 2);
+  assert.equal(journal.packs[0].state, 'rejected'); assert.equal(journal.packs[0].lastFailure.apiCode, -509);
+  await fs.writeFile(f.poster, png(120, 90, 55));
+  await assert.rejects(publishResourceShards({...options, retryQuota: true}), /保持原 ZIP、封面和图标/);
+  assert.equal(cli.state.creates, 2);
+});
+
+test('the quota flag cannot override an unresolved unknown outcome or validation rejection', async t => {
+  const f = await fixture(t, 1), cli = mockCli(), options = {...f.options, run: cli.run, submit: true};
+  cli.state.behavior = 'unknown-no-write'; await assert.rejects(publishResourceShards(options));
+  await assert.rejects(publishResourceShards({...options, retryQuota: true}), /未重复创建/);
+  assert.equal(cli.state.creates, 1);
+  const other = await fixture(t, 1), rejected = mockCli(); rejected.state.behavior = 'reject';
+  const validationOptions = {...other.options, run: rejected.run, submit: true};
+  await assert.rejects(publishResourceShards(validationOptions), /307009/);
+  await assert.rejects(publishResourceShards({...validationOptions, retryQuota: true}), /内容未改变/);
+  assert.equal(rejected.state.creates, 1);
 });
 
 test('oversize or invalid publishing images and unsupported CLI media flags cannot trigger upload', async t => {

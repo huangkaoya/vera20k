@@ -285,11 +285,18 @@ export async function validatePublishingMedia({poster, icon}) {
   return {media, mediaHash: digest(JSON.stringify({poster: media.poster.sha256, icon: media.icon.sha256}))};
 }
 
-export function canRetryRejectedPublication(record, descriptor, publishing, candidate) {
+export function canRetryRejectedPublication(record, descriptor, publishing, candidate, {retryQuota = false} = {}) {
   if (record.artifacthash !== descriptor.artifacthash)
     throw new Error(`重试的资源 ZIP 与已记录包体不一致：${descriptor.packId}`);
   if (record.state !== 'rejected' || record.lastFailure?.outcome !== 'rejected' || record.id || candidate)
     throw new Error(`先前结果并非无 ID、无线上 Toy 的明确拒绝，禁止再次创建：${descriptor.slug}`);
+  if (record.lastFailure.apiCode === -509) {
+    if (!retryQuota)
+      throw new Error(`Toy 今日创建配额已拒绝此包；次日恢复后需明确 --submit --retry-quota，不自动重试：${descriptor.slug}`);
+    if (!publishing || record.publishingMetadataHash !== publishing.mediaHash)
+      throw new Error(`配额恢复必须保持原 ZIP、封面和图标内容，不通过改包或改图重试：${descriptor.slug}`);
+    return true;
+  }
   if (!publishing || record.publishingMetadataHash === publishing.mediaHash)
     throw new Error(`明确拒绝后的发布封面/图标内容未改变，不自动重试：${descriptor.slug}`);
   return true;
@@ -302,12 +309,13 @@ function snapshotAttempt(record) {
   return Object.fromEntries(fields.filter(field => record[field] !== undefined).map(field => [field, structuredClone(record[field])]));
 }
 
-export async function publishResourceShards({submit = false, refreshStatus = false, limit = Infinity,
+export async function publishResourceShards({submit = false, refreshStatus = false, retryQuota = false, limit = Infinity,
   cli = path.join(root, '.build/toy-cli/toy'), run = runToyCli,
   planPath = path.join(root, 'dist/toy-resources/plan.json'),
   proofPath = path.join(root, 'validation/toy-resource-http.json'), poster, icon,
   wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)), onProgress = console.log} = {}) {
   if (submit && refreshStatus) throw new Error('--submit 和 --refresh-status 不能同时使用');
+  if (retryQuota && !submit) throw new Error('--retry-quota 仅能搭配显式 --submit 使用');
   if (!(limit === Infinity || Number.isSafeInteger(limit) && limit > 0)) throw new Error('--limit 必须是正整数');
   const {plan, planSha256, outputDirectory} = await validatePublicationPlan({planPath, proofPath, requireProof: submit});
   const publishing = refreshStatus ? null : await validatePublishingMedia({
@@ -339,13 +347,16 @@ export async function publishResourceShards({submit = false, refreshStatus = fal
   // pack cannot leave a partially published batch that already needed review.
   for (const descriptor of descriptors) {
     const existing = journal.packs.find(record => record.packId === descriptor.packId);
-    const candidate = matchingToy(remote, descriptor);
     if (existing && existing.artifacthash !== descriptor.artifacthash)
       throw new Error(`发布日志中的包体已变化，拒绝覆盖或重复发布：${descriptor.packId}`);
+    // A status refresh observes confirmed IDs. It must retain negative/unknown
+    // receipts for no-ID attempts without turning them into another outcome.
+    if (refreshStatus && !existing?.id) continue;
+    const candidate = matchingToy(remote, descriptor);
     if (!existing && candidate)
       throw new Error(`该地址已有 Toy，但没有对应包体日志，不能假定内容一致：${descriptor.slug}`);
     if (submit && existing && !existing.id && existing.state === 'rejected')
-      canRetryRejectedPublication(existing, descriptor, publishing, candidate);
+      canRetryRejectedPublication(existing, descriptor, publishing, candidate, {retryQuota});
   }
   if (submit) {
     const help = await run(cli, ['create', '--help-json']);
@@ -372,6 +383,11 @@ export async function publishResourceShards({submit = false, refreshStatus = fal
   for (let index = 0; index < plan.packs.length && index < limit; index++) {
     const pack = plan.packs[index], descriptor = descriptors[index];
     let record = journal.packs.find(value => value.packId === pack.packId);
+    if (refreshStatus && !record?.id) {
+      if (record) onProgress(JSON.stringify({packId: pack.packId, preservedReceipt: true,
+        state: record.state, status: record.status, apiCode: record.lastFailure?.apiCode ?? null}));
+      continue;
+    }
     let candidate = matchingToy(remote, descriptor);
     if (record) {
       if (record.id && ['submitted', 'submitted-awaiting-list'].includes(record.state)) {
@@ -389,9 +405,11 @@ export async function publishResourceShards({submit = false, refreshStatus = fal
         continue;
       }
       if (submit && record.state === 'rejected') {
-        canRetryRejectedPublication(record, descriptor, publishing, candidate);
+        canRetryRejectedPublication(record, descriptor, publishing, candidate, {retryQuota});
         onProgress(JSON.stringify({packId: pack.packId, retryingKnownRejection: true,
-          previousApiCode: record.lastFailure.apiCode, publishingMetadataChanged: true}));
+          previousApiCode: record.lastFailure.apiCode,
+          publishingMetadataChanged: record.publishingMetadataHash !== publishing.mediaHash,
+          explicitQuotaRetry: retryQuota && record.lastFailure.apiCode === -509}));
       } else {
         if (candidate) record.reconciliationCandidate = publicFields(candidate);
         if (record.state !== 'rejected') record.state = 'unknown';
@@ -479,6 +497,9 @@ export async function publishResourceShards({submit = false, refreshStatus = fal
     journal: journalPath, packages: plan.packs.length, recorded: journal.packs.length,
     enabled: false, confirmed: journal.packs.filter(record => record.id).length,
     pendingList: journal.packs.filter(record => record.id && record.metadataVerified !== true).length,
+    quotaRejected: journal.packs.filter(record => !record.id && record.state === 'rejected'
+      && record.lastFailure?.outcome === 'rejected' && record.lastFailure.apiCode === -509).length,
+    notSubmitted: plan.packs.filter(pack => !journal.packs.some(record => record.packId === pack.packId)).length,
     awaitingReview: journal.packs.filter(record => record.id && record.status !== 'published').length};
   onProgress(JSON.stringify(result));
   return result;
@@ -490,6 +511,7 @@ function argumentsFrom(args) {
     const arg = args[index];
     if (arg === '--submit') options.submit = true;
     else if (arg === '--refresh-status') options.refreshStatus = true;
+    else if (arg === '--retry-quota') options.retryQuota = true;
     else if (arg === '--dry-run') continue;
     else if (/^--limit=\d+$/.test(arg)) options.limit = Number(arg.slice(8));
     else if (arg.startsWith('--cli=')) options.cli = path.resolve(arg.slice(6));
