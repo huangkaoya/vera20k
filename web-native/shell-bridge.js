@@ -14,7 +14,7 @@ export function createNativeShellBridge({eventTarget = globalThis.window, onErro
     catch (error) { onError(error); }
   };
   const listener = event => dispatch(event.detail);
-  eventTarget.addEventListener('vera-shell-action', listener);
+  eventTarget.addEventListener('werhd-shell-action', listener);
   return {
     attach(surface, controller) {
       if (disposed || !surfaces.has(surface) || typeof controller?.dispatch !== 'function') throw new Error('原生菜单适配器无效');
@@ -34,7 +34,7 @@ export function createNativeShellBridge({eventTarget = globalThis.window, onErro
     dispatch,
     dispose() {
       if (disposed) return; disposed = true;
-      eventTarget.removeEventListener('vera-shell-action', listener);
+      eventTarget.removeEventListener('werhd-shell-action', listener);
       for (const controller of controllers.values()) controller.dispose?.();
       controllers.clear(); pending.clear(); runtime = undefined;
     },

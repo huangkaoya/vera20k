@@ -128,6 +128,9 @@ mod window_icon;
 /// Main window title. The single-instance gate finds a running copy's window by
 /// this exact title, so `main` hands the same constant to
 /// `util::single_instance::acquire`.
+#[cfg(target_arch = "wasm32")]
+pub const WINDOW_TITLE: &str = "WERHD";
+#[cfg(not(target_arch = "wasm32"))]
 pub const WINDOW_TITLE: &str = if crate::rules::ARES_ENABLED {
     "VERA20K [Ares]"
 } else {

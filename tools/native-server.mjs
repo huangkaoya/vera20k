@@ -7,7 +7,7 @@ import {requestPath, openRegularFile, fingerprint, sendFile, sendJson, methods, 
 import {attachNativeMultiplayer} from './services/native-websocket.mjs';
 import {NATIVE_PROTOCOL} from './services/native-room-coordinator.mjs';
 import {NATIVE_ROOM_ROUTING} from './services/native-room-routing.mjs';
-import {isNativeAssetName,readNativeResourceManifest,readNativeContentIndex,verifyNativeBuild,nativeAssetManifestIdentity} from './native-build-manifest.mjs';
+import {isNativeAssetName,readNativeResourceManifest,readNativeContentIndex,verifyNativeBuild,nativeAssetManifestIdentity,NATIVE_WEB_OUTPUTS,NATIVE_WEB_RENDERER} from './native-build-manifest.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const isNativeRetailFile = isNativeAssetName;
@@ -37,8 +37,8 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
     await opened.handle.close();
   }
   const contentObjects=new Map(content?.objects??[]);
-  if(build?.outputs['vera20k_bg.wasm'].download) {
-    const download=build.outputs['vera20k_bg.wasm'].download;
+  if(build?.outputs['werhd_bg.wasm'].download) {
+    const download=build.outputs['werhd_bg.wasm'].download;
     contentObjects.set(download.sha256,{...download,path:path.join(root,'.build/native-content/objects',download.sha256),contentType:'application/gzip'});
   }
   for(const [sha256,object] of contentObjects) {
@@ -54,8 +54,8 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
       if (!methods(request,response)) return;
       if (pathname==='/api/health') {
         let ready=false;
-        try {ready=(await fs.stat(path.join(nativeRoot,'vera20k_bg.wasm'))).isFile();}catch{}
-        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,patchSha256:build?.patchSha256,resourceManifestSha256:build?.resourceManifestSha256??nativeAssetManifestIdentity(index.manifest),renderer:'VERA wgpu/WebGPU',roomRouting:NATIVE_ROOM_ROUTING,multiplayer:{protocol:NATIVE_PROTOCOL,rooms:[...multiplayer.coordinators.values()].reduce((total,value)=>total+value.rooms.size,0),diagnosticRttMs},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
+        try {ready=(await fs.stat(path.join(nativeRoot,'werhd_bg.wasm'))).isFile();}catch{}
+        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-native',protocol:NATIVE_PROTOCOL,patchSha256:build?.patchSha256,resourceManifestSha256:build?.resourceManifestSha256??nativeAssetManifestIdentity(index.manifest),renderer:NATIVE_WEB_RENDERER,roomRouting:NATIVE_ROOM_ROUTING,multiplayer:{protocol:NATIVE_PROTOCOL,rooms:[...multiplayer.coordinators.values()].reduce((total,value)=>total+value.rooms.size,0),diagnosticRttMs},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
       }
       if (pathname==='/api/native/resources') {sendJson(request,response,200,index.manifest);return;}
       if(/^\/content\/objects\/[a-f0-9]{64}$/.test(pathname)) {
@@ -75,7 +75,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
       else if (pathname==='/branding/icon.png' || pathname==='/favicon.ico') {directory=path.join(root,'native-client/art/branding');relative='wannafire-app-icon.png';}
       else if (pathname==='/fonts/FiraSansCondensed-Medium.ttf' || pathname==='/fonts/FiraSansCondensed-OFL') {
         directory=path.join(root,'native-client/art/fonts');relative=path.basename(pathname);
-      } else if (pathname.startsWith('/native/') && /\.(?:js|wasm|json)$/.test(pathname)) {
+      } else if (['/native/build.json',...NATIVE_WEB_OUTPUTS.map(name=>`/native/${name}`)].includes(pathname)) {
         directory=nativeRoot;relative=pathname.slice('/native/'.length);
       } else throw httpError(404,'Route not exposed');
       const mime=relative.endsWith('.ttf')?'font/ttf':undefined;
@@ -93,7 +93,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
 }
 if (process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const app=await createNativeServer({port:Number(process.env.PORT??5280),diagnosticRttMs:Number(process.env.VERA_NATIVE_DIAGNOSTIC_RTT_MS??0)});
-  console.log(`王二火大 · VERA WebGPU ${app.url}`);
+  console.log(`王二火大 · WERHD WebGPU ${app.url}`);
   console.log(`只读游戏资源 ${app.manifest.files.length} 项；${Math.round(app.manifest.totalBytes/1048576)} MB`);
   let closing=false;
   const close=async()=>{if(closing)return;closing=true;await app.close();process.exit(0);};

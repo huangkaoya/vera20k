@@ -22,8 +22,12 @@ async function setup(t) {
   await fs.writeFile(path.join(root,'web-native/index.html'),'<title>王二火大</title><canvas id="game"></canvas>');
   await fs.writeFile(path.join(root,'web-native/bootstrap.js'),'export const native=true;');
   for (const name of ['pointer-capture.js','menu-animation.js']) await fs.writeFile(path.join(root,'web-native',name),'export const adapter=true;');
-  await fs.writeFile(path.join(root,'public/native/vera20k_bg.wasm'),Buffer.from([0,97,115,109,1,0,0,0]));
-  await fs.writeFile(path.join(root,'public/native/vera20k.js'),'export const start_browser=()=>{};');
+  await fs.writeFile(path.join(root,'public/native/werhd_bg.wasm'),Buffer.from([0,97,115,109,1,0,0,0]));
+  await fs.writeFile(path.join(root,'public/native/werhd.js'),'export const start_browser=()=>{};');
+  // Deliberately retained old output bytes must still be inaccessible.
+  await fs.writeFile(path.join(root,'public/native/vera20k_bg.wasm'),'obsolete engine');
+  await fs.writeFile(path.join(root,'public/native/vera20k.js'),'obsolete bindings');
+  await fs.writeFile(path.join(root,'public/native/other.js'),'unpublished');
   await fs.writeFile(path.join(root,'native-client/art/fonts/FiraSansCondensed-Medium.ttf'),'font');
   await fs.writeFile(path.join(root,'native-client/art/branding/wannafire-app-icon.png'),'approved-icon');
   for (const name of ['ra2.mix','movmd03.mix','thememd.mix','rulesmd.ini','RA2MD.INI','keyboard.ini']) await fs.writeFile(path.join(retail,name),'0123456789');
@@ -41,18 +45,23 @@ test('native shell serves real WASM and native media, preserving private profile
     const response=await request(app.url,route);
     assert.equal(response.status,200); assert.match(response.body.toString(),/adapter/);
   }
-  const wasm=await request(app.url,'/native/vera20k_bg.wasm');
+  const wasm=await request(app.url,'/native/werhd_bg.wasm');
   assert.equal(wasm.status,200);assert.equal(wasm.headers['content-type'],'application/wasm');
+  const bindings=await request(app.url,'/native/werhd.js');
+  assert.equal(bindings.status,200);assert.match(bindings.body.toString(),/start_browser/);
   const icon=await request(app.url,'/branding/icon.png');
   assert.equal(icon.status,200);assert.equal(icon.headers['content-type'],'image/png');assert.equal(icon.body.toString(),'approved-icon');
   const manifest=JSON.parse((await request(app.url,'/api/native/resources')).body);
   assert.deepEqual(manifest.files.map(file=>file.name),['movmd03.mix','ra2.mix','rulesmd.ini','thememd.mix']);
   assert.equal(manifest.totalBytes,40);
   const health=JSON.parse((await request(app.url,'/api/health')).body);
-  assert.equal(health.ok,true);assert.equal(health.app,'werhd-vera-native');
+  assert.equal(health.ok,true);assert.equal(health.app,'werhd-native');
+  assert.equal(health.renderer,'WERHD wgpu/WebGPU');
   assert.deepEqual(health.roomRouting,{shards:8,maxClientsPerShard:16,maxRoomsPerShard:8});
   assert.equal(health.multiplayer.rooms,0);assert.equal(app.multiplayer.coordinators.size,9);
-  for (const route of ['/retail/RA2MD.INI','/retail/keyboard.ini','/retail/ra2md.mix','/native/leak.js','/native/../../secret.json','/native/%2e%2e/secret.json','/native-client/src/lib.rs','/tools/native-server.mjs']) {
+  for (const route of ['/retail/RA2MD.INI','/retail/keyboard.ini','/retail/ra2md.mix','/native/leak.js',
+    '/native/vera20k.js','/native/vera20k_bg.wasm','/native/other.js',
+    '/native/../../secret.json','/native/%2e%2e/secret.json','/native-client/src/lib.rs','/tools/native-server.mjs']) {
     assert.ok([400,404].includes((await request(app.url,route)).status),route);
   }
   assert.equal((await request(app.url,'/',{method:'POST'})).status,405);

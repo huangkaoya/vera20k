@@ -13,7 +13,7 @@ function memoryCache() {
   const entries = new Map(), deleted = []; let puts = 0;
   return {entries, deleted, get puts() { return puts; },
     async match(key) { return entries.get(key)?.clone(); },
-    async put(key, response) { puts++; entries.set(key, new Response(await response.arrayBuffer())); },
+    async put(key, response) { puts++; entries.set(key, new Response(await response.arrayBuffer(), {headers: response.headers})); },
     async delete(key) { deleted.push(key); return entries.delete(key); },
   };
 }
@@ -184,4 +184,131 @@ test('invalid descriptors and unreasonable concurrency fail before touching stor
     await assert.rejects(f.store.loadFile(invalid), ContentError);
   }
   await assert.rejects(f.store.prefetch([file], {concurrency: 5}), ContentError); assert.equal(f.requests.length, 0);
+});
+
+const currentCacheName = 'werhd-native-content-v1', legacyCacheName = 'vera-native-content-v1';
+const legacyKey = file => `https://werhd-content.invalid/.vera-content-cache/v1/${file.sha256}`;
+function namedCaches({current = memoryCache(), legacy = memoryCache(), hasLegacy = true} = {}) {
+  const opened = [], names = new Map([[currentCacheName, current]]);
+  if (hasLegacy) names.set(legacyCacheName, legacy);
+  return {current, legacy, opened, names,
+    storage: {has: async name => names.has(name), open: async name => {
+      opened.push(name); if (!names.has(name)) names.set(name, memoryCache()); return names.get(name);
+    }}};
+}
+
+test('new cache names and headers lazily migrate a verified legacy SHA without fetching', async () => {
+  const bytes = raw('already downloaded retail bytes'), file = descriptor(bytes), caches = namedCaches();
+  const oldKey = legacyKey(file), events = [];
+  caches.legacy.entries.set(oldKey, new Response(bytes, {headers: {'X-Vera-Content-SHA256': file.sha256}}));
+  const unrelated = oldKey + '-unread'; caches.legacy.entries.set(unrelated, new Response('leave this alone'));
+  const f = fixture({cacheStorage: caches.storage});
+  assert.equal(f.store.key(file), `https://werhd-content.invalid/.werhd-content-cache/v1/${file.sha256}`);
+  assert.deepEqual(await f.store.loadFile(file, {onProgress: event => events.push(event)}), bytes);
+  assert.equal(f.requests.length, 0); assert.deepEqual(caches.opened, [currentCacheName, legacyCacheName]);
+  assert.equal(caches.legacy.entries.has(oldKey), false); assert.equal(caches.legacy.entries.has(unrelated), true);
+  const copied = caches.current.entries.get(f.store.key(file));
+  assert.deepEqual(new Uint8Array(await copied.clone().arrayBuffer()), bytes);
+  assert.equal(copied.headers.get('X-Werhd-Content-SHA256'), file.sha256);
+  assert.equal(copied.headers.has('X-Vera-Content-SHA256'), false);
+  assert.equal(events.at(-1).legacyCache, true); assert.equal(events.at(-1).migratedCache, true);
+  assert.equal(events.at(-1).wireBytes, 0); assert.equal(events.at(-1).fromCache, true);
+});
+
+test('a verified new cache hit wins before any legacy namespace is opened or inspected', async () => {
+  const bytes = raw('same exact known object'), file = descriptor(bytes), caches = namedCaches();
+  const f = fixture({cacheStorage: caches.storage});
+  caches.current.entries.set(f.store.key(file), new Response(bytes));
+  caches.legacy.entries.set(legacyKey(file), new Response('corrupt old bytes must not matter'));
+  assert.deepEqual(await f.store.loadFile(file), bytes);
+  assert.deepEqual(caches.opened, [currentCacheName]); assert.equal(f.requests.length, 0);
+  assert.deepEqual(caches.legacy.deleted, []); assert.equal(f.store.cacheStatus(file), 'hit');
+});
+
+test('failed migration writes preserve a verified legacy cache and remain playable without re-download', async () => {
+  const bytes = raw('keep installed resources'), file = descriptor(bytes), caches = namedCaches();
+  caches.legacy.entries.set(legacyKey(file), new Response(bytes));
+  caches.current.put = async () => { throw new DOMException('full', 'QuotaExceededError'); };
+  const f = fixture({cacheStorage: caches.storage});
+  assert.deepEqual(await f.store.loadFile(file), bytes); assert.deepEqual(await f.store.loadFile(file), bytes);
+  assert.equal(f.requests.length, 0); assert.equal(caches.legacy.entries.has(legacyKey(file)), true);
+  assert.deepEqual(caches.legacy.deleted, []); assert.equal(f.store.cacheStatus(file), 'hit');
+  assert.ok(f.statuses.some(event => event.state === 'write-failed'));
+});
+
+test('a missing legacy namespace is not created while normal new downloads use only WERHD names', async () => {
+  const bytes = raw('new installation'), file = descriptor(bytes), caches = namedCaches({hasLegacy: false});
+  const f = fixture({cacheStorage: caches.storage, fetch: async () => new Response(bytes)});
+  assert.deepEqual(await f.store.loadFile(file), bytes);
+  assert.deepEqual(caches.opened, [currentCacheName]); assert.equal(caches.names.has(legacyCacheName), false);
+  assert.equal(f.requests.length, 1); assert.ok(caches.current.entries.has(f.store.key(file)));
+});
+
+test('an unavailable new cache still serves verified old bytes without any network fallback', async () => {
+  const bytes = raw('old cache survives new-cache denial'), file = descriptor(bytes), caches = namedCaches();
+  caches.legacy.entries.set(legacyKey(file), new Response(bytes));
+  const open = caches.storage.open; caches.storage.open = name => {
+    if (name === currentCacheName) throw new DOMException('denied', 'SecurityError'); return open(name);
+  };
+  const f = fixture({cacheStorage: caches.storage});
+  assert.deepEqual(await f.store.loadFile(file), bytes); assert.equal(f.requests.length, 0);
+  assert.equal(caches.legacy.entries.has(legacyKey(file)), true); assert.deepEqual(caches.legacy.deleted, []);
+});
+
+test('abort during legacy copy keeps old bytes and suppresses late migration success', async () => {
+  const bytes = raw('copy in flight'), file = descriptor(bytes), caches = namedCaches();
+  const commit = deferred(), started = deferred(), controller = new AbortController(), events = [];
+  caches.legacy.entries.set(legacyKey(file), new Response(bytes));
+  caches.current.put = async (key, response) => {
+    const body = await response.arrayBuffer(); started.resolve(); await commit.promise;
+    caches.current.entries.set(key, new Response(body, {headers: response.headers}));
+  };
+  const f = fixture({cacheStorage: caches.storage});
+  const pending = f.store.loadFile(file, {signal: controller.signal, onProgress: event => events.push(event)});
+  await started.promise; controller.abort(); await assert.rejects(pending, {name: 'AbortError'});
+  const count = events.length; commit.resolve(); await flush(); await flush();
+  assert.equal(caches.legacy.entries.has(legacyKey(file)), true); assert.deepEqual(caches.legacy.deleted, []);
+  assert.equal(events.length, count); assert.equal(f.requests.length, 0);
+  assert.ok(!events.some(event => event.cacheStatus === 'stored' || event.stage === 'complete'));
+});
+
+test('an uncancellable legacy deletion completing after abort restores the old entry', async () => {
+  const bytes = raw('delete migration in flight'), file = descriptor(bytes), caches = namedCaches();
+  const commit = deferred(), started = deferred(), controller = new AbortController();
+  const oldKey = legacyKey(file); caches.legacy.entries.set(oldKey, new Response(bytes));
+  caches.legacy.delete = async key => { started.resolve(); await commit.promise; return caches.legacy.entries.delete(key); };
+  const f = fixture({cacheStorage: caches.storage}), pending = f.store.loadFile(file, {signal: controller.signal});
+  await started.promise; controller.abort(); await assert.rejects(pending, {name: 'AbortError'});
+  commit.resolve(); await flush(); await flush();
+  assert.deepEqual(new Uint8Array(await caches.legacy.entries.get(oldKey).clone().arrayBuffer()), bytes);
+  assert.ok(caches.current.entries.has(f.store.key(file))); assert.equal(f.requests.length, 0);
+});
+
+test('legacy content is independently size and SHA validated before use or migration', async () => {
+  const bytes = raw('valid old entry'), file = descriptor(bytes);
+  for (const bad of [raw('wrong old entry'), bytes.subarray(1)]) {
+    const caches = namedCaches(); caches.legacy.entries.set(legacyKey(file), new Response(bad));
+    const f = fixture({cacheStorage: caches.storage, fetch: async () => new Response(bytes)});
+    assert.deepEqual(await f.store.loadFile(file), bytes); assert.equal(f.requests.length, 1);
+    assert.deepEqual(caches.legacy.deleted, [legacyKey(file)]);
+    assert.ok(f.statuses.some(event => event.state === 'corrupt'));
+  }
+});
+
+test('cache adapters aliasing names do not retire or delete entries from the active cache', async () => {
+  const bytes = raw('aliased test adapter'), file = descriptor(bytes), shared = memoryCache();
+  shared.entries.set(legacyKey(file), new Response(bytes));
+  const f = fixture({cache: shared, cacheStorage: {has: async () => true, open: async () => shared}, fetch: async () => new Response(bytes)});
+  assert.deepEqual(await f.store.loadFile(file), bytes);
+  assert.equal(shared.entries.has(legacyKey(file)), true); assert.deepEqual(shared.deleted, []);
+  assert.deepEqual(await f.store.loadFile(file), bytes); assert.equal(f.requests.length, 0);
+});
+
+test('CacheStorage keys discovery supports older adapters without creating a missing legacy cache', async () => {
+  const bytes = raw('keys-based legacy discovery'), file = descriptor(bytes), caches = namedCaches();
+  caches.legacy.entries.set(legacyKey(file), new Response(bytes));
+  delete caches.storage.has; caches.storage.keys = async () => [...caches.names.keys()];
+  const f = fixture({cacheStorage: caches.storage});
+  assert.deepEqual(await f.store.loadFile(file), bytes); assert.equal(f.requests.length, 0);
+  assert.deepEqual(caches.opened, [currentCacheName, legacyCacheName]);
 });

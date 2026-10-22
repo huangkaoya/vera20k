@@ -86,7 +86,7 @@ fn notify(name: &str) {
 }
 
 pub(super) fn request_network_lobby() {
-    notify("vera-native-network");
+    notify("werhd-native-network");
 }
 
 pub(super) fn request_content(pack: &str) {
@@ -106,14 +106,14 @@ pub(super) fn request_content(pack: &str) {
     let init = web_sys::CustomEventInit::new();
     init.set_detail(&detail);
     if let Ok(event) =
-        web_sys::CustomEvent::new_with_event_init_dict("vera-content-required", &init)
+        web_sys::CustomEvent::new_with_event_init_dict("werhd-content-required", &init)
     {
         let _ = window.dispatch_event(&event);
     }
 }
 
 pub(super) fn notify_network_return() {
-    notify("vera-native-network-return");
+    notify("werhd-native-network-return");
 }
 
 struct PendingInitialization {
@@ -180,7 +180,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     }
     let event_loop = EventLoop::new().map_err(|error| JsValue::from_str(&error.to_string()))?;
     canvas.set_attribute("tabindex", "0")?;
-    canvas.set_attribute("data-vera-stage", "starting")?;
+    canvas.set_attribute("data-werhd-stage", "starting")?;
     let mut app = App::default();
     app.browser = Some(BrowserState {
         canvas,
@@ -218,9 +218,9 @@ pub fn menu_active() -> bool {
 }
 
 fn set_stage(browser: &BrowserState, stage: &str, error: Option<&str>) {
-    let _ = browser.canvas.set_attribute("data-vera-stage", stage);
+    let _ = browser.canvas.set_attribute("data-werhd-stage", stage);
     if let Some(error) = error {
-        let _ = browser.canvas.set_attribute("data-vera-error", error);
+        let _ = browser.canvas.set_attribute("data-werhd-error", error);
     }
     DIAGNOSTICS.with(|value| *value.borrow_mut() = json!({"stage":stage,"error":error}));
 }
@@ -270,16 +270,16 @@ impl App {
         }
         if let Some(config) = NETWORK_START.with(|pending| pending.borrow_mut().take()) {
             match network_launch::start(state, config) {
-                Ok(()) => notify("vera-native-network-started"),
+                Ok(()) => notify("werhd-native-network-started"),
                 Err(error) => {
                     let message = format!("网络对局启动失败：{error:#}");
                     log::error!("{message}");
                     if let Some(browser) = self.browser.as_ref() {
                         let _ = browser
                             .canvas
-                            .set_attribute("data-vera-network-error", &message);
+                            .set_attribute("data-werhd-network-error", &message);
                     }
-                    notify("vera-native-network-error");
+                    notify("werhd-native-network-error");
                 }
             }
         }
@@ -293,7 +293,7 @@ impl App {
                 Self::set_window_hidden(state, hidden);
             }
         }
-        notify("vera-native-network-service");
+        notify("werhd-native-network-service");
     }
     pub(super) fn begin_browser_initialization(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {

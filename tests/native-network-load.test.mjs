@@ -14,7 +14,7 @@ async function fixture(t,{invalidHealth=false,disconnectOnInput=false}={}){
   const server=http.createServer((request,response)=>{
     if(request.url!=='/api/health'){response.writeHead(404).end();return;}
     response.writeHead(200,{'Content-Type':'application/json'}).end(JSON.stringify({
-      ok:true,app:invalidHealth?'another-project':'werhd-vera-native',protocol:NATIVE_PROTOCOL,
+      ok:true,app:invalidHealth?'another-project':'werhd-native',protocol:NATIVE_PROTOCOL,
       ...identity,roomRouting:{maxRoomsPerShard:NATIVE_ROOM_ROUTING.maxRoomsPerShard,
         maxClientsPerShard:NATIVE_ROOM_ROUTING.maxClientsPerShard,shards:NATIVE_ROOM_ROUTING.shards}}));
   });

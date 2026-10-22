@@ -52,6 +52,9 @@ pub mod native_affine;
 
 #[cfg(target_arch = "wasm32")]
 pub mod browser_io;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "browser_io_migration.rs"]
+mod browser_io_migration_tests;
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod browser_menu_media;

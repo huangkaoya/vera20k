@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createVeraRuntime} from '../web-native/runtime-adapter.js';
+import {createWerhdRuntime} from '../web-native/runtime-adapter.js';
 
 test('content is frozen before gameplay while the replaceable network port remains available', async () => {
   const mounted = [], received = [], events = [], shell = [], movies = [];
@@ -20,7 +20,7 @@ test('content is frozen before gameplay while the replaceable network port remai
     browser_shell_update: text => shell.push(JSON.parse(text)),
     install_menu_animation: bytes => movies.push([...bytes]),
   };
-  const runtime = await createVeraRuntime({moduleUrl: '/native/engine.js', engineBytes: new Uint8Array([0, 97, 115, 109]),
+  const runtime = await createWerhdRuntime({moduleUrl: '/native/engine.js', engineBytes: new Uint8Array([0, 97, 115, 109]),
     importModule: async url => { assert.equal(url, '/native/engine.js'); return module; }});
   assert.throws(() => runtime.start('canvas'), /资源能力/);
   assert.equal(runtime.pointerCaptureAllowed(), false);

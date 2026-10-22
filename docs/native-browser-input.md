@@ -43,7 +43,7 @@ persists `[VERA] MouseSensitivityPercent` through the browser storage provider.
 This setting affects captured relative movement only; map scroll rate, ordinary
 menu coordinates and simulation speed keep their own existing settings.
 
-For bounded measurements, `window.__veraNative.diagnostics().pointerMotion`
+For bounded measurements, `window.__werhdNative.diagnostics().pointerMotion`
 reports input sample count, accumulated physical input, actual applied window
 delta after projection/clamping, gain, window scale and zoom scale. Compare two
 snapshots over a one-direction motion away from screen/letterbox edges. Applied
@@ -80,3 +80,18 @@ changes the match resource identity. Failure leaves the static native poster.
 network and WASM gates; the recorded binary patch retains these changes across
 an upstream candidate merge. Physical-device input and browser capture support
 remain runtime acceptance steps in addition to unit tests.
+
+## Browser product names
+
+The public engine is `werhd.js` / `werhd_bg.wasm`; the build manifest and local
+and deployed servers admit only those names. Legacy public engine routes return
+404, even if stale static files remain. WASM name/producers/DWARF debug metadata
+is removed at bindgen output. Browser titles, status text, log prefixes, font
+labels, bridge events and diagnostic hooks use WERHD or 王二火大.
+
+Existing browser profiles/saves and verified content caches migrate to the
+WERHD storage namespaces. New entries win; old values remain readable on
+storage failure and are removed only after successful replacement. This does
+not redownload unchanged retail resources. Upstream crate/source identities,
+attribution, save format markers and deterministic hash domains remain internal
+compatibility contracts; branding never rewrites their bytes.

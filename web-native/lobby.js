@@ -1,6 +1,13 @@
 function globalStorage(name) { try { return globalThis[name]; } catch { return undefined; } }
-function stored(storage, key, fallback) {
-  try { return storage.getItem(key) || fallback; } catch { return fallback; }
+function stored(storage, key, fallback, legacyKey) {
+  try {
+    const current = storage.getItem(key);
+    if (current) return current;
+    const old = legacyKey && storage.getItem(legacyKey);
+    if (!old) return fallback;
+    try { storage.setItem(key, old); storage.removeItem(legacyKey); } catch {}
+    return old;
+  } catch { return fallback; }
 }
 function save(storage, key, value) { try { storage.setItem(key, value); } catch {} }
 /** DOM-free native-v3 transport. The caller owns all visible UI and forwards
@@ -8,9 +15,9 @@ function save(storage, key, value) { try { storage.setItem(key, value); } catch 
 export function installNativeLobby({native, canvas, socketUrl, onState = () => {}} = {}) {
   if (!native || !canvas) throw new Error('联机大厅缺少游戏入口');
   const generatedId = globalThis.crypto?.randomUUID?.() ?? `player-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const playerId = stored(globalStorage('sessionStorage'), 'vera.native.playerId', generatedId);
-  save(globalStorage('sessionStorage'), 'vera.native.playerId', playerId);
-  const state = {name: stored(globalStorage('localStorage'), 'vera.native.playerName', '指挥官'), code: '', room: null,
+  const playerId = stored(globalStorage('sessionStorage'), 'werhd.native.playerId', generatedId, 'vera.native.playerId');
+  save(globalStorage('sessionStorage'), 'werhd.native.playerId', playerId);
+  const state = {name: stored(globalStorage('localStorage'), 'werhd.native.playerName', '指挥官', 'vera.native.playerName'), code: '', room: null,
     open: false, connected: false, busy: false, status: '', error: '', matchId: null,
     nativeStarted: false, starting: false, stopped: false, inbound: []};
   let socket = null, socketEpoch = 0, connecting = null, cancelConnect = null, disposed = false, timer, draining = false;
@@ -86,7 +93,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
         // Preserve the transport outcome without logging player identity or
         // command payloads. A normal protocol stop and a broken link need
         // different evidence when diagnosing a public match.
-        console.info('[VERA transport] WebSocket closed', JSON.stringify({
+        console.info('[WERHD transport] WebSocket closed', JSON.stringify({
           code: event.code ?? null, wasClean: event.wasClean ?? null,
           matchActive: Boolean(state.matchId), completed: completed(),
         }));
@@ -219,7 +226,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
   }
   function setName(name) {
     if (typeof name !== 'string') throw new Error('指挥官名称无效');
-    state.name = name.slice(0, 24); save(globalStorage('localStorage'), 'vera.native.playerName', state.name);
+    state.name = name.slice(0, 24); save(globalStorage('localStorage'), 'werhd.native.playerName', state.name);
   }
   function setCode(code) {
     if (typeof code !== 'string') throw new Error('房间代码无效');
@@ -298,12 +305,12 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     if (socket?.readyState === WebSocket.OPEN) sendNow({type: 'leave'});
     completion = null; transportFailure = null;
     state.matchId = null; state.nativeStarted = false; state.inbound = []; state.room = null;
-    report(canvas.dataset?.veraNetworkError || '无法启动网络对局'); setOpen(true);
+    report(canvas.dataset?.werhdNetworkError || '无法启动网络对局'); setOpen(true);
   };
-  window.addEventListener('vera-native-network', open);
-  window.addEventListener('vera-native-network-started', started);
-  window.addEventListener('vera-native-network-return', returned);
-  window.addEventListener('vera-native-network-error', failed);
+  window.addEventListener('werhd-native-network', open);
+  window.addEventListener('werhd-native-network-started', started);
+  window.addEventListener('werhd-native-network-return', returned);
+  window.addEventListener('werhd-native-network-error', failed);
   function drain() {
     if (disposed || draining) return;
     draining = true;
@@ -337,17 +344,17 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
   }
   // The native online worker-timer pass also notifies here; background output
   // never depends on RAF or on the browser's throttled ordinary timeout alone.
-  window.addEventListener('vera-native-network-service', drain);
+  window.addEventListener('werhd-native-network-service', drain);
   document.addEventListener('visibilitychange', timerDrain);
   timerDrain(); render();
   return {dispatch, dispose() {
     if (disposed) return;
     disposed = true; creating = null; clearTimeout(timer); closeSocket();
-    window.removeEventListener('vera-native-network-service', drain);
+    window.removeEventListener('werhd-native-network-service', drain);
     document.removeEventListener('visibilitychange', timerDrain);
-    window.removeEventListener('vera-native-network', open);
-    window.removeEventListener('vera-native-network-started', started);
-    window.removeEventListener('vera-native-network-return', returned);
-    window.removeEventListener('vera-native-network-error', failed);
+    window.removeEventListener('werhd-native-network', open);
+    window.removeEventListener('werhd-native-network-started', started);
+    window.removeEventListener('werhd-native-network-return', returned);
+    window.removeEventListener('werhd-native-network-error', failed);
   }};
 }

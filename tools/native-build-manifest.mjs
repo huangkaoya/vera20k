@@ -11,6 +11,15 @@ import {createResourceIndex,isPublicRetailFile} from './dev-server.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const gzip=promisify(gzipCallback);
+export const NATIVE_WEB_OUTPUTS=Object.freeze(['werhd.js','werhd_bg.wasm']);
+export const NATIVE_WEB_RENDERER='WERHD wgpu/WebGPU';
+const legacyOutputs=Object.freeze(['vera20k.js','vera20k_bg.wasm','vera20k.d.ts','vera20k_bg.wasm.d.ts',
+  'vera20k.js.map','vera20k_bg.wasm.map']);
+/** Only obsolete compiler outputs in the owned public/native directory. Never
+ * traverse or clear an asset, source, cache or user-data directory. */
+export async function removeLegacyNativeOutputs({root}) {
+  for(const name of legacyOutputs)await fs.rm(path.join(root,'public/native',name),{force:true});
+}
 export function nativeContentCatalogIdentity(catalog) {
   const {catalogIdentity,...body}=catalog;
   const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'
@@ -103,7 +112,7 @@ export async function writeNativeBuildManifest({root,profile,source,sourceChecke
   const current=await nativeSourceIdentity({root});
   if(JSON.stringify(current)!==JSON.stringify(source))throw new Error('Native source patch changed during compilation; rebuild after recording it');
   const outputs={};
-  for(const name of ['vera20k.js','vera20k_bg.wasm']) {
+  for(const name of NATIVE_WEB_OUTPUTS) {
     const file=path.join(root,'public/native',name),stat=await fs.stat(file);
     if(!stat.isFile())throw new Error(`Missing native build output ${name}`);
     outputs[name]={bytes:stat.size,sha256:await hashNativeFile(file)};
@@ -117,7 +126,7 @@ export async function writeNativeBuildManifest({root,profile,source,sourceChecke
       }
     }
   }
-  const manifest={schema:2,renderer:'VERA wgpu/WebGPU',...source,resourceManifestSha256,
+  const manifest={schema:2,renderer:NATIVE_WEB_RENDERER,...source,resourceManifestSha256,
     ...(contentCatalogIdentity?{contentCatalogIdentity}:{}),sourceChecked:Boolean(sourceChecked),profile,tools,outputs,builtAt:new Date().toISOString()};
   const target=path.join(root,'public/native/build.json');
   await fs.writeFile(target+'.tmp',JSON.stringify(manifest,null,2)+'\n');
@@ -128,10 +137,12 @@ export async function verifyNativeBuild({root,sourceCheck=false,requireChecked=f
   root=path.resolve(root);
   const build=JSON.parse(await fs.readFile(path.join(root,'public/native/build.json'),'utf8'));
   if(build.schema!==2||!build.outputs)throw new Error('Native build manifest missing v2 output hashes; rebuild the native web client');
+  if(build.renderer!==NATIVE_WEB_RENDERER||Object.keys(build.outputs).sort().join(',')!==[...NATIVE_WEB_OUTPUTS].sort().join(','))
+    throw new Error('Native build manifest does not contain the current WERHD browser outputs; rebuild the native web client');
   if(requireChecked&&!build.sourceChecked)throw new Error('Native build skipped its source check; a checked build is required for release');
   const source=await nativeSourceIdentity({root,sourceCheck});
   for(const key of ['revision','baselineSha256','patchSha256'])if(build[key]!==source[key])throw new Error(`Native build ${key} differs from the current recorded source`);
-  for(const name of ['vera20k.js','vera20k_bg.wasm']) {
+  for(const name of NATIVE_WEB_OUTPUTS) {
     const expected=build.outputs[name],file=path.join(root,'public/native',name),stat=await fs.stat(file);
     if(!stat.isFile()||stat.size!==expected?.bytes||await hashNativeFile(file)!==expected.sha256)throw new Error(`Native build output integrity mismatch: ${name}`);
     if(expected.download) {

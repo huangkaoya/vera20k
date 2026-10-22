@@ -9,9 +9,39 @@ use std::io::{self, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-const PREFIX: &str = "vera20k.native.files.v1:";
-const DIRECTORIES_KEY: &str = "vera20k.native.directories.v1";
+#[path = "browser_io_migration.rs"]
+mod migration;
+
 pub const RETAIL_ROOT: &str = "/retail";
+
+impl migration::Store for web_sys::Storage {
+    type Error = String;
+
+    fn keys(&self) -> Result<Vec<String>, Self::Error> {
+        let mut keys = Vec::new();
+        for index in 0..self
+            .length()
+            .map_err(|e| format!("storage length: {e:?}"))?
+        {
+            if let Some(name) = self.key(index).map_err(|e| format!("storage key: {e:?}"))? {
+                keys.push(name);
+            }
+        }
+        Ok(keys)
+    }
+    fn read(&self, key: &str) -> Result<Option<String>, Self::Error> {
+        self.get_item(key)
+            .map_err(|e| format!("storage read: {e:?}"))
+    }
+    fn write(&self, key: &str, value: &str) -> Result<(), Self::Error> {
+        self.set_item(key, value)
+            .map_err(|e| format!("storage quota or permission: {e:?}"))
+    }
+    fn remove(&self, key: &str) -> Result<(), Self::Error> {
+        self.remove_item(key)
+            .map_err(|e| format!("storage delete: {e:?}"))
+    }
+}
 
 #[derive(Default)]
 struct Files {
@@ -85,10 +115,7 @@ pub fn register_asset(name: &str, bytes: Vec<u8>) -> Result<(), String> {
 /// browser data is authoritative over the read-only retail download catalog.
 pub fn finish_mount_and_hydrate() -> Result<(), String> {
     let store = storage().map_err(|e| e.to_string())?;
-    let directories: BTreeSet<String> = match store
-        .get_item(DIRECTORIES_KEY)
-        .map_err(|e| format!("storage directory read: {e:?}"))?
-    {
+    let directories: BTreeSet<String> = match migration::read_directories(&store)? {
         None => BTreeSet::new(),
         Some(text) => {
             serde_json::from_str(&text).map_err(|e| format!("invalid browser directories: {e}"))?
@@ -104,23 +131,7 @@ pub fn finish_mount_and_hydrate() -> Result<(), String> {
         }
     }
     let mut hydrated = BTreeMap::new();
-    for index in 0..store
-        .length()
-        .map_err(|e| format!("storage length: {e:?}"))?
-    {
-        let Some(name) = store
-            .key(index)
-            .map_err(|e| format!("storage key: {e:?}"))?
-        else {
-            continue;
-        };
-        let Some(path) = name.strip_prefix(PREFIX) else {
-            continue;
-        };
-        let value = store
-            .get_item(&name)
-            .map_err(|e| format!("storage read: {e:?}"))?
-            .ok_or_else(|| format!("browser file disappeared: {path}"))?;
+    for (path, value) in migration::read_files(&store)? {
         let file: StoredFile = serde_json::from_str(&value)
             .map_err(|e| format!("invalid persisted file {path}: {e}"))?;
         if key(Path::new(&file.path))
@@ -132,7 +143,7 @@ pub fn finish_mount_and_hydrate() -> Result<(), String> {
         }
         crate::util::base64::base64_decode(&file.base64)
             .map_err(|e| format!("invalid persisted bytes {path}: {e}"))?;
-        hydrated.insert(path.to_string(), file);
+        hydrated.insert(path, file);
     }
     FILES.with(|files| {
         let mut files = files.borrow_mut();
@@ -216,13 +227,8 @@ pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> 
         base64: encode(bytes.as_ref()),
     };
     let serialized = serde_json::to_string(&file).map_err(|e| error(e.to_string()))?;
-    storage()?
-        .set_item(&format!("{PREFIX}{lookup}"), &serialized)
-        .map_err(|e| {
-            error(format!(
-                "could not commit browser file (storage quota or permission): {e:?}"
-            ))
-        })?;
+    migration::write_file(&storage()?, &lookup, &serialized)
+        .map_err(|e| error(format!("could not commit browser file: {e}")))?;
     FILES.with(|files| files.borrow_mut().persistent.insert(lookup, file));
     Ok(())
 }
@@ -243,9 +249,7 @@ pub fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
     if !exists {
         return Err(io::Error::new(ErrorKind::NotFound, lookup));
     }
-    storage()?
-        .remove_item(&format!("{PREFIX}{lookup}"))
-        .map_err(|e| error(format!("storage delete: {e:?}")))?;
+    migration::remove_file(&storage()?, &lookup).map_err(error)?;
     FILES.with(|files| files.borrow_mut().persistent.remove(&lookup));
     Ok(())
 }
@@ -283,9 +287,8 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
         directories.insert(key(ancestor)?);
     }
     let encoded = serde_json::to_string(&directories).map_err(|e| error(e.to_string()))?;
-    storage()?
-        .set_item(DIRECTORIES_KEY, &encoded)
-        .map_err(|e| error(format!("storage directory commit: {e:?}")))?;
+    migration::write_directories(&storage()?, &encoded)
+        .map_err(|e| error(format!("storage directory commit: {e}")))?;
     FILES.with(|files| files.borrow_mut().directories = directories);
     Ok(())
 }

@@ -27,7 +27,7 @@ impl Rasterizer {
     }
 
     pub(super) fn face_names(&self) -> (String, String) {
-        ("Vera UI Medium".into(), "browser system sans-serif".into())
+        ("WERHD UI Medium".into(), "browser system sans-serif".into())
     }
 
     pub(crate) fn glyph(&mut self, codepoint: u16, width: u32) -> Option<Vec<u8>> {
@@ -38,7 +38,7 @@ impl Rasterizer {
         self.canvas.set_width(width);
         self.canvas.set_height(self.rows);
         let context = &self.context;
-        context.set_font(&format!("500 {}px 'Vera UI', sans-serif", self.rows));
+        context.set_font(&format!("500 {}px 'WERHD UI', sans-serif", self.rows));
         context.set_text_baseline("alphabetic");
         let text = ch.to_string();
         let metrics = context.measure_text(&text).ok()?;

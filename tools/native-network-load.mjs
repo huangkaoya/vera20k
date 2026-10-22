@@ -230,7 +230,7 @@ async function health(origin){
   const response=await fetch(new URL('/api/health',origin),{signal:AbortSignal.timeout(20000)});
   requireValue(response.ok,`Health HTTP ${response.status}`);
   const value=await response.json();
-  requireValue(value.ok&&value.app==='werhd-vera-native'&&value.protocol===NATIVE_PROTOCOL,'Origin is not the expected native project/protocol');
+  requireValue(value.ok&&value.app==='werhd-native'&&value.protocol===NATIVE_PROTOCOL,'Origin is not the expected native project/protocol');
   for(const key of ['patchSha256','resourceManifestSha256'])requireValue(/^[a-f0-9]{64}$/.test(value[key]??''),`Health lacks ${key}`);
   requireValue(Object.entries(NATIVE_ROOM_ROUTING).every(([key,expected])=>value.roomRouting?.[key]===expected),'Health shard routing/capacity differs from this probe');
   return value;

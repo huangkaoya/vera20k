@@ -872,19 +872,28 @@ impl App {
                 .to_owned()
         };
         let details = display_error(&error);
-        crate::app::frontend::status_screen::render(
-            state,
-            encoder,
-            view,
-            title,
-            &format!(
-                "VERA20K needs Red Alert 2: Yuri's Revenge to run.\n\n\
+        #[cfg(target_arch = "wasm32")]
+        let instructions = format!(
+            "WERHD could not prepare the game menu.\n\n\
+Refresh this page to retry the verified game-resource download.\n\n\
+Your cached resources and saved settings will be preserved.\n\n\
+Details: {details}"
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let instructions = format!(
+            "VERA20K needs Red Alert 2: Yuri's Revenge to run.\n\n\
 1. Copy vera20k.exe into your Red Alert 2: Yuri's Revenge folder and start it there.\n\n\
 2. Or set [paths] ra2_dir in config.toml, either in the folder you start it from or beside vera20k.exe.\n\n\
 Game files: {asset_root}{path_note}\n\
 Log: logs/ra2.log\n\n\
 Details: {details}"
-            ),
+        );
+        crate::app::frontend::status_screen::render(
+            state,
+            encoder,
+            view,
+            title,
+            &instructions,
             crate::app::frontend::status_screen::Buttons::QUIT,
         );
         Ok(())
@@ -1654,7 +1663,11 @@ Details: {details}"
 
         #[cfg(target_arch = "wasm32")]
         if action == MainMenuShellAction::WwOnline {
-            crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Content, None);
+            crate::app::browser_shell::open(
+                state,
+                crate::app::browser_shell::Surface::Content,
+                None,
+            );
             return;
         }
 
@@ -1704,7 +1717,11 @@ Details: {details}"
             }
             MainMenuShellAction::Network => {
                 #[cfg(target_arch = "wasm32")]
-                crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Lobby, None);
+                crate::app::browser_shell::open(
+                    state,
+                    crate::app::browser_shell::Surface::Lobby,
+                    None,
+                );
                 #[cfg(not(target_arch = "wasm32"))]
                 Self::open_lan_lobby(state);
             }

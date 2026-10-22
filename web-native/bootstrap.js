@@ -2,14 +2,14 @@ import {ContentStore} from './content-store.js';
 import {resolveContentPlan} from './content-plan.js';
 import {createContentController} from './content-controller.js';
 import {createNativeShellBridge} from './shell-bridge.js';
-import {createVeraRuntime} from './runtime-adapter.js';
+import {createWerhdRuntime} from './runtime-adapter.js';
 import {installNativeLobby} from './lobby.js';
 import {installPointerCapture} from './pointer-capture.js';
 import {installMenuAnimationPrefetch} from './menu-animation.js';
 
 const status = document.querySelector('#status'), progress = document.querySelector('#progress');
 const startup = document.querySelector('#startup'), canvas = document.querySelector('#game');
-const actions = document.querySelector('#startup-actions'), selectionKey = 'vera.content.selection.v1';
+const actions = document.querySelector('#startup-actions'), selectionKey = 'werhd.content.selection.v1';
 const controller = new AbortController(), size = bytes => `${(bytes / 1048576).toFixed(1)} MB`;
 let runtime, pointerCapture, menuAnimation, menuAnimationState = {state: 'idle'};
 let initialized = false, cacheWarning = false;
@@ -45,7 +45,15 @@ try {
     || build.contentCatalogIdentity !== catalogIdentity || build.resourceManifestSha256 !== catalog.identity)
     throw new Error('引擎与资源目录版本不一致，请重新载入游戏');
   let selection = {profile: 'skirmish', addons: []};
-  try { const saved = JSON.parse(localStorage.getItem(selectionKey)); if (saved) { resolveContentPlan(catalog, saved); selection = saved; } } catch {}
+  try {
+    const saved = JSON.parse(localStorage.getItem(selectionKey) ?? localStorage.getItem('vera.content.selection.v1'));
+    if (saved) {
+      resolveContentPlan(catalog, saved); selection = saved;
+      // Preserve validated selections across the browser namespace change.
+      localStorage.setItem(selectionKey, JSON.stringify(saved));
+      localStorage.removeItem('vera.content.selection.v1');
+    }
+  } catch {}
   const plan = resolveContentPlan(catalog, selection), store = new ContentStore({onCacheStatus: event => {
     if (['unavailable', 'write-failed'].includes(event.state)) cacheWarning = true;
   }});
@@ -59,22 +67,22 @@ try {
   }});
   shell.attach('content', content);
   actions.append(action('取消下载', () => controller.abort()));
-  Object.defineProperty(window, '__veraContent', {value: Object.freeze({profile: plan.profile, addons: plan.addons,
+  Object.defineProperty(window, '__werhdContent', {value: Object.freeze({profile: plan.profile, addons: plan.addons,
     requiredResourceIdentity: plan.requiredResourceIdentity, catalogIdentity, files: plan.files.length,
     rawBytes: plan.totalBytes, downloadBytes: plan.downloadBytes, capabilities: plan.capabilities})});
-  const engine = build.outputs?.['vera20k_bg.wasm'];
+  const engine = build.outputs?.['werhd_bg.wasm'];
   if (!engine) throw new Error('缺少游戏引擎版本信息');
-  const engineFile = {name: 'vera20k_bg.wasm', ...engine, url: '/native/vera20k_bg.wasm'};
+  const engineFile = {name: 'werhd_bg.wasm', ...engine, url: '/native/werhd_bg.wasm'};
   status.textContent = `正在载入游戏引擎 · ${size(engine.download?.bytes ?? engine.bytes)}`;
   const engineBytes = await store.loadFile(engineFile, {signal: controller.signal, onProgress: event => {
     progress.value = Math.min(1, event.attemptWireBytes / Math.max(1, event.wireTotalBytes));
     status.textContent = event.cacheStatus === 'hit' ? '正在读取已校验的引擎缓存…'
       : `正在载入游戏引擎 ${size(event.attemptWireBytes)} / ${size(event.wireTotalBytes)}`;
   }});
-  runtime = await createVeraRuntime({moduleUrl: `/native/vera20k.js?sha256=${build.outputs['vera20k.js'].sha256}`, engineBytes});
+  runtime = await createWerhdRuntime({moduleUrl: `/native/werhd.js?sha256=${build.outputs['werhd.js'].sha256}`, engineBytes});
   shell.setRuntime(runtime);
   runtime.configureContent(plan.capabilities);
-  const font = new FontFace('Vera UI', 'url(/fonts/FiraSansCondensed-Medium.ttf)', {weight: '500'});
+  const font = new FontFace('WERHD UI', 'url(/fonts/FiraSansCondensed-Medium.ttf)', {weight: '500'});
   document.fonts.add(await font.load());
   let cursor = 0, complete = 0, firstError;
   const progressByFile = new Map();
@@ -103,15 +111,15 @@ try {
   status.textContent = '正在初始化画面…';
   const ready = new Promise((resolve, reject) => {
     const observer = new MutationObserver(() => {
-      if (canvas.dataset.veraStage === 'ready') { observer.disconnect(); resolve(); }
-      else if (canvas.dataset.veraStage === 'error') { observer.disconnect(); reject(new Error(canvas.dataset.veraError ?? '游戏初始化失败')); }
+      if (canvas.dataset.werhdStage === 'ready') { observer.disconnect(); resolve(); }
+      else if (canvas.dataset.werhdStage === 'error') { observer.disconnect(); reject(new Error(canvas.dataset.werhdError ?? '游戏初始化失败')); }
     });
-    observer.observe(canvas, {attributes: true, attributeFilter: ['data-vera-stage', 'data-vera-error']});
+    observer.observe(canvas, {attributes: true, attributeFilter: ['data-werhd-stage', 'data-werhd-error']});
   });
   const lobby = installNativeLobby({native: runtime.network, canvas, onState: state => shell.publish('lobby', state)});
   shell.attach('lobby', lobby);
   runtime.start(canvas);
-  Object.defineProperty(window, '__veraNative', {value: Object.freeze({sourceRevision: runtime.sourceRevision(),
+  Object.defineProperty(window, '__werhdNative', {value: Object.freeze({sourceRevision: runtime.sourceRevision(),
     diagnostics: runtime.diagnostics, networkStatus: runtime.networkStatus,
     pointerCaptureStatus: () => pointerCapture?.snapshot(),
     menuAnimationStatus: () => structuredClone(menuAnimationState)})});

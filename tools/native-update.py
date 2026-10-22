@@ -281,7 +281,7 @@ class NativeUpdate:
             ("browser-presentation", ["node", "--test", "tests/native-pointer-capture.test.mjs", "tests/native-menu-animation.test.mjs"]),
             ("network-latency", ["node", "--test", "tests/native-network-latency.test.mjs"]),
             ("native-network", ["cargo", "test", "--locked", "--manifest-path", "native-client/Cargo.toml", "--lib", "browser_network"]),
-            ("native-browser-input", ["cargo", "test", "--locked", "--manifest-path", "native-client/Cargo.toml", "-p", "vera20k", "-p", "vera20k-core", "--lib", "--", "in_game_options", "mouse_sensitivity", "pointer_resolution_tests", "input::cursor::browser", "app::ios_"]),
+            ("native-browser-input", ["cargo", "test", "--locked", "--manifest-path", "native-client/Cargo.toml", "-p", "vera20k", "-p", "vera20k-core", "--lib", "--", "in_game_options", "mouse_sensitivity", "pointer_resolution_tests", "input::cursor::browser", "app::ios_", "browser_io_migration"]),
             ("wasm-build", ["npm", "run", "build:native-web"]),
         ]
 

@@ -30,17 +30,17 @@ const resources={schema:2,defaultProfile:'skirmish',files:[coreFile],totalBytes:
   packs:{campaign:{files:[],totalBytes:0,downloadBytes:0,dependsOn:['cinematics'],capabilities:{campaign:true},requiresReload:true},
     cinematics:{files:[optionalFile],totalBytes:optionalFile.bytes,downloadBytes:optionalFile.download.bytes,dependsOn:[],capabilities:{movies:true},requiresReload:true}},theaterGroups:[]};
 resources.catalogIdentity=nativeContentCatalogIdentity(resources);
-const wasmFile=contentFile('vera20k_bg.wasm',wasmBytes);
+const wasmFile=contentFile('werhd_bg.wasm',wasmBytes);
 const entry=(file,contentType='application/octet-stream')=>({key:`vera20k/web-native/objects/sha256/${file.sha256}`,bytes:file.bytes,sha256:file.sha256,contentType});
 const object=entry(coreFile);
 const release={schema:1,catalogIdentity:resources.catalogIdentity,
   build:{schema:2,patchSha256:'1'.repeat(64),resourceManifestSha256:resourceIdentity,contentCatalogIdentity:resources.catalogIdentity,
-    outputs:{'vera20k_bg.wasm':{bytes:wasmFile.bytes,sha256:wasmFile.sha256,download:wasmFile.download}}},resources,objects:{}};
+    outputs:{'werhd_bg.wasm':{bytes:wasmFile.bytes,sha256:wasmFile.sha256,download:wasmFile.download}}},resources,objects:{}};
 for(const file of [coreFile,optionalFile]) {
   release.objects[file.url]=entry(file);
   release.objects[file.download.url]=entry(file.download,'application/gzip');
 }
-release.objects['/native/vera20k_bg.wasm']=entry(wasmFile,'application/wasm');
+release.objects['/native/werhd_bg.wasm']=entry(wasmFile,'application/wasm');
 release.objects[wasmFile.download.url]=entry(wasmFile.download,'application/gzip');
 const instrumentedRoomEntry=`
 import worker,{NativeRooms as ActualNativeRooms} from './native-worker.mjs';
@@ -65,12 +65,18 @@ export default {async fetch(request,env){
   if(url.pathname==='/__test/native-connect-fault'){await room.faultConnect();return Response.json({ok:true});}
   return worker.fetch(request,env);
 }};`;
-async function fixture(t,{directObjectName,instrumentRooms=false}={}) {
+async function fixture(t,{directObjectName,instrumentRooms=false,staleEngineAssets=false}={}) {
   // A test-only outer handler can deliberately bypass normal shard routing to
   // exercise the Durable Object's own validation with an intact request URL.
   const entry=instrumentRooms?{stdin:{contents:instrumentedRoomEntry,resolveDir:directory}}:directObjectName?{stdin:{contents:`export {NativeRooms} from './native-worker.mjs';export default {fetch(request,env){return env.NATIVE_ROOMS.getByName(${JSON.stringify(directObjectName)}).fetch(request);}}`,resolveDir:directory}}:{entryPoints:[path.join(directory,'native-worker.mjs')]};
   const output=await build({...entry,bundle:true,format:'esm',write:false,external:['cloudflare:workers'],plugins:[{name:'release-fixture',setup(api){api.onResolve({filter:/generated\/release\.json$/},()=>({path:'release',namespace:'fixture'}));api.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:JSON.stringify(release),loader:'json'}));}}]});
-  const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:output.outputFiles[0].text,compatibilityDate:'2026-10-19',durableObjects:{NATIVE_ROOMS:{className:'NativeRooms',useSQLite:true}},r2Buckets:['NATIVE_DATA'],serviceBindings:{ASSETS:request=>new Response(new URL(request.url).pathname==='/index.html'?'native index':'not found',{status:new URL(request.url).pathname==='/index.html'?200:404})}}));
+  const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:output.outputFiles[0].text,compatibilityDate:'2026-10-19',durableObjects:{NATIVE_ROOMS:{className:'NativeRooms',useSQLite:true}},r2Buckets:['NATIVE_DATA'],serviceBindings:{ASSETS:request=>{
+    const pathname=new URL(request.url).pathname;
+    if(pathname==='/index.html')return new Response('native index');
+    if(pathname==='/native/werhd.js')return new Response('WERHD browser module');
+    if(staleEngineAssets&&['/native/vera20k.js','/native/vera20k_bg.wasm'].includes(pathname))return new Response('stale engine asset');
+    return new Response('not found',{status:404});
+  }}}));
   t.after(()=>mf.dispose());
   const bucket=await mf.getR2Bucket('NATIVE_DATA');
   for(const value of Object.values(release.objects))await bucket.put(value.key,payloads.get(value.sha256),{customMetadata:{sha256:value.sha256},httpMetadata:{contentType:value.contentType,...(value.contentType==='application/gzip'?{contentEncoding:'gzip'}:{})}});
@@ -82,13 +88,29 @@ test('Worker serves locked resource manifest and streams full/range/HEAD/conditi
   const full=await mf.dispatchFetch('https://game.test'+coreFile.url);assert.equal(full.status,200);assert.deepEqual(new Uint8Array(await full.arrayBuffer()),bytes);
   const range=await mf.dispatchFetch('https://game.test'+coreFile.url,{headers:{Range:'bytes=7-12'}});assert.equal(range.status,206);assert.equal(range.headers.get('Content-Range'),`bytes 7-12/${bytes.length}`);assert.equal(await range.text(),new TextDecoder().decode(bytes.slice(7,13)));
   const suffix=await mf.dispatchFetch('https://game.test'+coreFile.url,{headers:{Range:'bytes=-7'}});assert.equal(suffix.status,206);assert.equal((await suffix.arrayBuffer()).byteLength,7);
-  const head=await mf.dispatchFetch('https://game.test/native/vera20k_bg.wasm',{method:'HEAD'});assert.equal(head.headers.get('Content-Type'),'application/wasm');assert.equal(head.headers.get('Content-Length'),String(wasmBytes.length));assert.equal((await head.arrayBuffer()).byteLength,0);
+  const head=await mf.dispatchFetch('https://game.test/native/werhd_bg.wasm',{method:'HEAD'});assert.equal(head.headers.get('Content-Type'),'application/wasm');assert.equal(head.headers.get('Content-Length'),String(wasmBytes.length));assert.equal((await head.arrayBuffer()).byteLength,0);
   assert.equal((await mf.dispatchFetch('https://game.test'+coreFile.url,{headers:{Range:'bytes=999-'}})).status,416);
   assert.equal((await mf.dispatchFetch('https://game.test'+coreFile.url,{headers:{'If-None-Match':`"${object.sha256}"`}})).status,304);
   assert.equal((await mf.dispatchFetch('https://game.test'+coreFile.url+'?sha256=wrong')).status,404);
   assert.equal((await mf.dispatchFetch('https://game.test/retail/ra2md.ini')).status,404);
   assert.equal((await mf.dispatchFetch('https://game.test'+coreFile.url,{method:'POST'})).status,405);
   assert.equal((await mf.dispatchFetch('https://game.test/')).status,200);
+});
+test('public engine routes use WERHD names and reject legacy aliases even in stale static assets',async t=>{
+  const {mf}=await fixture(t,{staleEngineAssets:true});
+  assert.equal((await mf.dispatchFetch('https://game.test/native/werhd.js')).status,200);
+  assert.equal((await mf.dispatchFetch('https://game.test/native/werhd_bg.wasm',{method:'HEAD'})).status,200);
+  for(const path of ['/native/vera20k.js','/native/vera20k_bg.wasm','/native/vera20k.js?sha256='+wasmFile.sha256,
+    '/native/%76era20k.js','/native/werhd.js.map','/native/unknown.js'])
+    assert.equal((await mf.dispatchFetch('https://game.test'+path)).status,404,path);
+  for(const path of ['/api/health','/native/build.json','/api/native/resources']) {
+    const response=await mf.dispatchFetch('https://game.test'+path),text=await response.text();
+    assert.doesNotMatch(text,/vera20k|\bvera\b/i,path);
+    assert.equal(text.includes('objectPrefix'),false,path);
+    assert.equal(text.includes('youlidefuchou-res'),false,path);
+    assert.equal(JSON.stringify([...response.headers]).includes('vera20k/web-native'),false,path);
+    if(path==='/api/health')assert.equal(JSON.parse(text).app,'werhd-native');
+  }
 });
 test('Worker fails closed when stored object metadata differs from the release',async t=>{
   const {mf,bucket}=await fixture(t);await bucket.put(object.key,bytes,{customMetadata:{sha256:'0'.repeat(64)}});
@@ -138,13 +160,24 @@ test('release plan rejects stale catalog/build, missing transfer objects and div
   for(const mutate of [input=>{input.build.contentCatalogIdentity='0'.repeat(64);},
     input=>{input.build.resourceManifestSha256='0'.repeat(64);},
     input=>{input.index.objects.delete(optionalFile.download.sha256);},
-    input=>{input.build.outputs['vera20k_bg.wasm'].download.encoding='identity';}]) {
+    input=>{input.build.outputs['werhd_bg.wasm'].download.encoding='identity';}]) {
     const input=planningFixture();mutate(input);assert.throws(()=>nativeReleaseObjects(input));
   }
   const input=planningFixture();input.index.manifest.profiles.full.requiredResourceIdentity='0'.repeat(64);
   input.index.manifest.catalogIdentity=nativeContentCatalogIdentity(input.index.manifest);
   input.build.contentCatalogIdentity=input.index.manifest.catalogIdentity;
   assert.throws(()=>nativeReleaseObjects(input),/gameplay identity/);
+});
+test('release planning and verification reject legacy public branding without changing private R2 identity',()=>{
+  for(const field of ['renderer','legacyOutput']) {
+    const input=planningFixture();
+    if(field==='renderer')input.build.renderer='VERA wgpu/WebGPU';
+    else input.build.outputs['vera20k.js']={bytes:1,sha256:'0'.repeat(64)};
+    assert.throws(()=>nativeReleaseObjects(input),/legacy engine name/);
+    const value=structuredClone(release);value.build=input.build;
+    assert.throws(()=>validateRelease(value),/WERHD names/);
+  }
+  assert.equal(nativeReleaseObjects(planningFixture()).release.deployment.objectPrefix,'vera20k/web-native/objects/sha256/');
 });
 test('post-deployment release gate validates layered coverage without assuming files plus one',()=>{
   const checked=validateRelease(release);
@@ -158,7 +191,7 @@ test('post-deployment release gate rejects catalog drift, optional gaps and miss
   for(const mutate of [value=>{value.resources.packs.campaign.dependsOn=[];},
     value=>{delete value.objects[optionalFile.url];},value=>{delete value.objects[wasmFile.download.url];},
     value=>{value.build.contentCatalogIdentity='0'.repeat(64);},
-    value=>{value.build.outputs['vera20k_bg.wasm'].download.encoding='identity';}]) {
+    value=>{value.build.outputs['werhd_bg.wasm'].download.encoding='identity';}]) {
     const value=structuredClone(release);mutate(value);assert.throws(()=>validateRelease(value));
   }
   const value=structuredClone(release);

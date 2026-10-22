@@ -1,6 +1,6 @@
 // The current native presentation is an adapter behind this boundary. Content
 // download/cache code and a future lobby do not import wasm-bindgen exports.
-export async function createVeraRuntime({moduleUrl, engineBytes, importModule = url => import(url)}) {
+export async function createWerhdRuntime({moduleUrl, engineBytes, importModule = url => import(url)}) {
   if (!moduleUrl || !(engineBytes instanceof Uint8Array)) throw new Error('缺少已校验的游戏引擎');
   const native = await importModule(moduleUrl);
   await native.default({module_or_path: engineBytes});

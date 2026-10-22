@@ -204,7 +204,7 @@ fn emit(surface: Surface, mut action: Value) {
         let init = web_sys::CustomEventInit::new();
         init.set_detail(&detail);
         if let Ok(event) =
-            web_sys::CustomEvent::new_with_event_init_dict("vera-shell-action", &init)
+            web_sys::CustomEvent::new_with_event_init_dict("werhd-shell-action", &init)
         {
             let _ = window.dispatch_event(&event);
         }

@@ -11,6 +11,8 @@ const directory=path.dirname(fileURLToPath(import.meta.url)),root=path.resolve(d
  * Physical paths belong only to the local upload plan, never the public release.
  */
 export function nativeReleaseObjects({build,index,target,root}) {
+  if(/vera20k|\bvera\b/i.test(JSON.stringify(build))||/vera20k|\bvera\b/i.test(JSON.stringify(index.manifest)))
+    throw new Error('Public WERHD build/catalog still contains a legacy engine name; rebuild before packaging');
   const resourceManifestSha256=nativeAssetManifestIdentity(index.manifest);
   const catalogIdentity=nativeContentCatalogIdentity(index.manifest);
   if(index.manifest.schema!==2||index.manifest.defaultProfile!=='skirmish'||
@@ -21,7 +23,7 @@ export function nativeReleaseObjects({build,index,target,root}) {
   function object(file,pathname,bytes,sha256,contentType) {
     if(typeof file!=='string'||!path.isAbsolute(file)||!Number.isSafeInteger(bytes)||bytes<0||
       !/^[a-f0-9]{64}$/.test(sha256)||!['application/octet-stream','application/gzip','application/wasm','video/mp4'].includes(contentType)||
-      !(pathname==='/native/vera20k_bg.wasm'||pathname===`/content/objects/${sha256}`))
+      !(pathname==='/native/werhd_bg.wasm'||pathname===`/content/objects/${sha256}`))
       throw new Error('Invalid immutable native content object');
     const key=target.objectPrefix+sha256;
     const entry={key,bytes,sha256,contentType},prior=objects[pathname];
@@ -51,9 +53,9 @@ export function nativeReleaseObjects({build,index,target,root}) {
   }
   for(const pack of Object.values(index.manifest.packs??{}))pack.files.forEach(checkFile);
   if(!index.manifest.profiles?.full||!index.manifest.profiles?.skirmish)throw new Error('Content profiles are incomplete');
-  const wasm=build.outputs?.['vera20k_bg.wasm'];
+  const wasm=build.outputs?.['werhd_bg.wasm'];
   if(!wasm)throw new Error('Native build has no WASM output');
-  object(path.join(root,'public/native/vera20k_bg.wasm'),'/native/vera20k_bg.wasm',wasm.bytes,wasm.sha256,'application/wasm');
+  object(path.join(root,'public/native/werhd_bg.wasm'),'/native/werhd_bg.wasm',wasm.bytes,wasm.sha256,'application/wasm');
   const wire=wasm.download;
   if(!wire||wire.encoding!=='gzip'||wire.url!==`/content/objects/${wire.sha256}`)
     throw new Error('Native build has no valid compressed WASM transfer');
@@ -80,6 +82,8 @@ export async function prepareNative() {
   async function copy(file,relative) {
     const stat=await fs.lstat(file);
     if(!stat.isFile()||stat.isSymbolicLink()||stat.size>25*1024*1024)throw new Error(`Static asset must be a regular file <=25MiB: ${relative}`);
+    if(relative.endsWith('.js')&&/vera20k/i.test(await fs.readFile(file,'utf8')))
+      throw new Error(`Public JavaScript contains a legacy engine name: ${relative}`);
     const target=path.join(assets,relative);await fs.mkdir(path.dirname(target),{recursive:true});await fs.copyFile(file,target);
     smallFiles.push({path:relative,bytes:stat.size});
   }
@@ -93,7 +97,7 @@ export async function prepareNative() {
     }
   }
   await copyTree(path.join(root,'web-native'));
-  await copy(path.join(root,'public/native/vera20k.js'),'native/vera20k.js');
+  await copy(path.join(root,'public/native/werhd.js'),'native/werhd.js');
   await copy(path.join(root,'public/native/build.json'),'native/build.json');
   await copy(path.join(root,'native-client/art/branding/wannafire-app-icon.png'),'branding/icon.png');
   for(const name of ['FiraSansCondensed-Medium.ttf','FiraSansCondensed-OFL'])await copy(path.join(root,'native-client/art/fonts',name),'fonts/'+name);

@@ -138,11 +138,16 @@ export default {
         return env.NATIVE_ROOMS.getByName(nativeRoomObjectName(shard)).fetch(request);
       }
       if(!methodAllowed(request))return new Response(null,{status:405,headers:{Allow:'GET, HEAD'}});
-      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,roomRouting:NATIVE_ROOM_ROUTING,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
+      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-native',protocol:NATIVE_PROTOCOL,roomRouting:NATIVE_ROOM_ROUTING,renderer:'WERHD wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
       if(url.pathname==='/api/native/resources')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.resources);
       if(url.pathname==='/native/build.json')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.build);
       let pathname;
       try{pathname=decodeURIComponent(url.pathname);}catch{return json({error:'Invalid path'},400);}
+      // Public engine names are WERHD-only. A stale static directory or release
+      // must not resurrect an earlier JS/WASM filename or a source map.
+      if(pathname.toLowerCase().startsWith('/native/')
+        &&!['/native/werhd.js','/native/werhd_bg.wasm','/native/build.json'].includes(pathname))
+        return json({error:'Route not exposed'},404);
       const key=pathname.startsWith('/retail/')?pathname.toLowerCase():pathname;
       const entry=Object.hasOwn(release.objects,key)?release.objects[key]:null;
       if(entry)return objectResponse(request,env,entry);

@@ -24,7 +24,9 @@ const deadline = (promise, label, milliseconds = TIMEOUT) => {
 export function validateRelease(release) {
   assert.equal(release?.schema, 1, 'Release schema');
   assert.equal(release.build?.schema, 2, 'Build schema');
+  assert.doesNotMatch(JSON.stringify(release.build), /vera20k|\bvera\b/i, 'Public build uses WERHD names');
   const resources = release.resources;
+  assert.doesNotMatch(JSON.stringify(resources), /vera20k|\bvera\b/i, 'Public catalog uses WERHD names');
   assert.equal(resources?.schema, 2, 'Layered content catalog schema');
   assert.equal(resources.defaultProfile, 'skirmish', 'Default content profile');
   const resourceIdentity = nativeAssetManifestIdentity(resources);
@@ -85,8 +87,8 @@ export function validateRelease(release) {
   assert.ok(packs && typeof packs === 'object' && !Array.isArray(packs), 'Optional content packs');
   for (const [name, pack] of Object.entries(packs)) group(pack, `Pack ${name}`);
 
-  const wasmOutput = release.build.outputs?.['vera20k_bg.wasm'];
-  const wasm = descriptor('/native/vera20k_bg.wasm', wasmOutput, 'WASM raw');
+  const wasmOutput = release.build.outputs?.['werhd_bg.wasm'];
+  const wasm = descriptor('/native/werhd_bg.wasm', wasmOutput, 'WASM raw');
   assert.ok(wasm.bytes >= 8, 'WASM raw header extent');
   assert.equal(wasm.contentType, 'application/wasm', 'WASM raw object MIME');
   const wasmDownload = wasmOutput.download;
@@ -378,12 +380,21 @@ async function main() {
     const http = createHttp(origin);
     stage = 'health';
     const health = await http.json('/api/health');
-    assert.ok(health.ok && health.app === 'werhd-vera-native' && health.protocol === 3, 'Native service health/protocol');
+    assert.ok(health.ok && health.app === 'werhd-native' && health.protocol === 3, 'Native service health/protocol');
     assert.equal(health.patchSha256, release.build.patchSha256, 'Published native patch');
     assert.equal(health.resourceManifestSha256, resourceIdentity, 'Published native resources');
     assert.equal(health.contentCatalogIdentity, catalogIdentity, 'Published native catalog');
     report.checks.health = true;
     stage = 'build'; equal(await http.json('/native/build.json'), release.build, 'Published build identity'); report.checks.build = true;
+    stage = 'engine-routes';
+    const script = await deadline(http.request('/native/werhd.js', {method: 'HEAD'}), 'WERHD JS route');
+    assert.equal(script.status, 200, 'WERHD JS route is published');
+    assert.ok(['text/javascript', 'application/javascript'].includes(mime(script)), 'WERHD JS MIME');
+    for (const pathname of ['/native/vera20k.js', '/native/vera20k_bg.wasm']) {
+      const legacy = await deadline(http.request(pathname, {method: 'HEAD'}), 'Retired engine route');
+      assert.equal(legacy.status, 404, 'Retired engine route has no compatibility alias');
+    }
+    report.checks.werhdEngineRoutes = true;
     stage = 'resources';
     const resources = await http.json('/api/native/resources');
     assert.equal(resources.schema, 2, 'Published layered content catalog');
@@ -395,7 +406,7 @@ async function main() {
     equal(resources, release.resources, 'Published resource URLs and manifest');
     report.checks.resourceManifest = true;
     stage = 'object-heads'; report.checks.objectHeads = await objectHeads(http, release.objects);
-    stage = 'wasm-range'; await http.wasmHeader('/native/vera20k_bg.wasm', wasm); report.checks.wasmHeader = true;
+    stage = 'wasm-range'; await http.wasmHeader('/native/werhd_bg.wasm', wasm); report.checks.wasmHeader = true;
     stage = 'wasm-gzip-range'; await http.gzipHeader(wasmDownload.url, wasmDownload); report.checks.wasmGzipHeader = true;
     report.httpBodyBytes = http.downloadedBytes;
     stage = 'websocket-transport'; report.checks.webSocket = await transportProbe(origin, release);

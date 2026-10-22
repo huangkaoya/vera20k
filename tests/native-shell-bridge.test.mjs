@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createNativeShellBridge} from '../web-native/shell-bridge.js';
 
-function event(detail) { const value = new Event('vera-shell-action'); value.detail = detail; return value; }
+function event(detail) { const value = new Event('werhd-shell-action'); value.detail = detail; return value; }
 test('hidden shell bridge queues detached snapshots before the native runtime and routes semantic actions', () => {
   const target = new EventTarget(), updates = [], commands = [], failures = [];
   const bridge = createNativeShellBridge({eventTarget: target, onError: error => failures.push(error)});

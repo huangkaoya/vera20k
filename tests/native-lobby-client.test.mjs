@@ -50,7 +50,7 @@ function fixture(t) {
     async start(matchId = 'MATCH-1') {
       await controller.dispatch({action: 'open'}); const creating = controller.dispatch({action: 'create'}); const socket = sockets.at(-1); socket.open(); await creating;
       socket.receive({type: 'start', matchId, playerIndex: 1, config: {map: 'XMP29U2.MAP'}});
-      event('vera-native-network-started'); assert.equal(states.at(-1).open, false); return socket;
+      event('werhd-native-network-started'); assert.equal(states.at(-1).open, false); return socket;
     },
   };
 }
@@ -124,7 +124,7 @@ test('a native-confirmed result keeps its page after socket errors and close', a
   const f = fixture(t), socket = await f.start();
   socket.receive(result()); socket.receive({type: 'room', room: null});
   socket.receive({type: 'error', error: 'late transport error'}); socket.error(); socket.disconnect();
-  f.event('vera-native-network-service');
+  f.event('werhd-native-network-service');
   assert.equal(f.current.open, false); assert.equal(stopped(f).length, 0);
 });
 
@@ -133,14 +133,14 @@ test('close between ACK delivery and native validation waits for the actual fini
   f.setStatus({matchId: 'MATCH-1', phase: 'finishing'});
   socket.receive(result()); socket.disconnect(); assert.equal(f.current.open, false);
   f.setStatus({matchId: 'MATCH-1', phase: 'finished', finishedTick: 8340, hash: result().checksum});
-  f.event('vera-native-network-service'); assert.equal(f.current.open, false); assert.equal(stopped(f).length, 0);
+  f.event('werhd-native-network-service'); assert.equal(f.current.open, false); assert.equal(stopped(f).length, 0);
 });
 
 test('an ACK later rejected by native validation still reports failure', async t => {
   const f = fixture(t), socket = await f.start(); f.deferAck();
   socket.receive(result()); socket.disconnect();
   f.setStatus({matchId: 'MATCH-1', phase: 'stopped', error: 'result checksum differs'});
-  f.event('vera-native-network-service');
+  f.event('werhd-native-network-service');
   assert.equal(f.current.open, true); assert.match(f.current.error, /result checksum differs/); assert.equal(stopped(f).length, 1);
 });
 
@@ -152,7 +152,7 @@ test('unacknowledged or wrong-match disconnects still stop the live match', asyn
 
 test('Continue clears completion and old socket epochs cannot protect a new unfinished match', async t => {
   const f = fixture(t), old = await f.start(); old.receive(result());
-  f.event('vera-native-network-return');
+  f.event('werhd-native-network-return');
   const current = await f.start('MATCH-2');
   old.receive(result()); old.error(); old.disconnect();
   assert.equal(f.current.open, false); assert.equal(stopped(f).length, 0);
@@ -216,10 +216,10 @@ test('the initial native barrier retains early messages and relays exact outbox 
     {type: 'turn', matchId: 'BARRIER', tick: 1, commands: []}];
   for (const message of early) socket.receive(message);
   assert.equal(f.calls.filter(([type]) => type === 'receive').length, 0);
-  f.event('vera-native-network-started'); assert.equal(f.current.phase, 'battle'); assert.equal(f.current.open, false);
+  f.event('werhd-native-network-started'); assert.equal(f.current.phase, 'battle'); assert.equal(f.current.open, false);
   assert.deepEqual(f.calls.filter(([type]) => type === 'receive').map(([, message]) => message), early);
   const receipt = {type: 'loaded', matchId: 'BARRIER', tick: 0, hash: 'diagnostic', owners: ['A', 'B'], build: 'pinned'};
-  f.emit(receipt); const snapshots = f.states.length; f.event('vera-native-network-service');
+  f.emit(receipt); const snapshots = f.states.length; f.event('werhd-native-network-service');
   assert.deepEqual(socket.sent.at(-1), receipt); assert.equal(f.states.length, snapshots, 'transport turns never redraw a shell');
   f.document.hidden = true; f.document.dispatchEvent(new Event('visibilitychange'));
   assert.equal([...f.timers.values()].at(-1).ms, 100);
@@ -232,14 +232,14 @@ test('closing or disposing during connect suppresses stale callbacks, sends and 
   assert.equal(old.sent.length, 0); assert.equal(f.states.length, snapshots); assert.equal(f.current.error, '');
   await f.controller.dispatch('open'); const joining = f.controller.dispatch({action: 'join', code: 'ABC123'}), current = f.sockets.at(-1);
   f.controller.dispose(); assert.equal(await joining, false); const disposedSnapshots = f.states.length;
-  current.open(); current.receive({type: 'room', room: room()}); f.event('vera-native-network'); await flush();
+  current.open(); current.receive({type: 'room', room: room()}); f.event('werhd-native-network'); await flush();
   assert.equal(f.states.length, disposedSnapshots); assert.equal(f.timers.size, 0);
 });
 
 test('a confirmed finished snapshot publishes once while preserving native result and return semantics', async t => {
-  const f = fixture(t), socket = await f.start(); socket.receive(result()); f.event('vera-native-network-service');
+  const f = fixture(t), socket = await f.start(); socket.receive(result()); f.event('werhd-native-network-service');
   assert.equal(f.current.phase, 'finished'); assert.equal(f.current.open, false); const snapshots = f.states.length;
-  f.event('vera-native-network-service'); f.event('vera-native-network-service'); assert.equal(f.states.length, snapshots);
+  f.event('werhd-native-network-service'); f.event('werhd-native-network-service'); assert.equal(f.states.length, snapshots);
   await f.controller.dispatch('returnMenu'); assert.deepEqual(f.calls.at(-1), ['leave', 'MATCH-1']);
-  f.event('vera-native-network-return'); assert.equal(f.current.phase, 'entry'); assert.equal(f.current.matchId, null); assert.equal(f.current.open, false);
+  f.event('werhd-native-network-return'); assert.equal(f.current.phase, 'entry'); assert.equal(f.current.matchId, null); assert.equal(f.current.open, false);
 });

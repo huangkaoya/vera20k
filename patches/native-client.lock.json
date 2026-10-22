@@ -5,7 +5,7 @@
   "baselineModes": {},
   "patch": {
     "path": "patches/native-client.patch",
-    "sha256": "7bbc9f690ed9124f5c9305db06d241a366be1f77778503483f677a88ac643743"
+    "sha256": "e20cd9a0d953b18f3d22cd891006806d62d4107fba275e4ff52be9daadc8d3ef"
   },
   "files": {
     "Cargo.lock": {
@@ -37,7 +37,7 @@
       "mode": "100644"
     },
     "src/app/browser.rs": {
-      "sha256": "2c43cd470051a7bf26f6c7d26e1e14af58e8dc92a992ebc9bbfb25668671d4ce",
+      "sha256": "a13e7ce4cf7cbb481c99890ef075b35fe1862acc85156d6bfcf060ad7ff55306",
       "mode": "100644"
     },
     "src/app/browser/network_launch.rs": {
@@ -53,7 +53,7 @@
       "mode": "100644"
     },
     "src/app/browser_shell.rs": {
-      "sha256": "c99bfb36db218c8799a39beb61eaf00caa14c24823aa7709a61ed9c01692fc55",
+      "sha256": "5f3a190bf0f637a0761885129e1270e527270cfe94a856972c8419a7d1291cce",
       "mode": "100644"
     },
     "src/app/browser_shell/content.rs": {
@@ -212,6 +212,10 @@
       "sha256": "00b06e9bc785c0233321bf2763d7fb9a73f48ba23c691acadeed3e45211617e1",
       "mode": "100644"
     },
+    "src/app/frontend/status_screen.rs": {
+      "sha256": "d80c6ed017a17e545a098afe191fe6a799de1d89a4977b9a1cf3650aeb758000",
+      "mode": "100644"
+    },
     "src/app/frontend/wol_welcome_render.rs": {
       "sha256": "c44066b63bcdec7a234118846632a1fc7209c2a5da880ea533614bacea435cda",
       "mode": "100644"
@@ -365,7 +369,7 @@
       "mode": "100644"
     },
     "src/app/mod.rs": {
-      "sha256": "3d088bea4d7ba2480eb9b83c897c69139742a5a9cdabb65111a08f3b653b6681",
+      "sha256": "325de998937e82b09ef057f5db98801433074f8a48c413c6833c8681fc8d6884",
       "mode": "100644"
     },
     "src/app/movie_playback.rs": {
@@ -481,7 +485,7 @@
       "mode": "100644"
     },
     "src/app/shell_main_menu.rs": {
-      "sha256": "a6ed398ae5c5ddc89b631d71a23d5a2994735b5a2fbbbd5fccb8b98b3e79e548",
+      "sha256": "c12fa13dacc7a8cd99ec0c2c22e07c17e673492fa19bdd551e3fe201fe7d0b7e",
       "mode": "100644"
     },
     "src/app/shell_movies_credits.rs": {
@@ -685,7 +689,7 @@
       "mode": "100644"
     },
     "src/render/bit_font_web.rs": {
-      "sha256": "68fff737fec4fabf6ab9bacfbfc2f884973663d80a4fc400a5dd990c37999112",
+      "sha256": "37c2296d2cb4cf951e25434ecea342623eab7f3cb2a6c7da3b26ba657138ad6f",
       "mode": "100644"
     },
     "src/render/depth_gpu_tests.rs": {
@@ -808,6 +812,10 @@
       "sha256": "ade8bbc2724486679704737cf894df2eec682dc107b562e38d5192992e424a58",
       "mode": "100644"
     },
+    "src/ui/main_menu_dialogs/options.rs": {
+      "sha256": "598b419ea67a2d127f9f80bce213af297bfa3333c7a0d9f4bbfa532456603a95",
+      "mode": "100644"
+    },
     "src/ui/movies_credits_shell/movie_list.rs": {
       "sha256": "79c218f08c717087283d383ebaf20acf2c58ce23f3946e2a059e1a401c319fd4",
       "mode": "100644"
@@ -905,7 +913,11 @@
       "mode": "100644"
     },
     "src/util/browser_io.rs": {
-      "sha256": "299c5ca5a585a05614e24a6d5a448376f0e372e4d8ff49cfab41b411046320e7",
+      "sha256": "b0d41547bd31d8b821fcad37840bbc3fd2d487693458719d4064c6b649a4aa8b",
+      "mode": "100644"
+    },
+    "src/util/browser_io_migration.rs": {
+      "sha256": "3384bcdb04d042c67acc9becea17a7c17547d02c09a9bac046a92bd73c0b4baa",
       "mode": "100644"
     },
     "src/util/browser_menu_media.rs": {
@@ -929,7 +941,7 @@
       "mode": "100644"
     },
     "src/util/mod.rs": {
-      "sha256": "b7256663bd17af796304c4231ec65acd2092b1b57ac6761122986b630a003ca1",
+      "sha256": "5e8afa4197435123ca7a2cfe6f741545610a97cedd586842824e02d04ee2502a",
       "mode": "100644"
     },
     "src/util/native_file_name.rs": {
@@ -937,7 +949,7 @@
       "mode": "100644"
     },
     "src/web_entry.rs": {
-      "sha256": "10f2c2605f8d4bb3ddeb2c39b4f99794108fafed63ac04e5b8c1de33810c6f00",
+      "sha256": "24d96775ff024a582699dab2087cc80837742068b14debbd766aca3881f2f847",
       "mode": "100644"
     }
   }

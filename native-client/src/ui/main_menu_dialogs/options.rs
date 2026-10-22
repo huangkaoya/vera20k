@@ -81,7 +81,14 @@ pub(crate) const FPS_COUNTER_HELP: &str = "Show frames per second in the top-lef
 pub(crate) const SHIFT_QUEUE_HELP: &str =
     "Shift-click an infantry, vehicle or aircraft cameo to queue several at once.";
 /// The main page's button to VERA's page, and that page's heading.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const VERA_OPTIONS_LABEL: &str = "WERHD Options";
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const VERA_OPTIONS_LABEL: &str = "VERA20K Options";
+#[cfg(target_arch = "wasm32")]
+pub(crate) const VERA_OPTIONS_HELP: &str =
+    "Settings WERHD adds: full screen, sidebar size, smooth motion and more.";
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const VERA_OPTIONS_HELP: &str =
     "Settings VERA20K adds: full screen, sidebar size, smooth motion and more.";
 /// The VERA page's Back reuses retail's caption; its status help is the

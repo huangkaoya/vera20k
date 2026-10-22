@@ -4,6 +4,16 @@ use wasm_bindgen::prelude::*;
 
 struct BrowserLogger;
 static LOGGER: BrowserLogger = BrowserLogger;
+
+// Keep upstream format identities unchanged while presenting the product's
+// name in browser diagnostics and panic messages.
+fn browser_message(message: String) -> String {
+    message
+        .replace("VERA20K", "WERHD")
+        .replace("VERA20k", "WERHD")
+        .replace("Vera20k", "WERHD")
+        .replace("vera20k", "werhd")
+}
 impl log::Log for BrowserLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= log::Level::Info
@@ -12,7 +22,11 @@ impl log::Log for BrowserLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let message = JsValue::from_str(&format!("[VERA {}] {}", record.level(), record.args()));
+        let message = JsValue::from_str(&browser_message(format!(
+            "[WERHD {}] {}",
+            record.level(),
+            record.args()
+        )));
         match record.level() {
             log::Level::Error => web_sys::console::error_1(&message),
             log::Level::Warn => web_sys::console::warn_1(&message),
@@ -27,7 +41,7 @@ pub fn initialize_browser_module() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
     std::panic::set_hook(Box::new(|panic| {
-        let error = js_sys::Error::new(&panic.to_string());
+        let error = js_sys::Error::new(&browser_message(panic.to_string()));
         web_sys::console::error_1(&error);
     }));
 }

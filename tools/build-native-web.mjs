@@ -4,7 +4,7 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {nativeSourceIdentity,writeNativeBuildManifest,nativeAssetManifestIdentity,readNativeContentIndex} from './native-build-manifest.mjs';
+import {nativeSourceIdentity,writeNativeBuildManifest,nativeAssetManifestIdentity,readNativeContentIndex,removeLegacyNativeOutputs} from './native-build-manifest.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 function run(command,args,extra={}) {
   return new Promise((resolve,reject)=>{
@@ -32,7 +32,13 @@ if(version!=='wasm-bindgen 0.2.114')throw new Error('Native web build requires w
 const rustc=(await promisify(execFile)('rustc',['--version'])).stdout.trim();
 await run('cargo',['rustc','--locked','--manifest-path','native-client/Cargo.toml','--target','wasm32-unknown-unknown','--profile',profile,'--lib','--','-C','link-arg=-zstack-size=16777216']);
 await fs.mkdir(path.join(root,'public/native'),{recursive:true});
-await run(bindgen,[path.join(root,'.build/cargo/wasm32-unknown-unknown',profile==='dev'?'debug':profile,'vera20k.wasm'),'--target','web','--out-dir',path.join(root,'public/native'),'--out-name','vera20k']);
+// The Cargo crate name stays pinned to upstream internally. Public filenames
+// and browser debug metadata use only the product's WERHD identity.
+await run(bindgen,[path.join(root,'.build/cargo/wasm32-unknown-unknown',profile==='dev'?'debug':profile,'vera20k.wasm'),
+  '--target','web','--out-dir',path.join(root,'public/native'),'--out-name','werhd',
+  '--remove-name-section','--remove-producers-section']);
 // A long Rust build must not certify source that was edited after preflight.
 if(sourceChecked)await nativeSourceIdentity({root,sourceCheck:true});
-await writeNativeBuildManifest({root,profile,source,sourceChecked,resourceManifestSha256,contentCatalogIdentity:content.manifest.catalogIdentity,tools:{rustc,wasmBindgen:version,stackBytes:16777216}});
+await removeLegacyNativeOutputs({root});
+await writeNativeBuildManifest({root,profile,source,sourceChecked,resourceManifestSha256,contentCatalogIdentity:content.manifest.catalogIdentity,
+  tools:{rustc,wasmBindgen:version,stackBytes:16777216,wasmMetadata:{nameSection:false,producersSection:false,dwarf:false}}});

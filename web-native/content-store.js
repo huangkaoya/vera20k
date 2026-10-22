@@ -1,6 +1,10 @@
 // Binary content delivery is independent of the engine, lobby and installed
 // game modes. Descriptors identify raw bytes; download describes the wire form.
-const CACHE_NAME = 'vera-native-content-v1';
+const CACHE_NAME = 'werhd-native-content-v1';
+// Read-only compatibility lookup for already-installed bytes. These legacy
+// names are never used for new downloads or exposed resource URLs.
+const LEGACY_CACHE_NAME = 'vera-native-content-v1';
+const LEGACY_CACHE_PATH = '/.vera-content-cache/v1/';
 const MAX_FILE_BYTES = 1024 ** 3;
 
 export class ContentError extends Error {
@@ -44,7 +48,7 @@ function describe(file, maxFileBytes) {
 
 export class ContentStore {
   constructor({cacheStorage = globalThis.caches, fetch = globalThis.fetch?.bind(globalThis), crypto = globalThis.crypto,
-    cacheName = CACHE_NAME, baseUrl = globalThis.location?.href ?? 'https://vera-content.invalid/', retries = 1,
+    cacheName = CACHE_NAME, baseUrl = globalThis.location?.href ?? 'https://werhd-content.invalid/', retries = 1,
     retryDelayMs = 250, maxFileBytes = MAX_FILE_BYTES, onCacheStatus} = {}) {
     if (typeof fetch !== 'function' || !crypto?.subtle) throw new ContentError('Fetch and Web Crypto are required');
     if (!Number.isSafeInteger(retries) || retries < 0 || retries > 3 || !Number.isFinite(retryDelayMs) || retryDelayMs < 0 || !Number.isSafeInteger(maxFileBytes) || maxFileBytes < 0 || maxFileBytes > MAX_FILE_BYTES) throw new ContentError('Invalid content store limits');
@@ -53,7 +57,7 @@ export class ContentStore {
     this.statuses = new Map(); this.writers = new Map();
   }
   cacheStatus(file) { return this.statuses.get(typeof file === 'string' ? file.toLowerCase() : file.sha256?.toLowerCase()) ?? 'unknown'; }
-  key(file) { return new URL(`/.vera-content-cache/v1/${file.sha256}`, this.baseUrl).href; }
+  key(file) { return new URL(`/.werhd-content-cache/v1/${file.sha256}`, this.baseUrl).href; }
   async digest(bytes) { return Array.from(new Uint8Array(await this.crypto.subtle.digest('SHA-256', bytes)), byte => byte.toString(16).padStart(2, '0')).join(''); }
   async cache() {
     if (!this.cachePromise) this.cachePromise = (async () => {
@@ -61,6 +65,21 @@ export class ContentStore {
       catch { this.cacheAvailable = false; return null; }
     })();
     return this.cachePromise;
+  }
+  async legacyCache(context) {
+    if (this.cacheName !== CACHE_NAME || typeof this.cacheStorage?.open !== 'function') return null;
+    try {
+      let exists = false;
+      if (typeof this.cacheStorage.has === 'function')
+        exists = await activeAwait(this.cacheStorage.has(LEGACY_CACHE_NAME), context);
+      else if (typeof this.cacheStorage.keys === 'function')
+        exists = (await activeAwait(this.cacheStorage.keys(), context)).includes(LEGACY_CACHE_NAME);
+      // CacheStorage.open creates a cache. Never create the retired namespace
+      // just to discover whether this browser has installed content in it.
+      if (!exists) return null;
+      const legacy = await activeAwait(this.cacheStorage.open(LEGACY_CACHE_NAME), context);
+      return legacy;
+    } catch (error) { check(context); return null; }
   }
   emit(context, stage, extra = {}) {
     check(context);
@@ -95,8 +114,7 @@ export class ContentStore {
       void reader.cancel(error).catch(() => {}); throw error;
     } finally { reader.releaseLock(); }
   }
-  async readCached(cache, context) {
-    const key = this.key(context.file);
+  async readCached(cache, context, key = this.key(context.file)) {
     let response;
     try { response = await activeAwait(cache.match(key), context); }
     catch (error) { check(context); this.status(context, 'unavailable', error); return null; }
@@ -113,6 +131,43 @@ export class ContentStore {
       this.status(context, 'corrupt', error); return null;
     }
     context.loadedBytes = bytes.length; this.status(context, 'hit'); return bytes;
+  }
+  cacheResponse(bytes, context) {
+    return new Response(bytes, {headers: {'Content-Type': 'application/octet-stream',
+      'Content-Length': String(bytes.length), 'X-Werhd-Content-SHA256': context.file.sha256}});
+  }
+  async readLegacyCached(current, context) {
+    const canCopy = current && context.cacheStatus !== 'unavailable';
+    const legacy = await this.legacyCache(context);
+    if (!legacy) return null;
+    const oldKey = new URL(LEGACY_CACHE_PATH + context.file.sha256, this.baseUrl).href;
+    const bytes = await this.readCached(legacy, context, oldKey);
+    if (!bytes) {
+      // A retired-cache read error does not disable an otherwise healthy new
+      // cache for the verified replacement downloaded below.
+      if (canCopy && context.cacheStatus === 'unavailable') this.status(context, 'miss');
+      return null;
+    }
+    let copied = false;
+    if (canCopy) copied = await this.writeCached(current, bytes, context, {preserveVerifiedCopy: true});
+    if (copied && legacy !== current) {
+      // Delete only after the new copy committed. Cache.delete is not
+      // cancellable, so compensate a late deletion if this read was cancelled.
+      const retired = Promise.resolve().then(() => { check(context); return legacy.delete(oldKey); }).then(async deleted => {
+        if (deleted && (!context.active || context.signal?.aborted)) {
+          try { await legacy.put(oldKey, this.cacheResponse(bytes, context)); } catch { /* The valid new copy still exists. */ }
+        }
+      });
+      try { await activeAwait(retired, context); }
+      catch (error) { check(context); /* Failed cleanup retains a usable copy. */ }
+    }
+    // Adapters that alias cache names may still supply a valid old-path hit.
+    // Copy that one object, but never retire entries from the active Cache.
+    // A failed migration is still a real, verified legacy cache hit. Returning
+    // these bytes must never fall through to a redundant network download.
+    if (!copied) this.status(context, 'hit');
+    context.legacyCache = true; context.migratedCache = copied;
+    return bytes;
   }
   async download(context) {
     const {file} = context, wire = file.download;
@@ -142,19 +197,22 @@ export class ContentStore {
     }
     check(context); context.loadedBytes = bytes.length; return bytes;
   }
-  async writeCached(cache, bytes, context) {
+  async writeCached(cache, bytes, context, {preserveVerifiedCopy = false} = {}) {
     const key = this.key(context.file), token = {};
     this.writers.set(key, token);
     try {
       check(context);
-      const put = cache.put(key, new Response(bytes, {headers: {'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.length), 'X-Vera-Content-SHA256': context.file.sha256}}));
+      const put = cache.put(key, this.cacheResponse(bytes, context));
       const settled = Promise.resolve(put).then(async () => {
-        if ((!context.active || context.signal?.aborted) && this.writers.get(key) === token) {
+        // A migrated copy was already validated and installed in the retired
+        // namespace. Retaining a late completed copy cannot install new bytes;
+        // it also protects another successful reader from losing its copy.
+        if (!preserveVerifiedCopy && (!context.active || context.signal?.aborted) && this.writers.get(key) === token) {
           await cache.delete(key);
         }
       }).finally(() => { if (this.writers.get(key) === token) this.writers.delete(key); });
-      await activeAwait(settled, context); this.status(context, 'stored');
-    } catch (error) { check(context); this.status(context, 'write-failed', error); }
+      await activeAwait(settled, context); this.status(context, 'stored'); return true;
+    } catch (error) { check(context); this.status(context, 'write-failed', error); return false; }
     finally { if (context.active && !context.signal?.aborted && this.writers.get(key) === token) this.writers.delete(key); }
   }
   /** Return validated raw bytes. Cache failure is reported, not a play failure.
@@ -166,8 +224,13 @@ export class ContentStore {
     try {
       check(context); const cache = await activeAwait(this.cache(), context);
       if (!cache) this.status(context, 'unavailable');
-      const cached = cache ? await this.readCached(cache, context) : null;
-      if (cached) { this.emit(context, 'complete', {fromCache: true}); return cached; }
+      let cached = cache ? await this.readCached(cache, context) : null;
+      if (!cached) cached = await this.readLegacyCached(cache, context);
+      if (cached) {
+        this.emit(context, 'complete', {fromCache: true, legacyCache: context.legacyCache === true,
+          migratedCache: context.migratedCache === true});
+        check(context); return cached;
+      }
       let bytes;
       for (let attempt = 1; attempt <= this.retries + 1; attempt++) {
         context.attempt = attempt; context.attemptWireBytes = 0; context.loadedBytes = 0;

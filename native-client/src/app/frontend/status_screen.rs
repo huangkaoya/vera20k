@@ -25,6 +25,9 @@ use crate::ui::pause_menu::{InGameMenuState, ModalOutcome};
 use crate::ui::shell::geom::RectPx;
 
 /// Bottom-right identity line. Not a retail build string.
+#[cfg(target_arch = "wasm32")]
+const BUILD_STAMP: &str = "WERHD V1.0";
+#[cfg(not(target_arch = "wasm32"))]
 const BUILD_STAMP: &str = concat!("VERA20K ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Copy)]

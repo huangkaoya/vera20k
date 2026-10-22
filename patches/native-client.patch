@@ -86790,7 +86790,7 @@ index 312056a1b74195c4d0baf6c848b4606b4b8f65d9..2e17c32972565dd85b608a6e3a31deb0
  
 diff --git a/src/app/browser.rs b/src/app/browser.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc091f9568a
+index 0000000000000000000000000000000000000000..c38a3a8128bcd209e48e4c64591ca7f5e09670b9
 --- /dev/null
 +++ b/src/app/browser.rs
 @@ -0,0 +1,598 @@
@@ -86882,7 +86882,7 @@ index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc0
 +}
 +
 +pub(super) fn request_network_lobby() {
-+    notify("vera-native-network");
++    notify("werhd-native-network");
 +}
 +
 +pub(super) fn request_content(pack: &str) {
@@ -86902,14 +86902,14 @@ index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc0
 +    let init = web_sys::CustomEventInit::new();
 +    init.set_detail(&detail);
 +    if let Ok(event) =
-+        web_sys::CustomEvent::new_with_event_init_dict("vera-content-required", &init)
++        web_sys::CustomEvent::new_with_event_init_dict("werhd-content-required", &init)
 +    {
 +        let _ = window.dispatch_event(&event);
 +    }
 +}
 +
 +pub(super) fn notify_network_return() {
-+    notify("vera-native-network-return");
++    notify("werhd-native-network-return");
 +}
 +
 +struct PendingInitialization {
@@ -86976,7 +86976,7 @@ index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc0
 +    }
 +    let event_loop = EventLoop::new().map_err(|error| JsValue::from_str(&error.to_string()))?;
 +    canvas.set_attribute("tabindex", "0")?;
-+    canvas.set_attribute("data-vera-stage", "starting")?;
++    canvas.set_attribute("data-werhd-stage", "starting")?;
 +    let mut app = App::default();
 +    app.browser = Some(BrowserState {
 +        canvas,
@@ -87014,9 +87014,9 @@ index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc0
 +}
 +
 +fn set_stage(browser: &BrowserState, stage: &str, error: Option<&str>) {
-+    let _ = browser.canvas.set_attribute("data-vera-stage", stage);
++    let _ = browser.canvas.set_attribute("data-werhd-stage", stage);
 +    if let Some(error) = error {
-+        let _ = browser.canvas.set_attribute("data-vera-error", error);
++        let _ = browser.canvas.set_attribute("data-werhd-error", error);
 +    }
 +    DIAGNOSTICS.with(|value| *value.borrow_mut() = json!({"stage":stage,"error":error}));
 +}
@@ -87066,16 +87066,16 @@ index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc0
 +        }
 +        if let Some(config) = NETWORK_START.with(|pending| pending.borrow_mut().take()) {
 +            match network_launch::start(state, config) {
-+                Ok(()) => notify("vera-native-network-started"),
++                Ok(()) => notify("werhd-native-network-started"),
 +                Err(error) => {
 +                    let message = format!("网络对局启动失败：{error:#}");
 +                    log::error!("{message}");
 +                    if let Some(browser) = self.browser.as_ref() {
 +                        let _ = browser
 +                            .canvas
-+                            .set_attribute("data-vera-network-error", &message);
++                            .set_attribute("data-werhd-network-error", &message);
 +                    }
-+                    notify("vera-native-network-error");
++                    notify("werhd-native-network-error");
 +                }
 +            }
 +        }
@@ -87089,7 +87089,7 @@ index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc0
 +                Self::set_window_hidden(state, hidden);
 +            }
 +        }
-+        notify("vera-native-network-service");
++        notify("werhd-native-network-service");
 +    }
 +    pub(super) fn begin_browser_initialization(&mut self, event_loop: &ActiveEventLoop) {
 +        if self.state.is_some() {
@@ -88576,7 +88576,7 @@ index 0000000000000000000000000000000000000000..6b33659d62331911621eeb6f35fc7f49
 +}
 diff --git a/src/app/browser_shell.rs b/src/app/browser_shell.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..540f46a8f232db38702649174076538a7e28c4e7
+index 0000000000000000000000000000000000000000..3a9b6abaa67fd230ab1fa07ca6507f9f84acff73
 --- /dev/null
 +++ b/src/app/browser_shell.rs
 @@ -0,0 +1,1274 @@
@@ -88786,7 +88786,7 @@ index 0000000000000000000000000000000000000000..540f46a8f232db38702649174076538a
 +        let init = web_sys::CustomEventInit::new();
 +        init.set_detail(&detail);
 +        if let Ok(event) =
-+            web_sys::CustomEvent::new_with_event_init_dict("vera-shell-action", &init)
++            web_sys::CustomEvent::new_with_event_init_dict("werhd-shell-action", &init)
 +        {
 +            let _ = window.dispatch_event(&event);
 +        }
@@ -92367,6 +92367,20 @@ index 66b83cca0f347ad2cc0e9fc220ee4308a0a3b58a..b27189dd747183e04b34226c7dd6e3a3
      /// External offline launch: returning from the session closes the process for its client.
      pub(crate) external_launch: bool,
      pub(crate) external_launch_error: Option<String>,
+diff --git a/src/app/frontend/status_screen.rs b/src/app/frontend/status_screen.rs
+index 3347ff55ef588172b4ede4e83cb6c00723348d35..51b2c946d52e9cc3cbbf0fca4eab5f4872e3e36d 100644
+--- a/src/app/frontend/status_screen.rs
++++ b/src/app/frontend/status_screen.rs
+@@ -25,6 +25,9 @@ use crate::ui::pause_menu::{InGameMenuState, ModalOutcome};
+ use crate::ui::shell::geom::RectPx;
+ 
+ /// Bottom-right identity line. Not a retail build string.
++#[cfg(target_arch = "wasm32")]
++const BUILD_STAMP: &str = "WERHD V1.0";
++#[cfg(not(target_arch = "wasm32"))]
+ const BUILD_STAMP: &str = concat!("VERA20K ", env!("CARGO_PKG_VERSION"));
+ 
+ #[derive(Clone, Copy)]
 diff --git a/src/app/frontend/wol_welcome_render.rs b/src/app/frontend/wol_welcome_render.rs
 index b9a76e103e0c3a6517c593b543ac277d8180c8a4..affd5d2d07fbf2df246d00737c35b3b9860b1bb0 100644
 --- a/src/app/frontend/wol_welcome_render.rs
@@ -95465,7 +95479,7 @@ index 9a397690e7cf41d01aee73ea976f504ac07ca2f6..86e52d6acb244d44d6a367425fc71c2f
  use crate::sim::telemetry::TimingSample;
  
 diff --git a/src/app/mod.rs b/src/app/mod.rs
-index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..1ba0aba7038d2fb79d1b7250c7865e66e2680526 100644
+index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..d97c6ebc2df0286e7b89c339a106ebe8ebc72228 100644
 --- a/src/app/mod.rs
 +++ b/src/app/mod.rs
 @@ -3,7 +3,7 @@
@@ -95536,7 +95550,17 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..1ba0aba7038d2fb79d1b7250c7865e66
  mod ios_unit_tags;
  pub(crate) mod loading;
  pub(crate) mod match_audio;
-@@ -134,13 +151,15 @@ pub struct App {
+@@ -111,6 +128,9 @@ mod window_icon;
+ /// Main window title. The single-instance gate finds a running copy's window by
+ /// this exact title, so `main` hands the same constant to
+ /// `util::single_instance::acquire`.
++#[cfg(target_arch = "wasm32")]
++pub const WINDOW_TITLE: &str = "WERHD";
++#[cfg(not(target_arch = "wasm32"))]
+ pub const WINDOW_TITLE: &str = if crate::rules::ARES_ENABLED {
+     "VERA20K [Ares]"
+ } else {
+@@ -134,13 +154,15 @@ pub struct App {
      startup_options: crate::app::frontend::startup_options::RetailStartupOptions,
      spawn_request: Option<crate::app::frontend::cncnet_spawn::SpawnRequest>,
      startup_failure: Option<String>,
@@ -95553,7 +95577,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..1ba0aba7038d2fb79d1b7250c7865e66
  }
  
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -187,11 +206,13 @@ impl App {
+@@ -187,11 +209,13 @@ impl App {
              startup_options,
              spawn_request: None,
              startup_failure: None,
@@ -95568,7 +95592,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..1ba0aba7038d2fb79d1b7250c7865e66
          }
      }
  
-@@ -207,11 +228,13 @@ impl App {
+@@ -207,11 +231,13 @@ impl App {
              startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
              spawn_request: None,
              startup_failure: None,
@@ -95583,7 +95607,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..1ba0aba7038d2fb79d1b7250c7865e66
          }
      }
  
-@@ -229,11 +252,13 @@ impl App {
+@@ -229,11 +255,13 @@ impl App {
              startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
              spawn_request: None,
              startup_failure: None,
@@ -96724,7 +96748,7 @@ index 8d6035e2bd0d2bef98566cd8daea08812f1c2dc6..61482202a40818505ee822f9a231e685
          )
      }
 diff --git a/src/app/shell_main_menu.rs b/src/app/shell_main_menu.rs
-index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..b926399d79da36024cad2544231f8b77ceea6f4e 100644
+index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..92f3f6ea62c02613ee7f3267f4b26a49fa034cbf 100644
 --- a/src/app/shell_main_menu.rs
 +++ b/src/app/shell_main_menu.rs
 @@ -727,6 +727,16 @@ impl App {
@@ -96744,7 +96768,44 @@ index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..b926399d79da36024cad2544231f8b77
          if state.frontend.external_launch {
              Self::start_quit_cascade(state);
              return;
-@@ -1171,6 +1181,11 @@ Details: {details}"
+@@ -862,19 +872,28 @@ impl App {
+                 .to_owned()
+         };
+         let details = display_error(&error);
+-        crate::app::frontend::status_screen::render(
+-            state,
+-            encoder,
+-            view,
+-            title,
+-            &format!(
+-                "VERA20K needs Red Alert 2: Yuri's Revenge to run.\n\n\
++        #[cfg(target_arch = "wasm32")]
++        let instructions = format!(
++            "WERHD could not prepare the game menu.\n\n\
++Refresh this page to retry the verified game-resource download.\n\n\
++Your cached resources and saved settings will be preserved.\n\n\
++Details: {details}"
++        );
++        #[cfg(not(target_arch = "wasm32"))]
++        let instructions = format!(
++            "VERA20K needs Red Alert 2: Yuri's Revenge to run.\n\n\
+ 1. Copy vera20k.exe into your Red Alert 2: Yuri's Revenge folder and start it there.\n\n\
+ 2. Or set [paths] ra2_dir in config.toml, either in the folder you start it from or beside vera20k.exe.\n\n\
+ Game files: {asset_root}{path_note}\n\
+ Log: logs/ra2.log\n\n\
+ Details: {details}"
+-            ),
++        );
++        crate::app::frontend::status_screen::render(
++            state,
++            encoder,
++            view,
++            title,
++            &instructions,
+             crate::app::frontend::status_screen::Buttons::QUIT,
+         );
+         Ok(())
+@@ -1171,6 +1190,11 @@ Details: {details}"
          {
              use crate::app::frontend::shell_transition::ShellExitThen;
              use crate::ui::main_menu_shell::MainMenuShellAction;
@@ -96756,20 +96817,24 @@ index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..b926399d79da36024cad2544231f8b77
              if inline_main_menu_action(
                  crate::app::frontend::shell_layout::uses_branded_main_menu(state),
                  action,
-@@ -1637,6 +1652,12 @@ Details: {details}"
+@@ -1637,6 +1661,16 @@ Details: {details}"
      ) {
          use crate::ui::main_menu_shell::MainMenuShellAction;
  
 +        #[cfg(target_arch = "wasm32")]
 +        if action == MainMenuShellAction::WwOnline {
-+            crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Content, None);
++            crate::app::browser_shell::open(
++                state,
++                crate::app::browser_shell::Surface::Content,
++                None,
++            );
 +            return;
 +        }
 +
          if let Some(inline) = inline_main_menu_action(
              crate::app::frontend::shell_layout::uses_branded_main_menu(state),
              action,
-@@ -1652,6 +1673,16 @@ Details: {details}"
+@@ -1652,6 +1686,16 @@ Details: {details}"
                      macos_main_menu_url::open_website();
                      #[cfg(target_os = "android")]
                      android_main_menu_url::open_website();
@@ -96786,14 +96851,18 @@ index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..b926399d79da36024cad2544231f8b77
                  }
              }
              return;
-@@ -1671,7 +1702,12 @@ Details: {details}"
+@@ -1671,7 +1715,16 @@ Details: {details}"
              MainMenuShellAction::MoviesAndCredits => {
                  Self::open_movies_credits_page(state);
              }
 -            MainMenuShellAction::Network => Self::open_lan_lobby(state),
 +            MainMenuShellAction::Network => {
 +                #[cfg(target_arch = "wasm32")]
-+                crate::app::browser_shell::open(state, crate::app::browser_shell::Surface::Lobby, None);
++                crate::app::browser_shell::open(
++                    state,
++                    crate::app::browser_shell::Surface::Lobby,
++                    None,
++                );
 +                #[cfg(not(target_arch = "wasm32"))]
 +                Self::open_lan_lobby(state);
 +            }
@@ -98996,7 +99065,7 @@ index a36c077c195e1c719b45da988d2dc5ab4dfb2b37..b7728f02c55c402045f78191c66291ad
      }
 diff --git a/src/render/bit_font_web.rs b/src/render/bit_font_web.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7fd97a8b1bb09835cf9e25966125b24265a79cda
+index 0000000000000000000000000000000000000000..07ce89a104c06c3b5fb8f735aa95274fe0708adf
 --- /dev/null
 +++ b/src/render/bit_font_web.rs
 @@ -0,0 +1,71 @@
@@ -99029,7 +99098,7 @@ index 0000000000000000000000000000000000000000..7fd97a8b1bb09835cf9e25966125b242
 +    }
 +
 +    pub(super) fn face_names(&self) -> (String, String) {
-+        ("Vera UI Medium".into(), "browser system sans-serif".into())
++        ("WERHD UI Medium".into(), "browser system sans-serif".into())
 +    }
 +
 +    pub(crate) fn glyph(&mut self, codepoint: u16, width: u32) -> Option<Vec<u8>> {
@@ -99040,7 +99109,7 @@ index 0000000000000000000000000000000000000000..7fd97a8b1bb09835cf9e25966125b242
 +        self.canvas.set_width(width);
 +        self.canvas.set_height(self.rows);
 +        let context = &self.context;
-+        context.set_font(&format!("500 {}px 'Vera UI', sans-serif", self.rows));
++        context.set_font(&format!("500 {}px 'WERHD UI', sans-serif", self.rows));
 +        context.set_text_baseline("alphabetic");
 +        let text = ch.to_string();
 +        let metrics = context.measure_text(&text).ok()?;
@@ -101135,6 +101204,25 @@ index e881c7117bb7585032ee281110834b8365bc6881..442d6488de335d01a4ae35b6eedc8398
  
  use crate::ui::shell::button::ShellButtonInteraction;
  use crate::ui::shell::descriptor::DialogId;
+diff --git a/src/ui/main_menu_dialogs/options.rs b/src/ui/main_menu_dialogs/options.rs
+index 57fc851cd733aad8b8f49ab6bf1484287e30ed29..7e1b0c0b3dad01788d25ceb4c12afba2b922214f 100644
+--- a/src/ui/main_menu_dialogs/options.rs
++++ b/src/ui/main_menu_dialogs/options.rs
+@@ -81,7 +81,14 @@ pub(crate) const FPS_COUNTER_HELP: &str = "Show frames per second in the top-lef
+ pub(crate) const SHIFT_QUEUE_HELP: &str =
+     "Shift-click an infantry, vehicle or aircraft cameo to queue several at once.";
+ /// The main page's button to VERA's page, and that page's heading.
++#[cfg(target_arch = "wasm32")]
++pub(crate) const VERA_OPTIONS_LABEL: &str = "WERHD Options";
++#[cfg(not(target_arch = "wasm32"))]
+ pub(crate) const VERA_OPTIONS_LABEL: &str = "VERA20K Options";
++#[cfg(target_arch = "wasm32")]
++pub(crate) const VERA_OPTIONS_HELP: &str =
++    "Settings WERHD adds: full screen, sidebar size, smooth motion and more.";
++#[cfg(not(target_arch = "wasm32"))]
+ pub(crate) const VERA_OPTIONS_HELP: &str =
+     "Settings VERA20K adds: full screen, sidebar size, smooth motion and more.";
+ /// The VERA page's Back reuses retail's caption; its status help is the
 diff --git a/src/ui/movies_credits_shell/movie_list.rs b/src/ui/movies_credits_shell/movie_list.rs
 index 0f706fe9c34414a1a5f9148255ec05f262c743b9..eca50a73650bc18deef65f96fca948d00846284f 100644
 --- a/src/ui/movies_credits_shell/movie_list.rs
@@ -101970,10 +102058,10 @@ index 0000000000000000000000000000000000000000..c025463a940a1700f4243ac1ddf91555
 +}
 diff --git a/src/util/browser_io.rs b/src/util/browser_io.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9e8d99946
+index 0000000000000000000000000000000000000000..2fe11f50de9285ea04c7a76161304ee8357163d0
 --- /dev/null
 +++ b/src/util/browser_io.rs
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,452 @@
 +//! Browser platform files. Retail bytes are immutable and shared with MIX views;
 +//! mutable profile/save writes commit synchronously to localStorage before success.
 +//! Storage quota/security failures are surfaced to the existing native UI owner.
@@ -101985,9 +102073,39 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +use std::path::{Component, Path, PathBuf};
 +use std::sync::Arc;
 +
-+const PREFIX: &str = "vera20k.native.files.v1:";
-+const DIRECTORIES_KEY: &str = "vera20k.native.directories.v1";
++#[path = "browser_io_migration.rs"]
++mod migration;
++
 +pub const RETAIL_ROOT: &str = "/retail";
++
++impl migration::Store for web_sys::Storage {
++    type Error = String;
++
++    fn keys(&self) -> Result<Vec<String>, Self::Error> {
++        let mut keys = Vec::new();
++        for index in 0..self
++            .length()
++            .map_err(|e| format!("storage length: {e:?}"))?
++        {
++            if let Some(name) = self.key(index).map_err(|e| format!("storage key: {e:?}"))? {
++                keys.push(name);
++            }
++        }
++        Ok(keys)
++    }
++    fn read(&self, key: &str) -> Result<Option<String>, Self::Error> {
++        self.get_item(key)
++            .map_err(|e| format!("storage read: {e:?}"))
++    }
++    fn write(&self, key: &str, value: &str) -> Result<(), Self::Error> {
++        self.set_item(key, value)
++            .map_err(|e| format!("storage quota or permission: {e:?}"))
++    }
++    fn remove(&self, key: &str) -> Result<(), Self::Error> {
++        self.remove_item(key)
++            .map_err(|e| format!("storage delete: {e:?}"))
++    }
++}
 +
 +#[derive(Default)]
 +struct Files {
@@ -102061,10 +102179,7 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +/// browser data is authoritative over the read-only retail download catalog.
 +pub fn finish_mount_and_hydrate() -> Result<(), String> {
 +    let store = storage().map_err(|e| e.to_string())?;
-+    let directories: BTreeSet<String> = match store
-+        .get_item(DIRECTORIES_KEY)
-+        .map_err(|e| format!("storage directory read: {e:?}"))?
-+    {
++    let directories: BTreeSet<String> = match migration::read_directories(&store)? {
 +        None => BTreeSet::new(),
 +        Some(text) => {
 +            serde_json::from_str(&text).map_err(|e| format!("invalid browser directories: {e}"))?
@@ -102080,23 +102195,7 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +        }
 +    }
 +    let mut hydrated = BTreeMap::new();
-+    for index in 0..store
-+        .length()
-+        .map_err(|e| format!("storage length: {e:?}"))?
-+    {
-+        let Some(name) = store
-+            .key(index)
-+            .map_err(|e| format!("storage key: {e:?}"))?
-+        else {
-+            continue;
-+        };
-+        let Some(path) = name.strip_prefix(PREFIX) else {
-+            continue;
-+        };
-+        let value = store
-+            .get_item(&name)
-+            .map_err(|e| format!("storage read: {e:?}"))?
-+            .ok_or_else(|| format!("browser file disappeared: {path}"))?;
++    for (path, value) in migration::read_files(&store)? {
 +        let file: StoredFile = serde_json::from_str(&value)
 +            .map_err(|e| format!("invalid persisted file {path}: {e}"))?;
 +        if key(Path::new(&file.path))
@@ -102108,7 +102207,7 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +        }
 +        crate::util::base64::base64_decode(&file.base64)
 +            .map_err(|e| format!("invalid persisted bytes {path}: {e}"))?;
-+        hydrated.insert(path.to_string(), file);
++        hydrated.insert(path, file);
 +    }
 +    FILES.with(|files| {
 +        let mut files = files.borrow_mut();
@@ -102192,13 +102291,8 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +        base64: encode(bytes.as_ref()),
 +    };
 +    let serialized = serde_json::to_string(&file).map_err(|e| error(e.to_string()))?;
-+    storage()?
-+        .set_item(&format!("{PREFIX}{lookup}"), &serialized)
-+        .map_err(|e| {
-+            error(format!(
-+                "could not commit browser file (storage quota or permission): {e:?}"
-+            ))
-+        })?;
++    migration::write_file(&storage()?, &lookup, &serialized)
++        .map_err(|e| error(format!("could not commit browser file: {e}")))?;
 +    FILES.with(|files| files.borrow_mut().persistent.insert(lookup, file));
 +    Ok(())
 +}
@@ -102219,9 +102313,7 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +    if !exists {
 +        return Err(io::Error::new(ErrorKind::NotFound, lookup));
 +    }
-+    storage()?
-+        .remove_item(&format!("{PREFIX}{lookup}"))
-+        .map_err(|e| error(format!("storage delete: {e:?}")))?;
++    migration::remove_file(&storage()?, &lookup).map_err(error)?;
 +    FILES.with(|files| files.borrow_mut().persistent.remove(&lookup));
 +    Ok(())
 +}
@@ -102259,9 +102351,8 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +        directories.insert(key(ancestor)?);
 +    }
 +    let encoded = serde_json::to_string(&directories).map_err(|e| error(e.to_string()))?;
-+    storage()?
-+        .set_item(DIRECTORIES_KEY, &encoded)
-+        .map_err(|e| error(format!("storage directory commit: {e:?}")))?;
++    migration::write_directories(&storage()?, &encoded)
++        .map_err(|e| error(format!("storage directory commit: {e}")))?;
 +    FILES.with(|files| files.borrow_mut().directories = directories);
 +    Ok(())
 +}
@@ -102421,6 +102512,338 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +    }
 +    fn flush(&mut self) -> io::Result<()> {
 +        Ok(())
++    }
++}
+diff --git a/src/util/browser_io_migration.rs b/src/util/browser_io_migration.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..69cd47197af7ddc576c31e4b2644984a1c05b71f
+--- /dev/null
++++ b/src/util/browser_io_migration.rs
+@@ -0,0 +1,326 @@
++//! Durable browser-file namespace migration. Values stay byte-for-byte intact;
++//! parsing and validation belong to the existing browser file owner.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++pub(super) const PREFIX: &str = "werhd.native.files.v1:";
++pub(super) const DIRECTORIES_KEY: &str = "werhd.native.directories.v1";
++const LEGACY_PREFIX: &str = "vera20k.native.files.v1:";
++const LEGACY_DIRECTORIES_KEY: &str = "vera20k.native.directories.v1";
++
++pub(super) trait Store {
++    type Error;
++
++    fn keys(&self) -> Result<Vec<String>, Self::Error>;
++    fn read(&self, key: &str) -> Result<Option<String>, Self::Error>;
++    fn write(&self, key: &str, value: &str) -> Result<(), Self::Error>;
++    fn remove(&self, key: &str) -> Result<(), Self::Error>;
++}
++
++fn read_and_migrate<S: Store>(
++    store: &S,
++    current: &str,
++    legacy: &str,
++) -> Result<Option<String>, S::Error> {
++    if let Some(value) = store.read(current)? {
++        return Ok(Some(value));
++    }
++    let value = store.read(legacy)?;
++    if let Some(value) = &value {
++        // Quota/security failures must not make an existing profile or save
++        // unreadable. Delete the old key only after the replacement committed.
++        if store.write(current, value).is_ok() {
++            let _ = store.remove(legacy);
++        }
++    }
++    Ok(value)
++}
++
++pub(super) fn read_directories<S: Store>(store: &S) -> Result<Option<String>, S::Error> {
++    read_and_migrate(store, DIRECTORIES_KEY, LEGACY_DIRECTORIES_KEY)
++}
++
++pub(super) fn read_files<S: Store>(store: &S) -> Result<BTreeMap<String, String>, S::Error> {
++    // Snapshot all names before moving any key. Removing localStorage entries
++    // while enumerating numeric indexes would skip subsequent saves/settings.
++    let paths: BTreeSet<_> = store
++        .keys()?
++        .iter()
++        .filter_map(|name| {
++            name.strip_prefix(PREFIX)
++                .or_else(|| name.strip_prefix(LEGACY_PREFIX))
++                .map(str::to_owned)
++        })
++        .collect();
++    let mut files = BTreeMap::new();
++    for path in paths {
++        if let Some(value) = read_and_migrate(
++            store,
++            &format!("{PREFIX}{path}"),
++            &format!("{LEGACY_PREFIX}{path}"),
++        )? {
++            files.insert(path, value);
++        }
++    }
++    Ok(files)
++}
++
++pub(super) fn write_file<S: Store>(store: &S, path: &str, value: &str) -> Result<(), S::Error> {
++    store.write(&format!("{PREFIX}{path}"), value)?;
++    // A prior migration may have fallen back to the legacy value. Retire that
++    // value only after this ordinary write has durably replaced it.
++    let _ = store.remove(&format!("{LEGACY_PREFIX}{path}"));
++    Ok(())
++}
++
++pub(super) fn write_directories<S: Store>(store: &S, value: &str) -> Result<(), S::Error> {
++    store.write(DIRECTORIES_KEY, value)?;
++    let _ = store.remove(LEGACY_DIRECTORIES_KEY);
++    Ok(())
++}
++
++pub(super) fn remove_file<S: Store>(store: &S, path: &str) -> Result<(), S::Error> {
++    // Remove a stale/fallback legacy copy first. A failed legacy deletion must
++    // retain the current file, rather than resurrect the old save next launch.
++    store.remove(&format!("{LEGACY_PREFIX}{path}"))?;
++    store.remove(&format!("{PREFIX}{path}"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::cell::RefCell;
++
++    #[derive(Default)]
++    struct MemoryStore {
++        values: RefCell<BTreeMap<String, String>>,
++        blocked_writes: RefCell<BTreeSet<String>>,
++        blocked_removes: RefCell<BTreeSet<String>>,
++        writes: RefCell<Vec<String>>,
++    }
++
++    impl Store for MemoryStore {
++        type Error = &'static str;
++
++        fn keys(&self) -> Result<Vec<String>, Self::Error> {
++            Ok(self.values.borrow().keys().cloned().collect())
++        }
++        fn read(&self, key: &str) -> Result<Option<String>, Self::Error> {
++            Ok(self.values.borrow().get(key).cloned())
++        }
++        fn write(&self, key: &str, value: &str) -> Result<(), Self::Error> {
++            self.writes.borrow_mut().push(key.to_owned());
++            if self.blocked_writes.borrow().contains(key) {
++                return Err("storage quota or permission");
++            }
++            self.values.borrow_mut().insert(key.into(), value.into());
++            Ok(())
++        }
++        fn remove(&self, key: &str) -> Result<(), Self::Error> {
++            if self.blocked_removes.borrow().contains(key) {
++                return Err("storage permission");
++            }
++            self.values.borrow_mut().remove(key);
++            Ok(())
++        }
++    }
++
++    fn legacy_store() -> (MemoryStore, BTreeMap<String, String>) {
++        let files: BTreeMap<_, _> = [
++            ("/settings/ra2md.ini", "profile:MouseSensitivityPercent=175"),
++            (
++                "/settings/ios-shortcuts.json",
++                "shortcuts:[ForceAttack,Stop]",
++            ),
++            ("/saves/savegame.sav", "save:VERA20K\\0:AAEC/w=="),
++        ]
++        .into_iter()
++        .map(|(path, bytes)| (path.to_owned(), bytes.to_owned()))
++        .collect();
++        let store = MemoryStore::default();
++        for (path, bytes) in &files {
++            store
++                .values
++                .borrow_mut()
++                .insert(format!("{LEGACY_PREFIX}{path}"), bytes.clone());
++        }
++        store.values.borrow_mut().insert(
++            LEGACY_DIRECTORIES_KEY.into(),
++            "[\"/settings\",\"/saves\",\"/empty\"]".into(),
++        );
++        store
++            .values
++            .borrow_mut()
++            .insert("unrelated.application".into(), "untouched".into());
++        (store, files)
++    }
++
++    #[test]
++    fn migrates_all_settings_shortcuts_saves_and_directories_without_changing_values() {
++        let (store, files) = legacy_store();
++        let directories = store.read(LEGACY_DIRECTORIES_KEY).unwrap();
++        assert_eq!(read_directories(&store).unwrap(), directories);
++        assert_eq!(read_files(&store).unwrap(), files);
++        assert_eq!(store.read(DIRECTORIES_KEY).unwrap(), directories);
++        for (path, bytes) in &files {
++            assert_eq!(
++                store.read(&format!("{PREFIX}{path}")).unwrap(),
++                Some(bytes.clone())
++            );
++            assert_eq!(store.read(&format!("{LEGACY_PREFIX}{path}")).unwrap(), None);
++        }
++        assert_eq!(store.read(LEGACY_DIRECTORIES_KEY).unwrap(), None);
++        assert_eq!(
++            store.read("unrelated.application").unwrap().as_deref(),
++            Some("untouched")
++        );
++    }
++
++    #[test]
++    fn existing_current_file_and_directory_values_always_win_without_overwrite() {
++        let (store, mut files) = legacy_store();
++        let path = "/settings/ra2md.ini";
++        store
++            .values
++            .borrow_mut()
++            .insert(format!("{PREFIX}{path}"), "newer profile".into());
++        store
++            .values
++            .borrow_mut()
++            .insert(DIRECTORIES_KEY.into(), "[\"/newer\"]".into());
++        files.insert(path.into(), "newer profile".into());
++        assert_eq!(
++            read_directories(&store).unwrap().as_deref(),
++            Some("[\"/newer\"]")
++        );
++        assert_eq!(read_files(&store).unwrap(), files);
++        assert!(!store.writes.borrow().contains(&format!("{PREFIX}{path}")));
++        assert!(
++            !store
++                .writes
++                .borrow()
++                .iter()
++                .any(|key| key == DIRECTORIES_KEY)
++        );
++        assert!(
++            store
++                .read(&format!("{LEGACY_PREFIX}{path}"))
++                .unwrap()
++                .is_some()
++        );
++    }
++
++    #[test]
++    fn blocked_migration_retains_legacy_values_and_reads_them_until_retry_succeeds() {
++        let (store, files) = legacy_store();
++        let directories = store.read(LEGACY_DIRECTORIES_KEY).unwrap();
++        store
++            .blocked_writes
++            .borrow_mut()
++            .extend(files.keys().map(|path| format!("{PREFIX}{path}")));
++        store
++            .blocked_writes
++            .borrow_mut()
++            .insert(DIRECTORIES_KEY.into());
++        for _ in 0..2 {
++            assert_eq!(read_directories(&store).unwrap(), directories);
++            assert_eq!(read_files(&store).unwrap(), files);
++            for (path, bytes) in &files {
++                assert_eq!(
++                    store.read(&format!("{LEGACY_PREFIX}{path}")).unwrap(),
++                    Some(bytes.clone())
++                );
++                assert_eq!(store.read(&format!("{PREFIX}{path}")).unwrap(), None);
++            }
++            assert_eq!(store.read(LEGACY_DIRECTORIES_KEY).unwrap(), directories);
++        }
++        store.blocked_writes.borrow_mut().clear();
++        assert_eq!(read_directories(&store).unwrap(), directories);
++        assert_eq!(read_files(&store).unwrap(), files);
++        assert_eq!(store.read(LEGACY_DIRECTORIES_KEY).unwrap(), None);
++        assert!(
++            store
++                .keys()
++                .unwrap()
++                .iter()
++                .all(|key| !key.starts_with(LEGACY_PREFIX))
++        );
++    }
++
++    #[test]
++    fn later_write_retires_fallback_only_after_successful_current_commit() {
++        let (store, _) = legacy_store();
++        let path = "/settings/ios-shortcuts.json";
++        let legacy_key = format!("{LEGACY_PREFIX}{path}");
++        let current_key = format!("{PREFIX}{path}");
++        let old = store.read(&legacy_key).unwrap();
++        store
++            .blocked_writes
++            .borrow_mut()
++            .insert(current_key.clone());
++        assert!(write_file(&store, path, "new shortcuts").is_err());
++        assert_eq!(store.read(&legacy_key).unwrap(), old);
++        assert_eq!(store.read(&current_key).unwrap(), None);
++        store.blocked_writes.borrow_mut().clear();
++        write_file(&store, path, "new shortcuts").unwrap();
++        assert_eq!(
++            store.read(&current_key).unwrap().as_deref(),
++            Some("new shortcuts")
++        );
++        assert_eq!(store.read(&legacy_key).unwrap(), None);
++    }
++
++    #[test]
++    fn failed_legacy_cleanup_keeps_current_authoritative_and_delete_cannot_resurrect_old_save() {
++        let (store, _) = legacy_store();
++        let path = "/saves/savegame.sav";
++        let legacy_key = format!("{LEGACY_PREFIX}{path}");
++        let current_key = format!("{PREFIX}{path}");
++        store
++            .blocked_removes
++            .borrow_mut()
++            .insert(legacy_key.clone());
++        read_files(&store).unwrap();
++        write_file(&store, path, "updated save").unwrap();
++        assert_eq!(
++            read_files(&store).unwrap().get(path).map(String::as_str),
++            Some("updated save")
++        );
++        assert!(store.read(&legacy_key).unwrap().is_some());
++        assert!(remove_file(&store, path).is_err());
++        assert_eq!(
++            store.read(&current_key).unwrap().as_deref(),
++            Some("updated save")
++        );
++        store.blocked_removes.borrow_mut().clear();
++        remove_file(&store, path).unwrap();
++        assert!(!read_files(&store).unwrap().contains_key(path));
++        assert_eq!(store.read(&legacy_key).unwrap(), None);
++        assert_eq!(store.read(&current_key).unwrap(), None);
++    }
++
++    #[test]
++    fn directory_updates_keep_legacy_until_commit_and_fallback_save_can_be_deleted() {
++        let (store, _) = legacy_store();
++        let old = store.read(LEGACY_DIRECTORIES_KEY).unwrap();
++        store
++            .blocked_writes
++            .borrow_mut()
++            .insert(DIRECTORIES_KEY.into());
++        assert!(write_directories(&store, "[\"/replacement\"]").is_err());
++        assert_eq!(store.read(LEGACY_DIRECTORIES_KEY).unwrap(), old);
++        store.blocked_writes.borrow_mut().clear();
++        write_directories(&store, "[\"/replacement\"]").unwrap();
++        assert_eq!(
++            store.read(DIRECTORIES_KEY).unwrap().as_deref(),
++            Some("[\"/replacement\"]")
++        );
++        assert_eq!(store.read(LEGACY_DIRECTORIES_KEY).unwrap(), None);
++        remove_file(&store, "/saves/savegame.sav").unwrap();
++        assert!(
++            !read_files(&store)
++                .unwrap()
++                .contains_key("/saves/savegame.sav")
++        );
 +    }
 +}
 diff --git a/src/util/browser_menu_media.rs b/src/util/browser_menu_media.rs
@@ -102672,7 +103095,7 @@ index 5772c39a59c9040fc278685be9a703b456d6f216..efaefa24ec881300046d80133459fac2
  const CAPACITY: usize = 4_000;
  const MESSAGE_BYTES: usize = 2_048;
 diff --git a/src/util/mod.rs b/src/util/mod.rs
-index 635492e0488399682628410cb15501e1b646d53b..227622decf75149ff7276e0177497350601f0858 100644
+index 635492e0488399682628410cb15501e1b646d53b..7fed0a45cb81af7dfc103903b110eaf5f884530c 100644
 --- a/src/util/mod.rs
 +++ b/src/util/mod.rs
 @@ -8,6 +8,7 @@
@@ -102717,13 +103140,16 @@ index 635492e0488399682628410cb15501e1b646d53b..227622decf75149ff7276e0177497350
  // pub mod color;
  
  pub mod native_file_time;
-@@ -48,3 +49,20 @@ pub mod native_file_time;
+@@ -48,3 +49,23 @@ pub mod native_file_time;
  pub mod native_file_name;
  
  pub mod native_affine;
 +
 +#[cfg(target_arch = "wasm32")]
 +pub mod browser_io;
++#[cfg(all(test, not(target_arch = "wasm32")))]
++#[path = "browser_io_migration.rs"]
++mod browser_io_migration_tests;
 +
 +#[cfg(any(target_arch = "wasm32", test))]
 +pub mod browser_menu_media;
@@ -102775,16 +103201,26 @@ index c2a5bcb4cee96dfcd0c0f75dc3333982d1957c94..d401e15ed7425038dd6d05c085d7f5ad
 +}
 diff --git a/src/web_entry.rs b/src/web_entry.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..646602fc9a6d3cfd26b9e6223925cf848ca0dc54
+index 0000000000000000000000000000000000000000..ece118b78d981601e710a54d84fa6a068bb31da3
 --- /dev/null
 +++ b/src/web_entry.rs
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,143 @@
 +//! Browser boundary for the complete native client. Rules, UI, input and drawing
 +//! remain owned by the original VERA modules.
 +use wasm_bindgen::prelude::*;
 +
 +struct BrowserLogger;
 +static LOGGER: BrowserLogger = BrowserLogger;
++
++// Keep upstream format identities unchanged while presenting the product's
++// name in browser diagnostics and panic messages.
++fn browser_message(message: String) -> String {
++    message
++        .replace("VERA20K", "WERHD")
++        .replace("VERA20k", "WERHD")
++        .replace("Vera20k", "WERHD")
++        .replace("vera20k", "werhd")
++}
 +impl log::Log for BrowserLogger {
 +    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
 +        metadata.level() <= log::Level::Info
@@ -102793,7 +103229,11 @@ index 0000000000000000000000000000000000000000..646602fc9a6d3cfd26b9e6223925cf84
 +        if !self.enabled(record.metadata()) {
 +            return;
 +        }
-+        let message = JsValue::from_str(&format!("[VERA {}] {}", record.level(), record.args()));
++        let message = JsValue::from_str(&browser_message(format!(
++            "[WERHD {}] {}",
++            record.level(),
++            record.args()
++        )));
 +        match record.level() {
 +            log::Level::Error => web_sys::console::error_1(&message),
 +            log::Level::Warn => web_sys::console::warn_1(&message),
@@ -102808,7 +103248,7 @@ index 0000000000000000000000000000000000000000..646602fc9a6d3cfd26b9e6223925cf84
 +    let _ = log::set_logger(&LOGGER);
 +    log::set_max_level(log::LevelFilter::Info);
 +    std::panic::set_hook(Box::new(|panic| {
-+        let error = js_sys::Error::new(&panic.to_string());
++        let error = js_sys::Error::new(&browser_message(panic.to_string()));
 +        web_sys::console::error_1(&error);
 +    }));
 +}

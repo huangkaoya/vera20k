@@ -36,6 +36,12 @@ optional packs and a separate full startup profile. Resource URLs are immutable
 `/content/objects/<sha256>` paths. The client checks compressed size/SHA,
 decompresses, then checks raw size/SHA before mounting.
 
+The browser loads `/native/werhd.js` and `/native/werhd_bg.wasm`; those exact
+names are also used by the public build manifest. The older engine filenames
+have no compatibility alias and return 404. The R2 key prefix above is private
+storage identity: only `/content/objects/<sha256>` reaches the browser, and no
+R2 key, account or bucket metadata is copied into response headers.
+
 ## Default and optional content
 
 Build the reproducible catalog with `python3 tools/native-content.py build`
@@ -66,7 +72,7 @@ and `build.contentCatalogIdentity === catalog.catalogIdentity`. The former is
 the fixed default gameplay identity, also required by full; the latter pins the
 entire recursively canonicalized catalog, including all optional descriptors.
 The release publishes every raw/gzip object in the private plan, the raw WASM
-alias `/native/vera20k_bg.wasm`, and its explicit gzip transfer descriptor.
+alias `/native/werhd_bg.wasm`, and its explicit gzip transfer descriptor.
 Content-addressed R2 keys deduplicate unchanged objects across releases. Gzip
 objects use `application/gzip` with **no HTTP Content-Encoding**, so fetch cannot
 silently decode bytes before their transfer SHA is checked. Retain old immutable
@@ -137,7 +143,8 @@ npm run verify --prefix deployment -- --origin=https://wan.youlidefuchou.com
 The probe requires the matching local `generated/release.json`. It checks
 health/build/catalog identities, shared required identity across profiles,
 every published raw/gzip object's HEAD size/ETag/MIME and absent Content-Encoding,
-an eight-byte WASM Range response and gzip header, rejected missing/foreign WebSocket Origins and
+the WERHD JS route, retired engine routes returning 404, an eight-byte WASM
+Range response and gzip header, rejected missing/foreign WebSocket Origins and
 a temporary two-peer native-v2 room. Its launch receipts and checksum are
 synthetic; it removes its temporary rooms and does not load the engine. Both
 hostnames passed the previous complete-file HTTP/transport probe at initial
@@ -167,5 +174,5 @@ in memory. Deploy/restart/disconnect terminates a match, like the local adapter;
 there is no unimplemented promise of resuming a partially committed game.
 
 Cloudflare does not run the game WASM inside its Worker. Browsers run the
-unchanged VERA client; the Worker streams assets and the coordinator admits
+WERHD client; the Worker streams assets and the coordinator admits
 ordered native commands and checks matching hashes.

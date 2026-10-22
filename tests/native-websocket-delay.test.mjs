@@ -25,7 +25,10 @@ test('diagnostic latency keeps hello and ordered client commands on the real Web
   f.send({type:'hello',protocol:3});f.send({type:'create',name:'Latency fixture'});
   const {room}=await f.wait('room');assert.equal(room.members[0].name,'Latency fixture');
   assert.equal(f.transport.coordinator.rooms.size,1);
-  f.ws.close();await new Promise(resolve=>f.ws.once('close',resolve));
+  // The client's close event can precede the server's cleanup callback.
+  const serverClosed=new Promise(resolve=>[...f.transport.wss.clients][0].once('close',resolve));
+  const clientClosed=new Promise(resolve=>f.ws.once('close',resolve));
+  f.ws.close();await Promise.all([serverClosed,clientClosed]);
   assert.equal(f.transport.coordinator.rooms.size,0);
 });
 
