@@ -69,7 +69,9 @@ npm run native:validate -- <candidate-id>
 Validation runs in the candidate project, not against a moving stable source:
 
 1. `native-source.py check` verifies the candidate baseline/patch contract.
-2. Node network, lobby and adapter contract tests run.
+2. Node network, shard routing, idle cleanup, bounded load-tool integration,
+   lobby admission and adapter contract tests run. Load-tool integration uses
+   a small local fixture; it does not manufacture public 100-user acceptance.
 3. The controlled-delay network regression runs separately. This tests the real
    coordinator with simulated transport timing, not an actual engine battle.
 4. `cargo test --lib browser_network` tests the production Rust pipeline module.

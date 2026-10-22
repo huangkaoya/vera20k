@@ -1,12 +1,13 @@
 // VERA-native protocol v3: bounded ahead-of-time inputs and independent CRCs. This module has no Node imports so the same room /
 // lockstep authority can be hosted locally and in a web runtime.
+import {nativeInternalErrorDetails} from './native-room-diagnostics.mjs';
 export const NATIVE_PROTOCOL = 3;
 export const INPUT_DELAY_TICKS = 8;
 const CHECKSUM = /^retail:\d+:[a-f0-9]{8}$/;
 const COUNTRIES = new Set(['America','Korea','France','Germany','GreatBritain','Libya','Iraq','Cuba','Russia','Yuri']);
 const OPTIONS = Object.freeze({credits:10000,unitCount:10,gameSpeed:3,shortGame:true,superWeapons:true,crates:true,mcvRepacks:true,buildOffAlly:false,destroyableBridges:true});
 const clone = value => JSON.parse(JSON.stringify(value));
-const ensure = (condition,message) => {if(!condition)throw new Error(message);};
+const ensure = (condition,message,code) => {if(!condition)throw Object.assign(new Error(message),code?{code}:{});};
 const integer = (value,min,max,label) => {ensure(Number.isSafeInteger(value)&&value>=min&&value<=max,`无效的${label}`);return value;};
 const cleanName = value => typeof value==='string'&&value.trim()?value.trim().slice(0,24):'指挥官';
 function roomName(value,members) {
@@ -16,7 +17,20 @@ function roomName(value,members) {
   return name;
 }
 const hash = value => typeof value==='string'&&/^[a-z0-9:_-]{1,160}$/i.test(value);
-function randomCode() {return Array.from(crypto.getRandomValues(new Uint8Array(3)),x=>x.toString(16).padStart(2,'0')).join('').toUpperCase();}
+function randomCode(prefix) {
+  const hex=Array.from(crypto.getRandomValues(new Uint8Array(3)),x=>x.toString(16).padStart(2,'0')).join('').toUpperCase();
+  return prefix===null?hex:prefix+hex.slice(0,5);
+}
+function retireRoom(service,room,reason,force=false) {
+  if(!room||room.phase==='stopped'&&!force)return;
+  room.phase='stopped';clearTimeout(room.timer);service.rooms.delete(room.code);
+  const members=[...room.members];room.members=[];
+  for(const member of members){member.room=null;member.ready=false;}
+  for(const member of members){
+    service.send(member,{type:'stopped',matchId:room.matchId??null,reason});service.send(member,{type:'room',room:null});
+  }
+  room.frames.clear();room.loaded.clear();room.finished?.clear();room.checksums?.clear();
+}
 function configFor(value,members) {
   ensure(!value||(typeof value==='object'&&!Array.isArray(value)),'无效的房间设置');
   value??={};
@@ -42,14 +56,38 @@ function configFor(value,members) {
 }
 
 export class NativeRoomCoordinator {
-  constructor({loadingTimeoutMs=300000,turnTimeoutMs=30000,maxClients=64,maxRooms=32}={}) {
+  constructor({loadingTimeoutMs=300000,turnTimeoutMs=30000,maxClients=64,maxRooms=32,codePrefix=null,onClientCountChanged=(_count)=>{}}={}) {
+    ensure(codePrefix===null||typeof codePrefix==='string'&&/^S[0-7]$/.test(codePrefix),'Invalid native room code prefix');
+    ensure(typeof onClientCountChanged==='function','Invalid native client count callback');
     this.rooms=new Map();this.clients=new Set();this.loadingTimeoutMs=loadingTimeoutMs;this.turnTimeoutMs=turnTimeoutMs;
-    this.maxClients=maxClients;this.maxRooms=maxRooms;
+    this.maxClients=maxClients;this.maxRooms=maxRooms;this.codePrefix=codePrefix;this.onClientCountChanged=onClientCountChanged;
   }
   connect({send,close}) {
-    ensure(this.clients.size<this.maxClients,'当前服务器人数已满');
-    const client={id:crypto.randomUUID(),send,close,room:null,name:'指挥官',slot:0,ready:false,protocol:null};
-    this.clients.add(client);this.send(client,{type:'hello',protocol:NATIVE_PROTOCOL,playerId:client.id});return client;
+    ensure(this.clients.size<this.maxClients,'当前服务器人数已满','CLIENT_CAPACITY');
+    const client={id:crypto.randomUUID(),send,close,room:null,name:'指挥官',slot:0,ready:false,protocol:null,lastSeenAt:Date.now()};
+    this.clients.add(client);this.notifyClientCountChanged(client);
+    if(this.clients.has(client))this.send(client,{type:'hello',protocol:NATIVE_PROTOCOL,playerId:client.id});return client;
+  }
+  notifyClientCountChanged(client) {try{this.onClientCountChanged(this.clients.size);}catch(error){this.handleInternalError(client,error,'client-count');}}
+  markClientActive(client,now=Date.now()) {if(this.clients.has(client)&&Number.isFinite(now))client.lastSeenAt=now;}
+  reportInternalError(error,callback) {
+    try{console.error(JSON.stringify(nativeInternalErrorDetails(error,callback)));}catch{}
+  }
+  handleInternalError(client,error,callback,room=client?.room) {
+    this.reportInternalError(error,callback);
+    try{if(room)retireRoom(this,room,'服务器内部错误，对战已停止。',true);}catch(cleanupError){this.reportInternalError(cleanupError,'internal-cleanup');}
+    try{if(client)this.disconnect(client);}catch(cleanupError){this.reportInternalError(cleanupError,'internal-cleanup');}
+    try{client?.close(1011,'Internal server error');}catch(cleanupError){this.reportInternalError(cleanupError,'internal-cleanup');}
+  }
+  expireIdleClients({now=Date.now(),idleMs=45000}={}) {
+    ensure(Number.isFinite(now)&&Number.isFinite(idleMs)&&idleMs>0,'Invalid native idle deadline');
+    let expired=0;
+    for(const client of [...this.clients])if(now-client.lastSeenAt>=idleMs){
+      expired++;
+      try{this.disconnect(client);}catch(error){this.handleInternalError(client,error,'watchdog');continue;}
+      try{client.close(1001,'Idle connection expired');}catch(error){this.reportInternalError(error,'idle-close');}
+    }
+    return expired;
   }
   send(client,message) {try{client.send(JSON.stringify(message));}catch{this.disconnect(client);}}
   broadcast(room,message) {for(const member of [...room.members])this.send(member,message);}
@@ -60,15 +98,8 @@ export class NativeRoomCoordinator {
       config:clone(room.config),status:room.phase==='lobby'?'分享房间号，等待另一位指挥官加入。':room.phase==='loading'?'正在同步战场部署…':'对战进行中'};
   }
   update(room) {for(const member of [...room.members])this.send(member,{type:'room',room:this.view(room,member)});}
-  arm(room,ms,reason) {clearTimeout(room.timer);room.timer=setTimeout(()=>this.stop(room,reason),ms);room.timer.unref?.();}
-  stop(room,reason) {
-    if(room.phase==='stopped')return;
-    room.phase='stopped';clearTimeout(room.timer);this.rooms.delete(room.code);
-    for(const member of [...room.members]){
-      member.room=null;member.ready=false;this.send(member,{type:'stopped',matchId:room.matchId??null,reason});this.send(member,{type:'room',room:null});
-    }
-    room.members=[];room.frames.clear();room.loaded.clear();room.finished?.clear();room.checksums?.clear();
-  }
+  arm(room,ms,reason) {clearTimeout(room.timer);room.timer=setTimeout(()=>{try{this.stop(room,reason);}catch(error){this.handleInternalError(room.members[0],error,'room-timer',room);}},ms);room.timer.unref?.();}
+  stop(room,reason) {retireRoom(this,room,reason);}
   leave(client) {
     const room=client.room;if(!room)return;
     const player=room.order?.indexOf(client),receipt=room.finished?.get(player);
@@ -85,7 +116,7 @@ export class NativeRoomCoordinator {
     for(const member of room.members)member.ready=member.id===room.host;
     room.config=configFor(room.config,room.members);this.update(room);this.send(client,{type:'room',room:null});
   }
-  disconnect(client) {if(!this.clients.delete(client))return;this.leave(client);}
+  disconnect(client) {if(!this.clients.delete(client))return;try{this.leave(client);}finally{this.notifyClientCountChanged(client);}}
   requireRoom(client,phase,matchId) {
     const room=client.room;ensure(room,'请先加入房间');
     if(phase)ensure(room.phase===phase,'当前房间状态不允许此操作');
@@ -96,13 +127,15 @@ export class NativeRoomCoordinator {
     try {
       ensure(typeof text==='string'&&text.length<=262144,'房间消息过大');
       const message=JSON.parse(text);ensure(message&&typeof message.type==='string','无效的房间消息');
+      if(message.type==='hello')ensure(message.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');
+      else ensure(client.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');
+      this.markClientActive(client);
       // Output already in flight when both native result owners completed is
       // harmless. A finished socket cannot author another world frame.
       if(client.completedMatchId===message.matchId&&['input','checksum','finished','chat','taunt'].includes(message.type)){
         if(message.type==='finished')ensure(message.tick===client.completedReceipt?.tick&&message.checksum===client.completedReceipt?.checksum,'重复结束对局内容不一致');
         return;
       }
-      if(message.type!=='hello')ensure(client.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');
       switch(message.type) {
         case 'hello': {
           ensure(message.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');client.protocol=NATIVE_PROTOCOL;
@@ -110,15 +143,17 @@ export class NativeRoomCoordinator {
           // advisory only and never supplies player/command authority.
           break;
         }
+        case 'ping':this.send(client,{type:'pong'});break;
         case 'create': {
-          ensure(!client.room,'请先离开当前房间');ensure(this.rooms.size<this.maxRooms,'服务器房间已满');
+          ensure(!client.room,'请先离开当前房间');ensure(this.rooms.size<this.maxRooms,'服务器房间已满','ROOM_CAPACITY');
           client.name=cleanName(message.name);client.slot=0;client.ready=true;
-          let code;do{code=randomCode();}while(this.rooms.has(code));
+          let code;do{code=randomCode(this.codePrefix);}while(this.rooms.has(code));
           const room={code,host:client.id,members:[client],phase:'lobby',config:null,frames:new Map(),loaded:new Map(),progress:new Map(),timer:null};
           room.config=configFor(message.config,room.members);client.room=room;this.rooms.set(code,room);this.update(room);break;
         }
         case 'join': {
-          ensure(!client.room,'请先离开当前房间');const room=this.rooms.get(String(message.code??'').trim().toUpperCase());
+          ensure(!client.room,'请先离开当前房间');const code=String(message.code??'').trim().toUpperCase();
+          ensure(/^(?:[A-F0-9]{6}|S[0-7][A-F0-9]{5})$/.test(code),'无效的房间号');const room=this.rooms.get(code);
           ensure(room?.phase==='lobby','找不到可加入的房间');ensure(room.members.length<2,'房间已满');
           client.name=roomName(message.name,room.members);client.slot=1;client.ready=false;client.room=room;room.members.push(client);
           room.config=configFor(room.config,room.members);this.update(room);break;
@@ -244,7 +279,8 @@ export class NativeRoomCoordinator {
         case 'leave':this.leave(client);break;
         default:throw new Error('不支持的原生联机消息');
       }
-    }catch(error){this.send(client,{type:'error',error:error instanceof Error?error.message:String(error)});}
+    }catch(error){this.send(client,{type:'error',error:error instanceof Error?error.message:String(error),
+      ...(error?.code==='ROOM_CAPACITY'?{code:'ROOM_CAPACITY'}:{})});}
   }
   drainTurns(room) {
     if(room.draining)return;
@@ -258,5 +294,5 @@ export class NativeRoomCoordinator {
       }
     } finally {room.draining=false;}
   }
-  close() {for(const room of [...this.rooms.values()])this.stop(room,'服务器已停止。');for(const client of [...this.clients]){try{client.close();}catch{}this.clients.delete(client);}}
+  close() {for(const room of [...this.rooms.values()])this.stop(room,'服务器已停止。');for(const client of [...this.clients]){this.disconnect(client);try{client.close();}catch{}}}
 }

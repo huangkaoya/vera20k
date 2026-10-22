@@ -6,6 +6,7 @@ import {fileURLToPath} from 'node:url';
 import {requestPath, openRegularFile, fingerprint, sendFile, sendJson, methods, failRequest, listen, closeServer, httpError} from './services/http-files.mjs';
 import {attachNativeMultiplayer} from './services/native-websocket.mjs';
 import {NATIVE_PROTOCOL} from './services/native-room-coordinator.mjs';
+import {NATIVE_ROOM_ROUTING} from './services/native-room-routing.mjs';
 import {isNativeAssetName,readNativeResourceManifest,readNativeContentIndex,verifyNativeBuild,nativeAssetManifestIdentity} from './native-build-manifest.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -54,7 +55,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
       if (pathname==='/api/health') {
         let ready=false;
         try {ready=(await fs.stat(path.join(nativeRoot,'vera20k_bg.wasm'))).isFile();}catch{}
-        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,patchSha256:build?.patchSha256,resourceManifestSha256:build?.resourceManifestSha256??nativeAssetManifestIdentity(index.manifest),renderer:'VERA wgpu/WebGPU',multiplayer:{protocol:NATIVE_PROTOCOL,rooms:multiplayer.coordinator.rooms.size,diagnosticRttMs},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
+        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,patchSha256:build?.patchSha256,resourceManifestSha256:build?.resourceManifestSha256??nativeAssetManifestIdentity(index.manifest),renderer:'VERA wgpu/WebGPU',roomRouting:NATIVE_ROOM_ROUTING,multiplayer:{protocol:NATIVE_PROTOCOL,rooms:[...multiplayer.coordinators.values()].reduce((total,value)=>total+value.rooms.size,0),diagnosticRttMs},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
       }
       if (pathname==='/api/native/resources') {sendJson(request,response,200,index.manifest);return;}
       if(/^\/content\/objects\/[a-f0-9]{64}$/.test(pathname)) {

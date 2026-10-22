@@ -39,6 +39,8 @@ npm run start:native-web
 
 独立 Cloudflare Worker、R2 和 Durable Object 的打包与部署说明见 [deployment/README.md](deployment/README.md)。本地代码、部署包和目标域名发布分别验证。
 
+当前按 100 人同时在线设计：新房间分到 8 个固定分片，每片最多 16 连接、8 房间；房间号包含分片，加入时直接路由。旧六位房号保留原路由。100 连接压力测试使用真实 WebSocket 的合成指令流，不能代替 100 个真实游戏引擎实玩；本地、公网和实际对局结果分别记录在 [联机验收记录](docs/native-network-validation.md)。
+
 ## 源码、补丁和构建
 
 - `native-client/`：完整 VERA 源码快照及本仓库的浏览器平台适配。

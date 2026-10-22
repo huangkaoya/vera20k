@@ -1,5 +1,6 @@
 import {DurableObject} from 'cloudflare:workers';
 import {NativeRoomCoordinator,NATIVE_PROTOCOL} from '../tools/services/native-room-coordinator.mjs';
+import {NATIVE_ROOM_ROUTING,parseNativeRoomShard,nativeRoomObjectName,nativeRoomCoordinatorOptions} from '../tools/services/native-room-routing.mjs';
 import release from './generated/release.json';
 
 const json=(value,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
@@ -53,11 +54,42 @@ async function objectResponse(request,env,entry) {
 export class NativeRooms extends DurableObject {
   constructor(ctx,env) {
     super(ctx,env);
-    this.coordinator=new NativeRoomCoordinator();
+    /** @type {NativeRoomCoordinator|null} */
+    this.coordinator=null;
+    /** @type {number|null|undefined} */
+    this.shard=undefined;
+    /** @type {ReturnType<typeof setInterval>|null} */
+    this.watchdog=null;
+  }
+  refreshWatchdog() {
+    if(!this.coordinator?.clients.size) {
+      if(this.watchdog!==null){clearInterval(this.watchdog);this.watchdog=null;}
+    } else if(this.watchdog===null) {
+      this.watchdog=setInterval(()=>{
+        try{this.coordinator.expireIdleClients({idleMs:45000});}
+        catch(error){this.coordinator.reportInternalError(error,'watchdog');}
+        finally{this.refreshWatchdog();}
+      },5000);
+    }
+  }
+  guard(client,callback,operation) {
+    try{return operation();}
+    catch(error){this.coordinator.handleInternalError(client,error,callback);}
+    finally{this.refreshWatchdog();}
   }
   async fetch(request) {
     if(!sameOrigin(request))return json({error:'Origin rejected'},403);
+    let shard;
+    try{shard=parseNativeRoomShard(new URL(request.url));}catch{return json({error:'Invalid room shard'},400);}
     if(request.method!=='GET'||request.headers.get('Upgrade')?.toLowerCase()!=='websocket')return json({error:'WebSocket upgrade required'},426);
+    // The outer Worker chooses a fixed object name from this same route. Keep
+    // each object pinned to its first validated shard without depending on an
+    // object ID retaining the original getByName() input across invocations.
+    if(this.coordinator&&this.shard!==shard)return json({error:'Room shard mismatch'},409);
+    if(!this.coordinator){
+      this.coordinator=new NativeRoomCoordinator({...nativeRoomCoordinatorOptions(shard),onClientCountChanged:()=>this.refreshWatchdog()});
+      this.shard=shard;
+    }
     const [clientSocket,serverSocket]=Object.values(new WebSocketPair());
     // Standard WebSocket ownership deliberately pins this instance while a
     // match exists. Node and DO share the same ephemeral coordinator; a host
@@ -65,27 +97,30 @@ export class NativeRooms extends DurableObject {
     serverSocket.accept();
     let client;
     const disconnect=()=>{if(client)this.coordinator.disconnect(client);};
-    serverSocket.addEventListener('message',event=>{
+    serverSocket.addEventListener('message',event=>this.guard(client,'message',()=>{
       if(typeof event.data!=='string'||new TextEncoder().encode(event.data).byteLength>262144){disconnect();serverSocket.close(1009,'Message too large');return;}
       this.coordinator.receive(client,event.data);
-    });
-    serverSocket.addEventListener('close',event=>{
+    }));
+    serverSocket.addEventListener('close',event=>this.guard(client,'close',()=>{
       // Record only transport metadata; close reasons and payloads may contain
       // client-controlled text and never belong in operational diagnostics.
       console.info(JSON.stringify({event:'native-socket-close',atMs:Date.now(),
         code:event.code,wasClean:event.wasClean,
         hasRoom:Boolean(client?.room),roomPhase:client?.room?.phase??null}));
       disconnect();
-    });
-    serverSocket.addEventListener('error',()=>{
+    }));
+    serverSocket.addEventListener('error',()=>this.guard(client,'error',()=>{
       console.error(JSON.stringify({event:'native-socket-error',atMs:Date.now(),
         hasRoom:Boolean(client?.room),roomPhase:client?.room?.phase??null}));
       disconnect();
-    });
+    }));
     try {
-      client=this.coordinator.connect({send:text=>serverSocket.send(text),close:()=>serverSocket.close(1001,'Server stopped')});
-    } catch {
-      serverSocket.close(1013,'Server capacity reached');
+      client=this.coordinator.connect({send:text=>serverSocket.send(text),close:(code=1001,reason='Server stopped')=>serverSocket.close(code,reason)});
+    } catch(error) {
+      if(error?.code==='CLIENT_CAPACITY')serverSocket.close(1013,'Server capacity reached');
+      else{this.coordinator.handleInternalError(client,error,'connect');serverSocket.close(1011,'Internal server error');}
+    } finally {
+      this.refreshWatchdog();
     }
     return new Response(null,{status:101,webSocket:clientSocket});
   }
@@ -98,10 +133,12 @@ export default {
     try {
       if(url.pathname==='/ws/native') {
         if(!sameOrigin(request))return json({error:'Origin rejected'},403);
-        return env.NATIVE_ROOMS.getByName('native-v3').fetch(request);
+        let shard;
+        try{shard=parseNativeRoomShard(url);}catch{return json({error:'Invalid room shard'},400);}
+        return env.NATIVE_ROOMS.getByName(nativeRoomObjectName(shard)).fetch(request);
       }
       if(!methodAllowed(request))return new Response(null,{status:405,headers:{Allow:'GET, HEAD'}});
-      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
+      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,roomRouting:NATIVE_ROOM_ROUTING,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
       if(url.pathname==='/api/native/resources')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.resources);
       if(url.pathname==='/native/build.json')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.build);
       let pathname;

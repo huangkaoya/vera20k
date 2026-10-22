@@ -277,7 +277,7 @@ class NativeUpdate:
     def gates():
         return [
             ("source", [sys.executable, "tools/native-source.py", "check"]),
-            ("network-contract", ["node", "--test", "tests/native-network.test.mjs", "tests/native-lobby-client.test.mjs", "tests/native-runtime-adapter.test.mjs"]),
+            ("network-contract", ["node", "--test", "tests/native-network.test.mjs", "tests/native-room-routing.test.mjs", "tests/native-network-liveness.test.mjs", "tests/native-network-load.test.mjs", "tests/native-lobby-admission.test.mjs", "tests/native-lobby-client.test.mjs", "tests/native-runtime-adapter.test.mjs"]),
             ("network-latency", ["node", "--test", "tests/native-network-latency.test.mjs"]),
             ("native-network", ["cargo", "test", "--locked", "--manifest-path", "native-client/Cargo.toml", "--lib", "browser_network"]),
             ("wasm-build", ["npm", "run", "build:native-web"]),

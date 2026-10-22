@@ -14,7 +14,17 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     open: false, connected: false, busy: false, status: '', error: '', matchId: null,
     nativeStarted: false, starting: false, stopped: false, inbound: []};
   let socket = null, socketEpoch = 0, connecting = null, cancelConnect = null, disposed = false, timer, draining = false;
-  let completion = null, transportFailure = null, published = null;
+  let completion = null, transportFailure = null, published = null, socketShard = null, creating = null;
+  let nextHeartbeatAt = 0;
+
+  function retryCreate() {
+    if (!creating || creating.attempt >= 7 || state.room || state.matchId || disposed) return false;
+    creating.attempt++;
+    const message = creating.message;
+    closeSocket();
+    void request(message, true);
+    return true;
+  }
 
   function currentCompletion() {
     return completion?.matchId === state.matchId && completion.epoch === socketEpoch;
@@ -42,13 +52,16 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     if (socket?.readyState !== WebSocket.OPEN) throw new Error('大厅连接已断开，请重新进入');
     socket.send(JSON.stringify(message));
   }
-  async function connect() {
+  async function connect(shard = socketShard) {
+    if (socket && socketShard !== shard) closeSocket();
     if (socket?.readyState === WebSocket.OPEN) return;
     if (connecting) return connecting;
     const epoch = ++socketEpoch;
     const address = socketUrl ? new URL(socketUrl, location.href) : new URL('/ws/native', location.href);
+    if (shard === null) address.searchParams.delete('shard');
+    else address.searchParams.set('shard', String(shard));
     address.protocol = address.protocol === 'https:' ? 'wss:' : address.protocol === 'http:' ? 'ws:' : address.protocol;
-    const current = new WebSocket(address); socket = current;
+    const current = new WebSocket(address); socket = current; socketShard = shard;
     connecting = new Promise((resolve, reject) => {
       let settled = false;
       cancelConnect = () => { if (!settled) { settled = true; reject(new Error('已离开大厅')); } };
@@ -56,6 +69,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
         if (epoch !== socketEpoch || socket !== current || disposed) return;
         state.connected = true;
         current.send(JSON.stringify({type: 'hello', protocol: 3, playerId}));
+        nextHeartbeatAt = Date.now() + 15000;
         settled = true; resolve(); render();
       });
       current.addEventListener('message', event => {
@@ -78,17 +92,26 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
         }));
         socket = null; connecting = null; state.connected = false; state.busy = false;
         if (!settled) { settled = true; reject(new Error('联机服务连接已关闭')); }
+        // Capacity rejection is known to precede room creation. Other broken
+        // connections must not replay create: its outcome could be unknown.
+        if (event.code === 1013 && retryCreate()) return;
+        creating = null;
         if (state.matchId) transportFailed('联机连接已中断，对局已停止。');
         else if (state.open) { state.room = null; state.error = '大厅连接已关闭，请重新创建或加入。'; render(); }
       });
     }).finally(() => { if (epoch === socketEpoch) { connecting = null; cancelConnect = null; } });
     return connecting;
   }
-  async function request(message) {
+  async function request(message, retry = false) {
+    if (message.type === 'create' && !retry) creating = {message, first: Math.floor(Math.random() * 8), attempt: 0};
+    else if (message.type !== 'create') creating = null;
     state.busy = true; state.error = ''; render();
-    const connection = connect(); const epoch = socketEpoch;
+    const joinedShard = message.type === 'join' && /^S[0-7][0-9A-F]{5}$/.test(message.code) ? Number(message.code[1]) : null;
+    const shard = message.type === 'create' ? (creating.first + creating.attempt) % 8
+      : message.type === 'join' ? joinedShard : socketShard;
+    const connection = connect(shard); const epoch = socketEpoch;
     try { await connection; if (epoch !== socketEpoch || disposed) return false; sendNow(message); return true; }
-    catch (error) { if (epoch === socketEpoch && !disposed) report(error); return false; }
+    catch (error) { if (epoch === socketEpoch && !disposed) { creating = null; report(error); } return false; }
   }
   function closeSocket() {
     ++socketEpoch; cancelConnect?.(); cancelConnect = null;
@@ -131,10 +154,18 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
       return;
     }
     if (message.type === 'room') {
+      if (message.room) creating = null;
       state.room = message.room; state.status = message.room?.status ?? ''; state.busy = false;
       if (!state.stopped) state.error = ''; render(); return;
     }
-    if (message.type === 'error') { receiveError(message.error ?? '大厅操作失败'); return; }
+    if (message.type === 'error') {
+      if (message.code === 'ROOM_CAPACITY' && retryCreate()) return;
+      creating = null;
+      // A rejected join/create owns no room. Release its connection slot so
+      // failed lookups cannot crowd out guests joining acknowledged rooms.
+      if (!state.room && !state.matchId) closeSocket();
+      receiveError(message.error ?? '大厅操作失败'); return;
+    }
     if (message.type === 'start') {
       if (state.matchId === message.matchId) return;
       if (state.matchId) throw new Error('已有对局尚未退出');
@@ -162,6 +193,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     state.room = null; state.busy = false; state.error = ''; state.status = ''; render();
   }
   function back() {
+    creating = null;
     if (state.matchId) { native.network_leave(state.matchId); return; }
     leaveRoom(); closeSocket(); setOpen(false);
   }
@@ -252,6 +284,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     setOpen(state.stopped);
   };
   const returned = () => {
+    creating = null;
     if (disposed) return;
     if (socket?.readyState === WebSocket.OPEN) sendNow({type: 'leave'});
     completion = null; transportFailure = null;
@@ -260,6 +293,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     closeSocket(); setOpen(false);
   };
   const failed = () => {
+    creating = null;
     if (disposed) return;
     if (socket?.readyState === WebSocket.OPEN) sendNow({type: 'leave'});
     completion = null; transportFailure = null;
@@ -294,6 +328,10 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
   function timerDrain() {
     clearTimeout(timer);
     if (disposed) return;
+    if (socket?.readyState === WebSocket.OPEN && Date.now() >= nextHeartbeatAt) {
+      try { sendNow({type: 'ping'}); nextHeartbeatAt = Date.now() + 15000; }
+      catch (error) { transportFailed('联机连接发生错误，对局已停止。'); }
+    }
     drain();
     timer = setTimeout(timerDrain, document.hidden ? 100 : 25);
   }
@@ -304,7 +342,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
   timerDrain(); render();
   return {dispatch, dispose() {
     if (disposed) return;
-    disposed = true; clearTimeout(timer); closeSocket();
+    disposed = true; creating = null; clearTimeout(timer); closeSocket();
     window.removeEventListener('vera-native-network-service', drain);
     document.removeEventListener('visibilitychange', timerDrain);
     window.removeEventListener('vera-native-network', open);

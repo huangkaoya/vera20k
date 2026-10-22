@@ -42,8 +42,34 @@ for(const file of [coreFile,optionalFile]) {
 }
 release.objects['/native/vera20k_bg.wasm']=entry(wasmFile,'application/wasm');
 release.objects[wasmFile.download.url]=entry(wasmFile.download,'application/gzip');
-async function fixture(t) {
-  const output=await build({entryPoints:[path.join(directory,'native-worker.mjs')],bundle:true,format:'esm',write:false,external:['cloudflare:workers'],plugins:[{name:'release-fixture',setup(api){api.onResolve({filter:/generated\/release\.json$/},()=>({path:'release',namespace:'fixture'}));api.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:JSON.stringify(release),loader:'json'}));}}]});
+const instrumentedRoomEntry=`
+import worker,{NativeRooms as ActualNativeRooms} from './native-worker.mjs';
+export class NativeRooms extends ActualNativeRooms {
+  inspect(){return {watchdog:this.watchdog!==null,clients:this.coordinator?.clients.size??0,rooms:this.coordinator?.rooms.size??0,internalCallbacks:this.internalCallbacks??[]};}
+  ageClients(){for(const client of this.coordinator.clients)client.lastSeenAt=Date.now()-60000;}
+  trackInternalErrors(){
+    const handle=this.coordinator.handleInternalError.bind(this.coordinator);this.internalCallbacks=[];
+    this.coordinator.handleInternalError=(client,error,callback)=>{this.internalCallbacks.push(callback);return handle(client,error,callback);};
+  }
+  faultReceive(id){
+    const receive=this.coordinator.receive.bind(this.coordinator);this.trackInternalErrors();
+    this.coordinator.receive=(client,text)=>{if(client.id===id)throw new Error('TEST_SECRET_MUST_NOT_BE_LOGGED');return receive(client,text);};
+  }
+  faultConnect(){this.trackInternalErrors();this.coordinator.connect=()=>{throw new TypeError('TEST_SECRET_MUST_NOT_BE_LOGGED');};}
+}
+export default {async fetch(request,env){
+  const url=new URL(request.url),room=env.NATIVE_ROOMS.getByName('native-v3-shard-0');
+  if(url.pathname==='/__test/native-state')return Response.json(await room.inspect());
+  if(url.pathname==='/__test/native-age'){await room.ageClients();return Response.json({ok:true});}
+  if(url.pathname==='/__test/native-fault'){await room.faultReceive(url.searchParams.get('id'));return Response.json({ok:true});}
+  if(url.pathname==='/__test/native-connect-fault'){await room.faultConnect();return Response.json({ok:true});}
+  return worker.fetch(request,env);
+}};`;
+async function fixture(t,{directObjectName,instrumentRooms=false}={}) {
+  // A test-only outer handler can deliberately bypass normal shard routing to
+  // exercise the Durable Object's own validation with an intact request URL.
+  const entry=instrumentRooms?{stdin:{contents:instrumentedRoomEntry,resolveDir:directory}}:directObjectName?{stdin:{contents:`export {NativeRooms} from './native-worker.mjs';export default {fetch(request,env){return env.NATIVE_ROOMS.getByName(${JSON.stringify(directObjectName)}).fetch(request);}}`,resolveDir:directory}}:{entryPoints:[path.join(directory,'native-worker.mjs')]};
+  const output=await build({...entry,bundle:true,format:'esm',write:false,external:['cloudflare:workers'],plugins:[{name:'release-fixture',setup(api){api.onResolve({filter:/generated\/release\.json$/},()=>({path:'release',namespace:'fixture'}));api.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:JSON.stringify(release),loader:'json'}));}}]});
   const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:output.outputFiles[0].text,compatibilityDate:'2026-10-19',durableObjects:{NATIVE_ROOMS:{className:'NativeRooms',useSQLite:true}},r2Buckets:['NATIVE_DATA'],serviceBindings:{ASSETS:request=>new Response(new URL(request.url).pathname==='/index.html'?'native index':'not found',{status:new URL(request.url).pathname==='/index.html'?200:404})}}));
   t.after(()=>mf.dispose());
   const bucket=await mf.getR2Bucket('NATIVE_DATA');
@@ -142,18 +168,19 @@ test('post-deployment release gate rejects catalog drift, optional gaps and miss
   assert.throws(()=>validateRelease(value),/shared gameplay identity/);
 });
 
-async function socket(mf) {
-  const response=await mf.dispatchFetch('https://game.test/ws/native',{headers:{Upgrade:'websocket',Origin:'https://game.test'}});
+async function socket(mf,query='') {
+  const response=await mf.dispatchFetch('https://game.test/ws/native'+query,{headers:{Upgrade:'websocket',Origin:'https://game.test'}});
   assert.equal(response.status,101);const ws=response.webSocket,messages=[],waiters=[];
+  const closed=new Promise(resolve=>ws.addEventListener('close',event=>resolve({code:event.code,wasClean:event.wasClean})));
   ws.addEventListener('message',event=>{const message=JSON.parse(event.data);messages.push(message);for(const waiter of [...waiters])if(waiter.type===message.type&&waiter.predicate(message)){waiters.splice(waiters.indexOf(waiter),1);waiter.resolve(message);}});
   ws.accept();
-  return {ws,messages,send:value=>ws.send(JSON.stringify(value)),wait:(type,predicate=()=>true)=>{
+  return {ws,messages,closed,send:value=>ws.send(JSON.stringify(value)),wait:(type,predicate=()=>true)=>{
     const prior=messages.find(message=>message.type===type&&predicate(message));if(prior)return Promise.resolve(prior);
     return new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Timed out waiting for '+type)),5000);waiters.push({type,predicate,resolve:value=>{clearTimeout(timer);resolve(value);}});});
   }};
 }
-async function launchPair(t,mf) {
-  const a=await socket(mf),b=await socket(mf);t.after(()=>{for(const client of [a,b])if(client.ws.readyState===1)client.ws.close();});
+async function launchPair(t,mf,query='') {
+  const a=await socket(mf,query),b=await socket(mf,query);t.after(()=>{for(const client of [a,b])if(client.ws.readyState===1)client.ws.close();});
   assert.equal((await a.wait('hello')).protocol,3);
   for(const client of [a,b])client.send({type:'hello',protocol:3});
   a.send({type:'create',name:'Host'});const room=(await a.wait('room')).room;
@@ -168,11 +195,104 @@ async function launchPair(t,mf) {
   const ready=await a.wait('ready');assert.equal(ready.tick,101);assert.equal(ready.bootstrap,start.matchId);assert.deepEqual(await b.wait('ready'),ready);
   return {a,b,start,ready,room};
 }
+async function until(predicate,timeoutMs=2000) {
+  const started=Date.now();
+  for(;;){const value=await predicate();if(value)return value;if(Date.now()-started>=timeoutMs)throw new Error('Timed out waiting for room lifecycle');await new Promise(resolve=>setTimeout(resolve,20));}
+}
+async function closedWithin(client,timeoutMs=2000) {
+  let timer;
+  try{return await Promise.race([client.closed,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Timed out waiting for socket close')),timeoutMs);})]);}
+  finally{clearTimeout(timer);}
+}
+test('Durable Object watchdog starts only with clients and stops on last close or idle expiration',async t=>{
+  const {mf}=await fixture(t,{instrumentRooms:true}),state=async()=>await (await mf.dispatchFetch('https://game.test/__test/native-state')).json();
+  assert.deepEqual(await state(),{watchdog:false,clients:0,rooms:0,internalCallbacks:[]});
+  const first=await socket(mf,'?shard=0');t.after(()=>{if(first.ws.readyState===1)first.ws.close();});await first.wait('hello');
+  assert.deepEqual(await state(),{watchdog:true,clients:1,rooms:0,internalCallbacks:[]});
+  first.ws.close();await until(async()=>!(await state()).watchdog);assert.equal((await state()).clients,0);
+  const second=await socket(mf,'?shard=0');t.after(()=>{if(second.ws.readyState===1)second.ws.close();});await second.wait('hello');
+  assert.equal((await state()).watchdog,true);
+  await mf.dispatchFetch('https://game.test/__test/native-age');
+  assert.equal((await closedWithin(second,6500)).code,1001);
+  assert.deepEqual(await state(),{watchdog:false,clients:0,rooms:0,internalCallbacks:[]});
+});
+test('Durable Object callback faults stop only the affected room and report once',async t=>{
+  const {mf}=await fixture(t,{instrumentRooms:true}),clients=[];t.after(()=>{for(const client of clients)if(client.ws.readyState===1)client.ws.close();});
+  for(let index=0;index<4;index++){const client=await socket(mf,'?shard=0');clients.push(client);client.identity=await client.wait('hello');client.send({type:'hello',protocol:3});}
+  const [a,b,c,d]=clients;
+  a.send({type:'create',name:'Affected host'});const roomA=(await a.wait('room')).room;b.send({type:'join',name:'Affected guest',code:roomA.code});await b.wait('room');
+  c.send({type:'create',name:'Healthy host'});const roomC=(await c.wait('room')).room;d.send({type:'join',name:'Healthy guest',code:roomC.code});await d.wait('room');
+  await mf.dispatchFetch('https://game.test/__test/native-fault?id='+a.identity.playerId);
+  a.send({type:'ping'});await b.wait('stopped');assert.equal((await closedWithin(a)).code,1011);
+  const snapshot=await (await mf.dispatchFetch('https://game.test/__test/native-state')).json();
+  assert.deepEqual(snapshot,{watchdog:true,clients:3,rooms:1,internalCallbacks:['message']});
+  for(const client of [c,d]){client.send({type:'ping'});assert.deepEqual(await client.wait('pong'),{type:'pong'});}
+  c.send({type:'config',config:{options:{credits:12000}}});assert.equal((await d.wait('room',message=>message.room?.config.options.credits===12000)).room.code,roomC.code);
+});
+test('Durable Object connect exceptions use internal-error closure rather than a capacity response',async t=>{
+  const {mf}=await fixture(t,{instrumentRooms:true}),healthy=await socket(mf,'?shard=0');t.after(()=>{if(healthy.ws.readyState===1)healthy.ws.close();});
+  await healthy.wait('hello');healthy.send({type:'hello',protocol:3});
+  await mf.dispatchFetch('https://game.test/__test/native-connect-fault');
+  const rejected=await socket(mf,'?shard=0');assert.equal((await closedWithin(rejected)).code,1011);
+  healthy.send({type:'ping'});assert.deepEqual(await healthy.wait('pong'),{type:'pong'});
+  assert.deepEqual(await (await mf.dispatchFetch('https://game.test/__test/native-state')).json(),{watchdog:true,clients:1,rooms:0,internalCallbacks:['connect']});
+});
+test('Worker exposes fixed room routing capacity without changing release identity',async t=>{
+  const {mf}=await fixture(t),health=await (await mf.dispatchFetch('https://game.test/api/health')).json();
+  assert.deepEqual(health.roomRouting,{shards:8,maxClientsPerShard:16,maxRoomsPerShard:8});
+  assert.equal(health.protocol,3);assert.equal(health.patchSha256,release.build.patchSha256);
+  assert.equal(health.resourceManifestSha256,resourceIdentity);assert.equal(health.contentCatalogIdentity,resources.catalogIdentity);
+});
+test('Worker rejects invalid shard queries and preserves same-origin upgrade checks',async t=>{
+  const {mf}=await fixture(t),headers={Upgrade:'websocket',Origin:'https://game.test'};
+  for(const query of ['?shard=','?shard=8','?shard=-1','?shard=00','?shard=1.0','?shard=0&shard=0','?shard=0&extra=1','?extra=1']) {
+    const response=await mf.dispatchFetch('https://game.test/ws/native'+query,{headers});
+    assert.equal(response.status,400,query);assert.deepEqual(await response.json(),{error:'Invalid room shard'});
+  }
+  assert.equal((await mf.dispatchFetch('https://game.test/ws/native?shard=0',{headers:{Upgrade:'websocket',Origin:'https://other.test'}})).status,403);
+  assert.equal((await mf.dispatchFetch('https://game.test/ws/native?shard=0',{headers:{Origin:'https://game.test'}})).status,426);
+});
+test('Worker isolates all eight shard rooms and retains the legacy six-hex route',async t=>{
+  const {mf}=await fixture(t),clients=[];t.after(()=>{for(const client of clients)if(client.ws.readyState===1)client.ws.close();});
+  const rooms=[];
+  for(let shard=0;shard<8;shard++) {
+    const client=await socket(mf,`?shard=${shard}`);clients.push(client);
+    await client.wait('hello');client.send({type:'hello',protocol:3});client.send({type:'create',name:'Shard host'});
+    const {room}=await client.wait('room');assert.match(room.code,new RegExp(`^S${shard}[A-F0-9]{5}$`));rooms.push(room);
+  }
+  const legacy=await socket(mf);clients.push(legacy);await legacy.wait('hello');legacy.send({type:'hello',protocol:3});legacy.send({type:'create',name:'Legacy host'});
+  assert.match((await legacy.wait('room')).room.code,/^[A-F0-9]{6}$/);
+  const guest=await socket(mf,'?shard=1');clients.push(guest);await guest.wait('hello');guest.send({type:'hello',protocol:3});
+  guest.send({type:'join',name:'Guest',code:rooms[0].code});assert.match((await guest.wait('error')).error,/找不到/);
+  guest.send({type:'join',name:'Guest',code:rooms[1].code});assert.equal((await guest.wait('room')).room.code,rooms[1].code);
+});
+test('Worker enforces sixteen clients and eight rooms per shard while a neighboring shard stays available',async t=>{
+  const {mf}=await fixture(t),clients=[];t.after(()=>{for(const client of clients)if(client.ws.readyState===1)client.ws.close();});
+  for(let index=0;index<16;index++) {
+    const client=await socket(mf,'?shard=0');clients.push(client);await client.wait('hello');client.send({type:'hello',protocol:3});
+    if(index<8){client.send({type:'create',name:'Capacity host'});assert.match((await client.wait('room')).room.code,/^S0[A-F0-9]{5}$/);}
+  }
+  clients[8].send({type:'create',name:'Ninth room'});const capacity=await clients[8].wait('error');assert.match(capacity.error,/房间已满/);assert.equal(capacity.code,'ROOM_CAPACITY');
+  const overflow=await socket(mf,'?shard=0');clients.push(overflow);assert.equal((await overflow.closed).code,1013);
+  const neighbor=await socket(mf,'?shard=1');clients.push(neighbor);await neighbor.wait('hello');neighbor.send({type:'hello',protocol:3});neighbor.send({type:'create',name:'Available host'});
+  assert.match((await neighbor.wait('room')).room.code,/^S1[A-F0-9]{5}$/);
+});
+test('Durable Object validates shard queries before accepting a socket and locks its coordinator route',async t=>{
+  const {mf}=await fixture(t,{directObjectName:'direct-shard-test'});
+  const headers={Upgrade:'websocket',Origin:'https://game.test'};
+  const direct=query=>mf.dispatchFetch('https://game.test/ws/native'+query,{headers});
+  assert.equal((await direct('?shard=8')).status,400);
+  const accepted=await direct('?shard=4');assert.equal(accepted.status,101);
+  accepted.webSocket.accept();t.after(()=>{if(accepted.webSocket.readyState===1)accepted.webSocket.close();});
+  assert.equal((await direct('?shard=4&shard=4')).status,400);
+  assert.equal((await direct('?shard=3')).status,409);
+  assert.equal((await direct('')).status,409);
+});
 test('Durable Object shares v3 pipeline authority, ownership checks and independent CRC',async t=>{
   const {mf}=await fixture(t);
   assert.equal((await mf.dispatchFetch('https://game.test/ws/native',{headers:{Upgrade:'websocket'}})).status,403);
   assert.equal((await mf.dispatchFetch('https://game.test/ws/native',{headers:{Upgrade:'websocket',Origin:'https://other.test'}})).status,403);
-  const {a,b,start,ready}=await launchPair(t,mf);
+  const {a,b,start,ready}=await launchPair(t,mf,'?shard=7');
   assert.equal(ready.protocol,3);assert.equal(ready.inputDelayTicks,8);
   a.send({type:'input',matchId:start.matchId,tick:101,prevHash:'old-v2',commands:[]});
   await a.wait('error');

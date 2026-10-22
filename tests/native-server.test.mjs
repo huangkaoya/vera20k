@@ -45,6 +45,8 @@ test('native shell serves real WASM and native media, preserving private profile
   assert.equal(manifest.totalBytes,40);
   const health=JSON.parse((await request(app.url,'/api/health')).body);
   assert.equal(health.ok,true);assert.equal(health.app,'werhd-vera-native');
+  assert.deepEqual(health.roomRouting,{shards:8,maxClientsPerShard:16,maxRoomsPerShard:8});
+  assert.equal(health.multiplayer.rooms,0);assert.equal(app.multiplayer.coordinators.size,9);
   for (const route of ['/retail/RA2MD.INI','/retail/keyboard.ini','/retail/ra2md.mix','/native/leak.js','/native/../../secret.json','/native/%2e%2e/secret.json','/native-client/src/lib.rs','/tools/native-server.mjs']) {
     assert.ok([400,404].includes((await request(app.url,route)).status),route);
   }

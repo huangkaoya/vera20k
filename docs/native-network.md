@@ -86,15 +86,54 @@ candidate-bound acceptance requirements. See [native-updates.md](native-updates.
 
 ## Capacity boundary
 
-The current coordinator defaults to 64 connected clients and 32 rooms, all
-inside a single `native-v3` Durable Object in production. This repair does
-not establish 500-client capacity. Increasing these constants alone would
-not demonstrate capacity or remove a single-object event-processing limit.
+The requested deployment target is now 100 simultaneous users, tested as 50
+two-player rooms rather than 100 idle connections. New rooms are distributed
+over eight fixed Durable Objects, each limited to 16 connections and eight
+rooms. They share the exact coordinator/CRC contract; a room has one owner
+and never combines input from two shards. The local Node server uses the same
+eight-coordinator routing for integration and load checks.
 
-For 500 online users, distinguish lobby connections from active player-hours.
-At 20 TPS, input plus CRC per frame is 40 incoming messages per active player
-per second: 500 active players produce 20,000 events/second. A future Go
-service or room-sharded Durable Object deployment must retain the same
-admission, ordering, CRC and finish contract, then undergo connection,
-multi-room throughput, memory and lifecycle load tests. Existing sibling
-Go/WERHD repositories remain unchanged by this repair.
+`/ws/native?shard=0` through `shard=7` route to `native-v3-shard-N`.
+New room codes are seven alphanumeric characters: `S`, shard digit and five
+hex digits, for example `S3ABCDE`. Join extracts the explicit shard from this
+code. Legacy six-hex codes still use `/ws/native` and the old `native-v3`
+coordinator (64 connections / 32 rooms). Missing routing and an invalid query
+are distinct: duplicate/unknown query parameters and invalid shards fail 400.
+
+Create initially chooses a shard and tries each of the eight at most once
+when it receives an explicit pre-creation capacity rejection (`1013` or
+`ROOM_CAPACITY`). It closes the rejected connection and ignores old epoch
+callbacks. Ordinary broken connections never replay create, because the
+original room's creation outcome may be unknown. Acknowledged room membership
+ends this retry path. The limits describe admission, not proven throughput.
+
+At 20 TPS, input plus CRC per frame produces about 4,000 incoming messages per
+second across 100 active users. Sharding avoids concentrating all of these
+events on one object. It does not remove user/network RTT, packet loss or
+unexpected connection closure. Disconnected rooms still stop; reconnect/resume
+is not part of this protocol. No 500-user capacity claim is made.
+
+The existing invisible adapter sends an application ping every 15 seconds,
+including while waiting in the native lobby. It does not seal input or advance
+the simulation. The coordinator releases a client after 45 seconds without
+valid protocol traffic. A nonempty DO checks every five seconds and clears
+that timer as soon as its last client leaves. Node also uses its existing
+transport ping/pong. Callback failures stop the affected room and emit only
+sanitized error type/source frames; they do not fabricate successful turns.
+These bounds reclaim half-open slots; they do not provide reconnect/resume.
+
+Run the bounded real-WebSocket load tool only against this project or loopback:
+
+```sh
+node tools/native-network-load.mjs --origin=http://127.0.0.1:5280 --players=100 --ticks=2000 --tick-ms=48 --self-echo=true
+```
+
+It waits for all 100 peers to reach ready, then pumps all 50 rooms together,
+checks ordered turns and synthetic CRC receipts, and reopens all rooms. The
+report includes the common commit-overlap interval, per-peer TPS and cleanup.
+`ok` proves only protocol/lifecycle checks; TPS must be assessed separately.
+`engineGameplayVerified:false` is explicit because this tool loads no WASM
+world or renderer. Actual two-client gameplay is a separate acceptance gate.
+Results, including unsuccessful attempts, are recorded in
+[native-network-validation.md](native-network-validation.md). Existing sibling
+Go/WERHD repositories remain unchanged.

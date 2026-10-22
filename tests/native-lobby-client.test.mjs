@@ -15,12 +15,12 @@ function fixture(t) {
   class Socket extends EventTarget {
     static OPEN = 1;
     readyState = 0; sent = [];
-    constructor() { super(); sockets.push(this); }
+    constructor(url) { super(); this.url = new URL(url); sockets.push(this); }
     send(raw) { this.sent.push(JSON.parse(raw)); }
     close() { this.readyState = 3; }
     open() { this.readyState = 1; this.dispatchEvent(new Event('open')); }
     receive(message) { const event = new Event('message'); event.data = JSON.stringify(message); this.dispatchEvent(event); }
-    disconnect() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    disconnect(code = 1006) { this.readyState = 3; const event = new Event('close'); event.code = code; event.wasClean = code !== 1006; this.dispatchEvent(event); }
     error() { this.dispatchEvent(new Event('error')); }
   }
   for (const [name, value] of Object.entries({window, document, WebSocket: Socket,
@@ -56,6 +56,69 @@ function fixture(t) {
 }
 const result = (matchId = 'MATCH-1') => ({type: 'finished', matchId, tick: 8340, checksum: 'retail:8340:6c44133f'});
 const stopped = f => f.calls.filter(([type, message]) => type === 'receive' && message.type === 'stopped');
+
+test('new rooms choose a shard and capacity rejection retries another before room creation', async t => {
+  const f = fixture(t); await f.controller.dispatch('open');
+  const pending = f.controller.dispatch('create'), first = f.sockets.at(-1);
+  first.open(); await pending;
+  const shard = Number(first.url.searchParams.get('shard'));
+  assert.ok(Number.isInteger(shard) && shard >= 0 && shard < 8);
+  first.receive({type: 'error', code: 'ROOM_CAPACITY', error: 'full'});
+  const second = f.sockets.at(-1);
+  assert.notEqual(second, first); assert.equal(first.readyState, 3);
+  assert.equal(second.url.searchParams.get('shard'), String((shard + 1) % 8));
+  second.open(); await flush();
+  assert.equal(second.sent.filter(message => message.type === 'create').length, 1);
+  first.receive({type: 'room', room: room()}); assert.equal(f.current.room, null, 'old shard cannot publish a late room');
+  second.receive({type: 'room', room: room()}); assert.equal(f.current.phase, 'room');
+});
+
+test('connection-capacity retries are bounded and ordinary broken links never replay create', async t => {
+  const f = fixture(t); await f.controller.dispatch('open');
+  const pending = f.controller.dispatch('create'); f.sockets.at(-1).open(); await pending;
+  for (let attempt = 0; attempt < 7; attempt++) {
+    f.sockets.at(-1).disconnect(1013); f.sockets.at(-1).open(); await flush();
+  }
+  assert.equal(f.sockets.length, 8);
+  assert.equal(new Set(f.sockets.map(socket => socket.url.searchParams.get('shard'))).size, 8);
+  f.sockets.at(-1).disconnect(1013); await flush();
+  assert.equal(f.sockets.length, 8); assert.equal(f.current.busy, false); assert.ok(f.current.error);
+  const retry = f.controller.dispatch('create'); f.sockets.at(-1).open(); await retry;
+  const count = f.sockets.length; f.sockets.at(-1).disconnect(1006); await flush();
+  assert.equal(f.sockets.length, count, 'an unknown create outcome must never be replayed');
+});
+
+test('join routes shard codes deterministically and preserves legacy room lookup', async t => {
+  const f = fixture(t); await f.controller.dispatch('open');
+  let pending = f.controller.dispatch({action: 'join', code: ' s3abcde '});
+  let socket = f.sockets.at(-1); socket.open(); await pending;
+  assert.equal(socket.url.searchParams.get('shard'), '3');
+  assert.equal(socket.sent.at(-1).code, 'S3ABCDE');
+  socket.receive({type: 'error', error: 'room not found'});
+  assert.equal(socket.readyState, 3, 'failed lookup releases its shard slot');
+  assert.equal(f.current.connected, false);
+  pending = f.controller.dispatch({action: 'join', code: 'ABCDEF'});
+  const legacy = f.sockets.at(-1); assert.notEqual(legacy, socket); assert.equal(socket.readyState, 3);
+  legacy.open(); await pending;
+  assert.equal(legacy.url.searchParams.has('shard'), false);
+  assert.equal(legacy.sent.at(-1).code, 'ABCDEF');
+});
+
+test('idle lobby heartbeats retain transport without advancing or injecting native turns', async t => {
+  let clock = 1000; t.mock.method(Date, 'now', () => clock);
+  const f = fixture(t); await f.controller.dispatch('open');
+  const pending = f.controller.dispatch('create'), socket = f.sockets.at(-1); socket.open(); await pending;
+  socket.receive({type: 'room', room: room()});
+  const nativeCalls = f.calls.length, snapshots = f.states.length;
+  clock += 15000; [...f.timers.values()].at(-1).callback();
+  assert.deepEqual(socket.sent.at(-1), {type: 'ping'});
+  socket.receive({type: 'pong'});
+  assert.equal(f.calls.length, nativeCalls); assert.equal(f.states.length, snapshots);
+  const sent = socket.sent.length; [...f.timers.values()].at(-1).callback();
+  assert.equal(socket.sent.length, sent, 'heartbeat frequency remains bounded');
+  await f.controller.dispatch('close'); clock += 15000; [...f.timers.values()].at(-1).callback();
+  assert.equal(socket.sent.length, sent + 1, 'only the explicit leave was sent after close');
+});
 
 test('a native-confirmed result keeps its page after socket errors and close', async t => {
   const f = fixture(t), socket = await f.start();
