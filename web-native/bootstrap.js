@@ -6,6 +6,7 @@ import {createWerhdRuntime} from './runtime-adapter.js';
 import {installNativeLobby} from './lobby.js';
 import {installPointerCapture} from './pointer-capture.js';
 import {installMenuAnimationPrefetch} from './menu-animation.js';
+import {createWebHost} from './host.js';
 
 const status = document.querySelector('#status'), progress = document.querySelector('#progress');
 const startup = document.querySelector('#startup'), canvas = document.querySelector('#game');
@@ -14,6 +15,7 @@ const controller = new AbortController(), size = bytes => `${(bytes / 1048576).t
 let runtime, pointerCapture, menuAnimation, menuAnimationState = {state: 'idle'};
 let initialized = false, cacheWarning = false;
 const shell = createNativeShellBridge();
+const host = createWebHost();
 window.addEventListener('pagehide', event => {
   if (!event.persisted) { pointerCapture?.dispose(); menuAnimation?.dispose(); shell.dispose(); }
 });
@@ -39,7 +41,7 @@ function activationAllowed() {
 
 try {
   if (!navigator.gpu) throw new Error('当前浏览器未提供 WebGPU，请使用支持 WebGPU 的浏览器。');
-  const [build, catalog] = await Promise.all([json('/native/build.json'), json('/api/native/resources')]);
+  const [build, catalog] = await Promise.all([json(host.serviceUrl('/native/build.json')), json(host.serviceUrl('/api/native/resources'))]);
   const {catalogIdentity, ...catalogBody} = catalog;
   if (catalogIdentity !== await digest(new TextEncoder().encode(JSON.stringify(canonical(catalogBody))))
     || build.contentCatalogIdentity !== catalogIdentity || build.resourceManifestSha256 !== catalog.identity)
@@ -54,7 +56,7 @@ try {
       localStorage.removeItem('vera.content.selection.v1');
     }
   } catch {}
-  const plan = resolveContentPlan(catalog, selection), store = new ContentStore({onCacheStatus: event => {
+  const plan = resolveContentPlan(catalog, selection), store = new ContentStore({fetch: host.fetchContent, onCacheStatus: event => {
     if (['unavailable', 'write-failed'].includes(event.state)) cacheWarning = true;
   }});
   const content = createContentController({catalog, store,
@@ -79,10 +81,10 @@ try {
     status.textContent = event.cacheStatus === 'hit' ? '正在读取已校验的引擎缓存…'
       : `正在载入游戏引擎 ${size(event.attemptWireBytes)} / ${size(event.wireTotalBytes)}`;
   }});
-  runtime = await createWerhdRuntime({moduleUrl: `/native/werhd.js?sha256=${build.outputs['werhd.js'].sha256}`, engineBytes});
+  runtime = await createWerhdRuntime({moduleUrl: host.serviceUrl(`/native/werhd.js?sha256=${build.outputs['werhd.js'].sha256}`), engineBytes});
   shell.setRuntime(runtime);
   runtime.configureContent(plan.capabilities);
-  const font = new FontFace('WERHD UI', 'url(/fonts/FiraSansCondensed-Medium.ttf)', {weight: '500'});
+  const font = new FontFace('WERHD UI', `url("${host.assetUrl('fonts/FiraSansCondensed-Medium.ttf')}")`, {weight: '500'});
   document.fonts.add(await font.load());
   let cursor = 0, complete = 0, firstError;
   const progressByFile = new Map();
@@ -116,7 +118,7 @@ try {
     });
     observer.observe(canvas, {attributes: true, attributeFilter: ['data-werhd-stage', 'data-werhd-error']});
   });
-  const lobby = installNativeLobby({native: runtime.network, canvas, onState: state => shell.publish('lobby', state)});
+  const lobby = installNativeLobby({native: runtime.network, canvas, socketUrl: host.serviceUrl('/ws/native'), onState: state => shell.publish('lobby', state)});
   shell.attach('lobby', lobby);
   runtime.start(canvas);
   Object.defineProperty(window, '__werhdNative', {value: Object.freeze({sourceRevision: runtime.sourceRevision(),

@@ -2,9 +2,9 @@ import {DurableObject} from 'cloudflare:workers';
 import {NativeRoomCoordinator,NATIVE_PROTOCOL} from '../tools/services/native-room-coordinator.mjs';
 import {NATIVE_ROOM_ROUTING,parseNativeRoomShard,nativeRoomObjectName,nativeRoomCoordinatorOptions} from '../tools/services/native-room-routing.mjs';
 import release from './generated/release.json';
+import {nativeRequestOrigin,nativeCorsResponse,nativeCorsPreflight} from './native-origin.mjs';
 
 const json=(value,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
-const sameOrigin=request=>request.headers.get('Origin')===new URL(request.url).origin;
 const methodAllowed=request=>request.method==='GET'||request.method==='HEAD';
 
 function selectedRange(header,size) {
@@ -78,7 +78,7 @@ export class NativeRooms extends DurableObject {
     finally{this.refreshWatchdog();}
   }
   async fetch(request) {
-    if(!sameOrigin(request))return json({error:'Origin rejected'},403);
+    if(!nativeRequestOrigin(request))return json({error:'Origin rejected'},403);
     let shard;
     try{shard=parseNativeRoomShard(new URL(request.url));}catch{return json({error:'Invalid room shard'},400);}
     if(request.method!=='GET'||request.headers.get('Upgrade')?.toLowerCase()!=='websocket')return json({error:'WebSocket upgrade required'},426);
@@ -126,16 +126,15 @@ export class NativeRooms extends DurableObject {
   }
 }
 
-/** @satisfies {ExportedHandler<Env>} */
-export default {
-  async fetch(request,env) {
+/** @param {Request} request @param {Env} env */
+async function nativeResponse(request,env) {
     const url=new URL(request.url);
     try {
       if(url.pathname==='/ws/native') {
-        if(!sameOrigin(request))return json({error:'Origin rejected'},403);
+        if(!nativeRequestOrigin(request))return json({error:'Origin rejected'},403);
         let shard;
         try{shard=parseNativeRoomShard(url);}catch{return json({error:'Invalid room shard'},400);}
-        return env.NATIVE_ROOMS.getByName(nativeRoomObjectName(shard)).fetch(request);
+        return await env.NATIVE_ROOMS.getByName(nativeRoomObjectName(shard)).fetch(request);
       }
       if(!methodAllowed(request))return new Response(null,{status:405,headers:{Allow:'GET, HEAD'}});
       if(url.pathname==='/api/health')return json({ok:true,app:'werhd-native',protocol:NATIVE_PROTOCOL,roomRouting:NATIVE_ROOM_ROUTING,renderer:'WERHD wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
@@ -150,7 +149,7 @@ export default {
         return json({error:'Route not exposed'},404);
       const key=pathname.startsWith('/retail/')?pathname.toLowerCase():pathname;
       const entry=Object.hasOwn(release.objects,key)?release.objects[key]:null;
-      if(entry)return objectResponse(request,env,entry);
+      if(entry)return await objectResponse(request,env,entry);
       // Unlisted retail files and all source/config paths fail closed. ASSETS
       // contains only the intentionally packaged browser entry, JS and fonts.
       if(pathname.startsWith('/retail/')||pathname.startsWith('/content/')||pathname.endsWith('.wasm')||pathname.startsWith('/api/'))return json({error:'Route not exposed'},404);
@@ -164,5 +163,12 @@ export default {
       console.error(JSON.stringify({event:'native-request-failed',path:url.pathname,errorType:error?.name??'Error'}));
       return json({error:'Native service unavailable'},503);
     }
+}
+
+/** @satisfies {ExportedHandler<Env>} */
+export default {
+  async fetch(request,env) {
+    if(request.method==='OPTIONS')return nativeCorsPreflight(request);
+    return nativeCorsResponse(request,await nativeResponse(request,env));
   },
 };

@@ -6,6 +6,7 @@
   "scripts": {
     "setup:native-web": "node tools/setup-native-web.mjs",
     "build:native-web": "node tools/build-native-web.mjs",
+    "package:toy": "node tools/package-native-toy.mjs",
     "start:native-web": "node tools/native-server.mjs",
     "native:check": "python3 tools/native-source.py check",
     "native:record": "python3 tools/native-source.py record",

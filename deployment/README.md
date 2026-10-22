@@ -167,7 +167,8 @@ and [Pages migration routing guidance](https://developers.cloudflare.com/pages/m
 
 ## Runtime boundary
 
-`/ws/native` requires an exact same-origin `Origin` and forwards to the native
+`/ws/native` requires a validated same-origin or HTTPS `bilibilitoy.com`
+(including proper subdomains) `Origin` and forwards to the native
 v2 coordinator Durable Object. The current bound is 64 clients / 32 two-player
 rooms. It uses standard WebSockets so a connected match retains its coordinator
 in memory. Deploy/restart/disconnect terminates a match, like the local adapter;
@@ -176,3 +177,14 @@ there is no unimplemented promise of resuming a partially committed game.
 Cloudflare does not run the game WASM inside its Worker. Browsers run the
 WERHD client; the Worker streams assets and the coordinator admits
 ordered native commands and checks matching hashes.
+
+## Toy browser package
+
+`npm run package:toy` from the repository root exports the checked public release
+as a small static ZIP under `dist/toy/`. The catalog and immutable engine/art
+objects remain on this Worker; the uploaded pages use package-relative host
+assets and the same native game UI. HTTPS `bilibilitoy.com` and its proper
+subdomains receive explicit per-origin CORS for resource GET/HEAD and bounded
+preflights, and are admitted at both WebSocket boundaries. Other origins receive
+no CORS permission. R2 bucket policy is unchanged. See
+[the export workflow](../docs/native-toy.md).

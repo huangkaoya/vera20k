@@ -7,6 +7,7 @@ import {gzipSync,gunzipSync} from 'node:zlib';
 import {nativeAssetManifestIdentity,nativeContentCatalogIdentity} from '../tools/native-build-manifest.mjs';
 import {nativeReleaseObjects} from './prepare-native.mjs';
 import {validateRelease} from './verify-native.mjs';
+import {nativeRequestOrigin,nativeCorsResponse} from './native-origin.mjs';
 import {build} from '../node_modules/esbuild/lib/main.js';
 import {Miniflare,convertV4MiniflareOptions} from 'miniflare';
 
@@ -73,7 +74,8 @@ async function fixture(t,{directObjectName,instrumentRooms=false,staleEngineAsse
   const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:output.outputFiles[0].text,compatibilityDate:'2026-10-19',durableObjects:{NATIVE_ROOMS:{className:'NativeRooms',useSQLite:true}},r2Buckets:['NATIVE_DATA'],serviceBindings:{ASSETS:request=>{
     const pathname=new URL(request.url).pathname;
     if(pathname==='/index.html')return new Response('native index');
-    if(pathname==='/native/werhd.js')return new Response('WERHD browser module');
+    if(pathname==='/native/werhd.js')return new Response('WERHD browser module',{headers:{'Content-Type':'text/javascript','Vary':'Accept-Encoding'}});
+    if(pathname==='/fonts/FiraSansCondensed-Medium.ttf')return new Response('font fixture',{headers:{'Content-Type':'font/ttf'}});
     if(staleEngineAssets&&['/native/vera20k.js','/native/vera20k_bg.wasm'].includes(pathname))return new Response('stale engine asset');
     return new Response('not found',{status:404});
   }}}));
@@ -134,6 +136,100 @@ test('Worker exposes optional content by exact SHA and leaves explicit gzip byte
   assert.equal(range.status,206);assert.equal(range.headers.get('Content-Encoding'),null);
   const prefix=new Uint8Array(await range.arrayBuffer());assert.equal(prefix.length,10);
   assert.deepEqual([...prefix.slice(0,3)],[31,139,8]);
+});
+
+const toyOrigins=['https://bilibilitoy.com','https://www.bilibilitoy.com','https://preview-123.toy.bilibilitoy.com','https://bilibilitoy.com:443'];
+const foreignOrigins=['null','https://other.test','http://bilibilitoy.com','https://bilibilitoy.com:444',
+  'https://evilbilibilitoy.com','https://bilibilitoy.com.evil.test','https://bilibilitoy.com@evil.test',
+  'https://evil.test@bilibilitoy.com','https://.bilibilitoy.com','https://a..bilibilitoy.com',
+  'https://-preview.bilibilitoy.com','https://preview_.bilibilitoy.com','https://bilibilitoy.com.',
+  'https://bilibilitoy.com/','https://bilibilitoy.com/path','https://bilibilitoy.com?query',
+  'https://bilibilitoy.com#fragment','https://bilibilitoy.com https://other.test','not an origin'];
+const originRequest=origin=>new Request('https://game.test/native/build.json',{headers:origin===undefined?{}:{Origin:origin}});
+function assertCors(response,origin) {
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'),origin);
+  assert.equal(response.headers.get('Access-Control-Allow-Credentials'),null);
+  assert.match(response.headers.get('Vary'),/(?:^|,\s*)Origin(?:,|$)/i);
+}
+test('native Origin policy admits same-origin and HTTPS Toy domains with proper DNS boundaries',()=>{
+  for(const origin of ['https://game.test',...toyOrigins])assert.equal(nativeRequestOrigin(originRequest(origin)),origin,origin);
+  for(const origin of [undefined,...foreignOrigins])assert.equal(nativeRequestOrigin(originRequest(origin)),null,String(origin));
+  const response=new Response('static',{headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Credentials':'true','Vary':'Accept-Encoding'}});
+  const foreign=nativeCorsResponse(originRequest('https://other.test'),response);
+  assertCors(foreign,null);assert.match(foreign.headers.get('Vary'),/Accept-Encoding/);
+});
+test('Toy CORS covers manifests, JS, fonts, HEAD and immutable full/range/304/error responses',async t=>{
+  const {mf,bucket}=await fixture(t);
+  for(const origin of toyOrigins)for(const path of ['/api/health','/api/native/resources','/native/build.json','/native/werhd.js','/fonts/FiraSansCondensed-Medium.ttf',coreFile.download.url]) {
+    const response=await mf.dispatchFetch('https://game.test'+path,{headers:{Origin:origin}});
+    assert.equal(response.status,200,path);assertCors(response,origin);
+    assert.match(response.headers.get('Access-Control-Expose-Headers'),/ETag/);
+    if(path==='/api/native/resources')assert.deepEqual(await response.json(),release.resources);
+    else await response.arrayBuffer();
+  }
+  const origin='https://www.bilibilitoy.com';
+  const head=await mf.dispatchFetch('https://game.test/native/werhd_bg.wasm',{method:'HEAD',headers:{Origin:origin}});
+  assertCors(head,origin);assert.equal(head.headers.get('Content-Length'),String(wasmBytes.length));assert.equal((await head.arrayBuffer()).byteLength,0);
+  for(const [headers,status] of [[{Range:'bytes=0-9'},206],[{'If-None-Match':`"${coreFile.download.sha256}"`},304],[{Range:'bytes=999-'},416]]) {
+    const response=await mf.dispatchFetch('https://game.test'+coreFile.download.url,{headers:{Origin:origin,...headers}});
+    assert.equal(response.status,status);assertCors(response,origin);assert.equal(response.headers.get('Content-Encoding'),null);
+    if(status===206){assert.equal(response.headers.get('Content-Type'),'application/gzip');assert.equal(response.headers.get('Content-Range'),`bytes 0-9/${coreFile.download.bytes}`);}
+    await response.arrayBuffer();
+  }
+  for(const path of ['/content/objects/'+'f'.repeat(64),'/native/unknown.js','/api/unknown']) {
+    const response=await mf.dispatchFetch('https://game.test'+path,{headers:{Origin:origin}});
+    assert.equal(response.status,404);assertCors(response,origin);await response.arrayBuffer();
+  }
+  await bucket.put(object.key,bytes,{customMetadata:{sha256:'0'.repeat(64)}});
+  const unavailable=await mf.dispatchFetch('https://game.test'+coreFile.url,{headers:{Origin:origin}});
+  assert.equal(unavailable.status,503);assertCors(unavailable,origin);await unavailable.arrayBuffer();
+  for(const bad of foreignOrigins) {
+    const response=await mf.dispatchFetch('https://game.test/api/native/resources',{headers:{Origin:bad}});
+    assertCors(response,null);await response.arrayBuffer();
+  }
+});
+test('Toy preflight allows only GET/HEAD and explicit range/conditional request headers without credentials',async t=>{
+  const {mf}=await fixture(t),origin='https://www.bilibilitoy.com';
+  for(const method of ['GET','HEAD']) {
+    const response=await mf.dispatchFetch('https://game.test'+coreFile.download.url,{method:'OPTIONS',headers:{Origin:origin,
+      'Access-Control-Request-Method':method,'Access-Control-Request-Headers':'Range, If-None-Match, If-Range'}});
+    assert.equal(response.status,204);assertCors(response,origin);
+    assert.equal(response.headers.get('Access-Control-Allow-Methods'),'GET, HEAD');
+    assert.equal(response.headers.get('Access-Control-Allow-Headers'),'range, if-none-match, if-range');
+    assert.match(response.headers.get('Vary'),/Access-Control-Request-Method/);
+    assert.match(response.headers.get('Vary'),/Access-Control-Request-Headers/);
+  }
+  const simple=await mf.dispatchFetch('https://game.test/native/build.json',{method:'OPTIONS',headers:{Origin:origin,'Access-Control-Request-Method':'GET'}});
+  assert.equal(simple.status,204);assertCors(simple,origin);assert.equal(simple.headers.get('Access-Control-Allow-Headers'),null);
+  for(const headers of [
+    {Origin:origin,'Access-Control-Request-Method':'POST'},
+    {Origin:origin,'Access-Control-Request-Method':'GET','Access-Control-Request-Headers':'Authorization'},
+    {Origin:origin,'Access-Control-Request-Method':'GET','Access-Control-Request-Headers':'Range, Cookie'},
+    {Origin:origin,'Access-Control-Request-Method':'GET','Access-Control-Request-Headers':'Range,'},
+    {Origin:origin},
+    ...foreignOrigins.map(Origin=>({Origin,'Access-Control-Request-Method':'GET'})),
+  ]) {
+    const response=await mf.dispatchFetch('https://game.test/native/build.json',{method:'OPTIONS',headers});
+    assert.equal(response.status,403);assertCors(response,null);await response.arrayBuffer();
+  }
+  const socket=await mf.dispatchFetch('https://game.test/ws/native',{method:'OPTIONS',headers:{Origin:origin,'Access-Control-Request-Method':'GET'}});
+  assert.equal(socket.status,403);assertCors(socket,null);await socket.arrayBuffer();
+});
+
+for(const direct of [false,true])test(`Toy WebSocket Origin admission is enforced by ${direct?'the Durable Object directly':'the outer Worker and Durable Object'}`,async t=>{
+  const {mf}=await fixture(t,direct?{directObjectName:'toy-origin-direct'}:{}),clients=[];
+  t.after(()=>{for(const ws of clients)if(ws.readyState===1)ws.close();});
+  for(const origin of toyOrigins) {
+    const response=await mf.dispatchFetch('https://game.test/ws/native?shard=0',{headers:{Upgrade:'websocket',Origin:origin}});
+    assert.equal(response.status,101,origin);const ws=response.webSocket;ws.accept();clients.push(ws);
+    const hello=await new Promise(resolve=>ws.addEventListener('message',event=>resolve(JSON.parse(event.data)),{once:true}));
+    assert.equal(hello.type,'hello');assert.equal(hello.protocol,3);
+  }
+  for(const origin of [undefined,...foreignOrigins]) {
+    const response=await mf.dispatchFetch('https://game.test/ws/native?shard=0',{headers:{Upgrade:'websocket',...(origin===undefined?{}:{Origin:origin})}});
+    assert.equal(response.status,403,String(origin));assert.equal(response.webSocket,null);
+    assert.equal(response.headers.get('Access-Control-Allow-Origin'),null);await response.arrayBuffer();
+  }
 });
 
 const fixtureTarget={accountId:'a143c234b30a44c323ed2f2273c9c9da',bucket:'youlidefuchou-res',objectPrefix:'vera20k/web-native/objects/sha256/'};
