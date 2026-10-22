@@ -1,5 +1,8 @@
-// VERA-native protocol v2. This module has no Node imports so the same room /
+// VERA-native protocol v3: bounded ahead-of-time inputs and independent CRCs. This module has no Node imports so the same room /
 // lockstep authority can be hosted locally and in a web runtime.
+export const NATIVE_PROTOCOL = 3;
+export const INPUT_DELAY_TICKS = 8;
+const CHECKSUM = /^retail:\d+:[a-f0-9]{8}$/;
 const COUNTRIES = new Set(['America','Korea','France','Germany','GreatBritain','Libya','Iraq','Cuba','Russia','Yuri']);
 const OPTIONS = Object.freeze({credits:10000,unitCount:10,gameSpeed:3,shortGame:true,superWeapons:true,crates:true,mcvRepacks:true,buildOffAlly:false,destroyableBridges:true});
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -45,8 +48,8 @@ export class NativeRoomCoordinator {
   }
   connect({send,close}) {
     ensure(this.clients.size<this.maxClients,'当前服务器人数已满');
-    const client={id:crypto.randomUUID(),send,close,room:null,name:'指挥官',slot:0,ready:false};
-    this.clients.add(client);this.send(client,{type:'hello',protocol:2,playerId:client.id});return client;
+    const client={id:crypto.randomUUID(),send,close,room:null,name:'指挥官',slot:0,ready:false,protocol:null};
+    this.clients.add(client);this.send(client,{type:'hello',protocol:NATIVE_PROTOCOL,playerId:client.id});return client;
   }
   send(client,message) {try{client.send(JSON.stringify(message));}catch{this.disconnect(client);}}
   broadcast(room,message) {for(const member of [...room.members])this.send(member,message);}
@@ -64,7 +67,7 @@ export class NativeRoomCoordinator {
     for(const member of [...room.members]){
       member.room=null;member.ready=false;this.send(member,{type:'stopped',matchId:room.matchId??null,reason});this.send(member,{type:'room',room:null});
     }
-    room.members=[];room.frames.clear();room.loaded.clear();room.finished?.clear();
+    room.members=[];room.frames.clear();room.loaded.clear();room.finished?.clear();room.checksums?.clear();
   }
   leave(client) {
     const room=client.room;if(!room)return;
@@ -95,13 +98,14 @@ export class NativeRoomCoordinator {
       const message=JSON.parse(text);ensure(message&&typeof message.type==='string','无效的房间消息');
       // Output already in flight when both native result owners completed is
       // harmless. A finished socket cannot author another world frame.
-      if(client.completedMatchId===message.matchId&&['input','finished','chat','taunt'].includes(message.type)){
+      if(client.completedMatchId===message.matchId&&['input','checksum','finished','chat','taunt'].includes(message.type)){
         if(message.type==='finished')ensure(message.tick===client.completedReceipt?.tick&&message.checksum===client.completedReceipt?.checksum,'重复结束对局内容不一致');
         return;
       }
+      if(message.type!=='hello')ensure(client.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');
       switch(message.type) {
         case 'hello': {
-          ensure(message.protocol===2,'联机协议不匹配，请更新客户端');
+          ensure(message.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');client.protocol=NATIVE_PROTOCOL;
           // Connection identity is assigned by the server. The browser ID is
           // advisory only and never supplies player/command authority.
           break;
@@ -129,7 +133,7 @@ export class NativeRoomCoordinator {
         case 'start': {
           const room=this.requireRoom(client,'lobby');ensure(room.host===client.id,'只有房主可以开始');ensure(this.view(room,client).canStart,'请等待所有玩家准备');
           room.phase='loading';room.matchId=crypto.randomUUID();room.order=[...room.members].sort((a,b)=>a.slot-b.slot);room.tick=0;
-          room.frames.clear();room.loaded.clear();room.progress.clear();room.finished=new Map();this.arm(room,this.loadingTimeoutMs,'等待战场部署超时，对战已停止。');
+          room.frames.clear();room.loaded.clear();room.progress.clear();room.finished=new Map();room.checksums=new Map();room.committed=[];room.submitted=[];this.arm(room,this.loadingTimeoutMs,'等待战场部署超时，对战已停止。');
           this.update(room);room.order.forEach((member,playerIndex)=>this.send(member,{type:'start',matchId:room.matchId,playerIndex,config:clone(room.config)}));break;
         }
         case 'progress': {
@@ -139,6 +143,7 @@ export class NativeRoomCoordinator {
         }
         case 'loaded': {
           const room=this.requireRoom(client,'loading',message.matchId),player=room.order.indexOf(client);
+          ensure(message.protocol===NATIVE_PROTOCOL,'联机协议不匹配，请更新客户端');
           ensure(!room.loaded.has(player),'重复提交战场状态');integer(message.tick,0,Number.MAX_SAFE_INTEGER-1,'作战帧');
           ensure(hash(message.hash),'无效的状态校验');ensure(Array.isArray(message.owners)&&message.owners.length===2&&new Set(message.owners).size===2,'无效的玩家映射');
           message.owners.forEach(owner=>integer(owner,0,0xffffffff,'玩家身份'));ensure(typeof message.build==='string'&&message.build.length>0&&message.build.length<=512,'缺少客户端版本');
@@ -153,7 +158,8 @@ export class NativeRoomCoordinator {
             const shared=({hash,...receipt})=>receipt;
             if(JSON.stringify(shared(a))!==JSON.stringify(shared(b))){this.stop(room,'初始帧、玩家映射、游戏资源或客户端版本不一致，对战已停止。');break;}
             room.owners=a.owners;room.initialTick=a.tick;room.tick=a.tick+1;room.phase='running';
-            this.broadcast(room,{type:'ready',matchId:room.matchId,tick:room.tick,bootstrap:room.matchId});
+            room.committed=[a.tick,a.tick];room.submitted=[a.tick,a.tick];
+            this.broadcast(room,{type:'ready',matchId:room.matchId,tick:room.tick,bootstrap:room.matchId,protocol:NATIVE_PROTOCOL,inputDelayTicks:INPUT_DELAY_TICKS});
             this.arm(room,this.turnTimeoutMs,'等待玩家指令超时，对战已停止。');
           }break;
         }
@@ -161,36 +167,55 @@ export class NativeRoomCoordinator {
           const room=this.requireRoom(client,undefined,message.matchId),player=room.order.indexOf(client);
           if(room.phase==='finishing')break;
           ensure(room.phase==='running','当前房间状态不允许作战指令');
-          ensure(message.tick===room.tick,'作战帧顺序不正确');ensure(hash(message.prevHash),'无效的状态校验');ensure(!room.frames.has(player),'重复提交当前作战帧');
-          if(room.tick===room.initialTick+1)ensure(message.prevHash===`launch:${room.matchId}`,'初始装载凭据不匹配');
-          else ensure(/^retail:\d+:[a-f0-9]{8}$/.test(message.prevHash),'缺少原生逐帧校验凭据');
+          ensure(!Object.hasOwn(message,'prevHash'),'旧版逐帧校验协议不受支持');
+          const tick=integer(message.tick,room.initialTick+1,Number.MAX_SAFE_INTEGER-1,'作战帧');
+          ensure(tick===room.submitted[player]+1,'作战帧顺序不正确或重复提交');
+          // The window is tied to executed receipts, not to the broadcast
+          // frontier: a client cannot manufacture unbounded future turns by
+          // exchanging empty inputs without actually advancing its world.
+          ensure(tick<=room.committed[player]+INPUT_DELAY_TICKS,'作战帧超出提前输入窗口');
           ensure(Array.isArray(message.commands)&&message.commands.length<=256,'每帧最多提交256条指令');
           const commands=message.commands.map(envelope=>{
             ensure(envelope&&typeof envelope==='object'&&!Array.isArray(envelope),'无效的原生指令');
             ensure(envelope.owner===room.owners[player],'禁止提交其他玩家的指令');
-            ensure(envelope.execute_tick===room.tick,'指令执行帧不匹配');
+            ensure(envelope.execute_tick===tick,'指令执行帧不匹配');
             const payload=envelope.payload,keys=payload&&typeof payload==='object'&&!Array.isArray(payload)?Object.keys(payload):[];
             ensure(typeof payload==='string'?/^[A-Z][A-Za-z0-9]*$/.test(payload):keys.length===1&&/^[A-Z][A-Za-z0-9]*$/.test(keys[0]),'无效的指令内容');
             ensure(payload!=='Select'&&!Object.hasOwn(Object(payload),'Select'),'本地选择不能作为联网指令');
             return {player,envelope:clone(envelope)};
           });
-          room.frames.set(player,{hash:message.prevHash,commands});
-          if(room.frames.size===2){
-            const a=room.frames.get(0),b=room.frames.get(1);
-            if(a.hash!==b.hash){this.stop(room,`第${room.tick}帧状态校验不一致，对战已停止。`);break;}
-            const turn={type:'turn',matchId:room.matchId,tick:room.tick,commands:[...a.commands,...b.commands]};
-            room.tick++;room.frames.clear();this.broadcast(room,turn);this.arm(room,this.turnTimeoutMs,'等待玩家指令超时，对战已停止。');
+          let frame=room.frames.get(tick);
+          if(!frame){frame=new Map();room.frames.set(tick,frame);}
+          ensure(!frame.has(player),'重复提交当前作战帧');
+          frame.set(player,commands);room.submitted[player]=tick;
+          this.drainTurns(room);break;
+        }
+        case 'checksum': {
+          const room=this.requireRoom(client,undefined,message.matchId),player=room.order.indexOf(client);
+          ensure(room.phase==='running'||room.phase==='finishing','当前房间状态不能提交帧校验');
+          if(room.phase==='finishing'&&message.tick>room.terminalTick)break;
+          const tick=integer(message.tick,room.initialTick+1,Number.MAX_SAFE_INTEGER-1,'校验帧');
+          ensure(tick===room.committed[player]+1,'校验帧顺序不正确或重复提交');
+          ensure(tick<room.tick,'不能校验尚未广播的作战帧');
+          ensure(tick<=room.committed[1-player]+INPUT_DELAY_TICKS,'校验帧超出另一位玩家的执行窗口');
+          ensure(typeof message.checksum==='string'&&CHECKSUM.test(message.checksum),'缺少原生逐帧校验凭据');
+          let frame=room.checksums.get(tick);
+          if(!frame){frame=new Map();room.checksums.set(tick,frame);}
+          frame.set(player,message.checksum);room.committed[player]=tick;
+          if(frame.size===2){
+            if(frame.get(0)!==frame.get(1)){this.stop(room,`第${tick}帧状态校验不一致，对战已停止。`);break;}
+            room.checksums.delete(tick);
           }break;
         }
         case 'finished': {
           const room=this.requireRoom(client,undefined,message.matchId),player=room.order.indexOf(client);
           ensure(room.phase==='running'||room.phase==='finishing','当前房间状态不能结束对局');
           const tick=integer(message.tick,room.initialTick+1,Number.MAX_SAFE_INTEGER-1,'结束帧');
-          ensure(room.tick-tick>=1&&room.tick-tick<=2,'结束帧不属于当前作战回合');
-          ensure(typeof message.checksum==='string'&&/^retail:\d+:[a-f0-9]{8}$/.test(message.checksum),'缺少原生结束校验');
+          ensure(tick===room.committed[player]&&room.tick-tick>=1&&room.tick-tick<=INPUT_DELAY_TICKS+1,'结束帧不属于当前已执行作战回合');
+          ensure(typeof message.checksum==='string'&&CHECKSUM.test(message.checksum),'缺少原生结束校验');
           const previous=room.finished.get(player);
           if(previous){ensure(previous.tick===tick&&previous.checksum===message.checksum,'重复结束对局内容不一致');break;}
-          room.finished.set(player,{tick,checksum:message.checksum});room.phase='finishing';room.frames.clear();
+          room.finished.set(player,{tick,checksum:message.checksum});room.terminalTick??=tick;room.phase='finishing';room.frames.clear();
           if(room.finished.size===2){
             const a=room.finished.get(0),b=room.finished.get(1);
             if(JSON.stringify(a)!==JSON.stringify(b)){this.stop(room,'双方对局结束帧或原生校验不一致。');break;}
@@ -200,7 +225,7 @@ export class NativeRoomCoordinator {
               member.completedMatchId=room.matchId;member.completedReceipt={...a};member.room=null;member.ready=false;
               this.send(member,{type:'finished',matchId:room.matchId,...a});this.send(member,{type:'room',room:null});
             }
-            room.members=[];room.finished.clear();room.loaded.clear();
+            room.members=[];room.finished.clear();room.loaded.clear();room.checksums.clear();
           }else this.arm(room,this.turnTimeoutMs,'等待另一位玩家确认对局结束超时。');
           break;
         }
@@ -220,6 +245,18 @@ export class NativeRoomCoordinator {
         default:throw new Error('不支持的原生联机消息');
       }
     }catch(error){this.send(client,{type:'error',error:error instanceof Error?error.message:String(error)});}
+  }
+  drainTurns(room) {
+    if(room.draining)return;
+    room.draining=true;
+    try {
+      while(room.phase==='running'&&room.frames.get(room.tick)?.size===2){
+        const tick=room.tick,frame=room.frames.get(tick);
+        room.frames.delete(tick);room.tick++;
+        this.broadcast(room,{type:'turn',matchId:room.matchId,tick,commands:[...frame.get(0),...frame.get(1)]});
+        if(room.phase==='running')this.arm(room,this.turnTimeoutMs,'等待玩家指令超时，对战已停止。');
+      }
+    } finally {room.draining=false;}
   }
   close() {for(const room of [...this.rooms.values()])this.stop(room,'服务器已停止。');for(const client of [...this.clients]){try{client.close();}catch{}this.clients.delete(client);}}
 }

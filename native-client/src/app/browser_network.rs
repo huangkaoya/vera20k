@@ -14,6 +14,9 @@ use crate::net::browser_command_admission::{Admission, validate_command};
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::intern::InternedId;
 
+mod pipeline;
+use pipeline::{PROTOCOL, TurnPipeline};
+
 const MAX_COMMANDS: usize = 1024;
 const SOURCE_REVISION: &str = match option_env!("VERA_WEB_SOURCE_REVISION") {
     Some(value) => value,
@@ -72,8 +75,11 @@ enum Incoming {
         percent: i32,
     },
     Ready {
+        protocol: u32,
         tick: u64,
         bootstrap: String,
+        #[serde(rename = "inputDelayTicks")]
+        input_delay_ticks: u64,
     },
     Turn {
         tick: u64,
@@ -103,16 +109,51 @@ pub(crate) struct Session {
     owners: Vec<InternedId>,
     next_tick: u64,
     pending: Vec<CommandEnvelope>,
-    submitted: bool,
+    pipeline: Option<TurnPipeline<Vec<WireCommand>>>,
     accepted: Option<Vec<CommandEnvelope>>,
     committing: bool,
     committing_frame: Option<u32>,
     finished_tick: Option<u64>,
-    in_flight_turn: Option<u64>,
     error: Option<String>,
     last_hash: String,
     full_state_hash: String,
     full_state_tick: Option<u64>,
+}
+
+/// Check transport identity and ordering without querying mutable gameplay
+/// state. Stateful actor and rule admission belongs to the execution tick.
+fn validate_turn_headers(commands: &[WireCommand], owners: &[InternedId], tick: u64) -> Result<()> {
+    ensure!(
+        commands.len() <= MAX_COMMANDS,
+        "too many native commands in one turn"
+    );
+    let mut previous_player = 0;
+    for wire in commands {
+        let owner = owners
+            .get(wire.player)
+            .ok_or_else(|| anyhow::anyhow!("invalid native source participant"))?;
+        ensure!(
+            wire.player >= previous_player,
+            "native turn is not in participant order"
+        );
+        previous_player = wire.player;
+        ensure!(
+            wire.envelope.owner == *owner,
+            "native command has a foreign participant header"
+        );
+        ensure!(
+            wire.envelope.execute_tick == tick,
+            "native command has a foreign execute tick"
+        );
+        ensure!(
+            !matches!(
+                wire.envelope.payload,
+                Command::Select { .. } | Command::RemovePlayer { .. }
+            ),
+            "local or transport-only command must not cross native input turns"
+        );
+    }
+    Ok(())
 }
 
 fn emit(value: Value) {
@@ -123,7 +164,12 @@ fn publish(session: &Session) {
     STATUS.with(|status| *status.borrow_mut() = json!({
         "phase":session.phase.text(), "matchId":session.match_id,
         "localPlayer":session.local_player, "nextTick":session.next_tick,
-        "submitted":session.submitted, "turnReady":session.accepted.is_some(), "finishedTick":session.finished_tick,
+        "submitted":session.pipeline.as_ref().is_some_and(|p| p.submitted_through() >= session.next_tick),
+        "turnReady":session.accepted.is_some(), "finishedTick":session.finished_tick,
+        "protocol":PROTOCOL,"inputDelayTicks":session.pipeline.as_ref().map(TurnPipeline::input_delay),
+        "submittedThrough":session.pipeline.as_ref().map(TurnPipeline::submitted_through),
+        "receivedThrough":session.pipeline.as_ref().map(TurnPipeline::received_through),
+        "queuedTurns":session.pipeline.as_ref().map_or(0, TurnPipeline::queued_turns),
         "hash":session.last_hash, "hashAlgorithm":if session.last_hash.starts_with("retail:") { "retail-multiplayer-v1" } else if session.last_hash.starts_with("launch:") { "launch-receipt-v1" } else { "diagnostic-full-state-v1" },
         "diagnosticFullStateHash":session.full_state_hash,"diagnosticFullStateTick":session.full_state_tick, "owners":session.owners.iter().map(|id| id.index()).collect::<Vec<_>>(),
         "error":session.error,
@@ -168,12 +214,11 @@ pub(crate) fn begin(state: &mut AppState, match_id: String, local_player: usize)
         owners: Vec::new(),
         next_tick: 0,
         pending: Vec::new(),
-        submitted: false,
+        pipeline: None,
         accepted: None,
         committing: false,
         committing_frame: None,
         finished_tick: None,
-        in_flight_turn: None,
         error: None,
         last_hash: String::new(),
         full_state_hash: String::new(),
@@ -192,6 +237,9 @@ fn fail(session: &mut Session, reason: String, notify: bool) {
     session.phase = Phase::Stopped;
     session.pending.clear();
     session.accepted = None;
+    if let Some(pipeline) = session.pipeline.as_mut() {
+        pipeline.clear_buffer();
+    }
     session.committing = false;
     session.committing_frame = None;
     session.error = Some(reason.clone());
@@ -211,6 +259,9 @@ pub(crate) fn stop(state: &mut AppState, reason: &str) {
             session.error = None;
             session.pending.clear();
             session.accepted = None;
+            if let Some(pipeline) = session.pipeline.as_mut() {
+                pipeline.clear_buffer();
+            }
             emit(json!({"type":"leave", "matchId":session.match_id,"reason":reason}));
         } else {
             fail(session, reason.to_owned(), true);
@@ -340,14 +391,15 @@ fn begin_finishing_if_ready(state: &AppState, session: &mut Session) -> Result<(
         "finished native world has no committed Queue_AI checksum"
     );
     session.finished_tick = Some(tick);
-    // A turn already broadcast before the server learns this terminal edge
-    // may still arrive. Authenticate and discard at most that one turn.
-    session.in_flight_turn =
-        (session.submitted && session.accepted.is_none()).then_some(session.next_tick);
+    // Already sealed future turns may have been broadcast before the server
+    // learns this native terminal edge. Retain only their bounded frontiers;
+    // queued commands are discarded and never reach another simulation call.
+    if let Some(pipeline) = session.pipeline.as_mut() {
+        pipeline.clear_buffer();
+    }
     session.phase = Phase::Finishing;
     session.pending.clear();
     session.accepted = None;
-    session.submitted = false;
     emit(json!({"type":"finished", "matchId":session.match_id,
         "tick":tick, "checksum":session.last_hash}));
     Ok(())
@@ -405,7 +457,12 @@ fn poll_session(state: &mut AppState, session: &mut Session) -> Result<()> {
                 );
                 crate::app::loading::pump::accept_network_loading_progress(state, source, percent);
             }
-            Incoming::Ready { tick, bootstrap } => {
+            Incoming::Ready {
+                protocol,
+                tick,
+                bootstrap,
+                input_delay_ticks,
+            } => {
                 ensure!(
                     session.phase == Phase::Loaded && tick == session.next_tick,
                     "unexpected native ready tick"
@@ -414,52 +471,35 @@ fn poll_session(state: &mut AppState, session: &mut Session) -> Result<()> {
                     bootstrap == session.match_id,
                     "native launch receipt belongs to another match"
                 );
-                // This is the server's frozen launch receipt, not an initial
-                // shared-world digest. The first real Queue_AI checksum is
-                // compared immediately after the first committed world frame.
+                session.pipeline = Some(
+                    TurnPipeline::new(protocol, tick, input_delay_ticks)
+                        .map_err(anyhow::Error::msg)?,
+                );
+                // Full saves include process-local presentation state. Native
+                // Queue_AI checksums are sent separately after actual commits;
+                // they never gate the next future input submission.
                 session.last_hash = format!("launch:{}", session.match_id);
                 session.phase = Phase::Running;
             }
             Incoming::Turn { tick, commands } => {
-                let retiring_in_flight =
-                    session.phase == Phase::Finishing && session.in_flight_turn == Some(tick);
                 ensure!(
-                    ((session.phase == Phase::Running && session.submitted) || retiring_in_flight)
-                        && session.accepted.is_none()
-                        && !session.committing
-                        && tick == session.next_tick,
-                    "duplicate, stale or future native turn"
+                    matches!(session.phase, Phase::Running | Phase::Finishing),
+                    "native turn requires an active or retiring match"
                 );
-                let sim = &state
-                    .match_state
-                    .sim_runtime
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("native world is missing"))?
-                    .simulation;
-                ensure!(
-                    tick == sim.session().tick() + 1,
-                    "native turn is not the world's next tick"
-                );
-                let mut admitted = Vec::with_capacity(commands.len());
-                let mut previous_player = 0;
-                for wire in commands {
-                    let owner = *session
-                        .owners
-                        .get(wire.player)
-                        .ok_or_else(|| anyhow::anyhow!("invalid native source participant"))?;
-                    ensure!(
-                        wire.player >= previous_player,
-                        "native turn is not in participant order"
-                    );
-                    previous_player = wire.player;
-                    if validate_command(sim, owner, &wire.envelope, tick)? == Admission::Apply {
-                        admitted.push(wire.envelope);
-                    }
-                }
-                if retiring_in_flight {
-                    session.in_flight_turn = None;
+                validate_turn_headers(&commands, &session.owners, tick)?;
+                let pipeline = session
+                    .pipeline
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("native input pipeline is missing"))?;
+                if session.phase == Phase::Finishing {
+                    pipeline.retire_receipt(tick).map_err(anyhow::Error::msg)?;
                 } else {
-                    session.accepted = Some(admitted);
+                    // Gameplay authorization is deferred until this is the
+                    // exact world's next tick: actors may die or change owner
+                    // while their future transport turn is buffered.
+                    pipeline
+                        .receive(tick, session.next_tick, commands)
+                        .map_err(anyhow::Error::msg)?;
                 }
             }
             Incoming::Finished { tick, checksum } => {
@@ -470,7 +510,9 @@ fn poll_session(state: &mut AppState, session: &mut Session) -> Result<()> {
                     "native finished acknowledgement differs from the committed result"
                 );
                 session.phase = Phase::Finished;
-                session.in_flight_turn = None;
+                if let Some(pipeline) = session.pipeline.as_mut() {
+                    pipeline.clear_buffer();
+                }
                 session.pending.clear();
                 session.accepted = None;
                 log::info!("Native network match finished at committed tick {tick}");
@@ -547,34 +589,52 @@ fn poll_session(state: &mut AppState, session: &mut Session) -> Result<()> {
         session.last_hash = format!("full:{}", session.full_state_hash);
         session.phase = Phase::Loaded;
         emit(
-            json!({"type":"loaded", "matchId":session.match_id, "tick":sim.session().tick(),
+            json!({"type":"loaded", "protocol":PROTOCOL, "matchId":session.match_id, "tick":sim.session().tick(),
             "hash":session.full_state_hash,"owners":session.owners.iter().map(|id| id.index()).collect::<Vec<_>>(),
             "build":format!("{SOURCE_REVISION}:{PATCH_HASH}"),"resourceManifest":RESOURCE_MANIFEST }),
         );
     }
-    if session.phase == Phase::Running
-        && !session.submitted
-        && session.accepted.is_none()
-        && !session.committing
-    {
+    if session.phase == Phase::Running && !session.committing {
         ensure!(
-            sim.session().tick() + 1 == session.next_tick,
+            sim.session().tick().checked_add(1) == Some(session.next_tick),
             "native world advanced outside ordered turn"
         );
-        // The preceding native Queue_AI already produced the sync checksum.
-        // Recomputing it would consume two extra Scenario RNG draws. Full state
-        // hashes include process-local presentation/defeat state, so they are
-        // retained only as diagnostics; the loaded barrier authenticates the
-        // frozen launch/build/assets rather than local presentation state.
-        let mut commands = std::mem::take(&mut session.pending);
-        for command in &mut commands {
-            command.execute_tick = session.next_tick;
+        let pipeline = session
+            .pipeline
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native input pipeline is missing"))?;
+        let targets = pipeline
+            .seal(session.next_tick)
+            .map_err(anyhow::Error::msg)?;
+        let authored_tick = targets.end.checked_sub(1);
+        for tick in targets {
+            // Only the far end of the initial window may contain authored
+            // input. Earlier bootstrap turns are deterministic empty turns.
+            let mut commands = if Some(tick) == authored_tick {
+                std::mem::take(&mut session.pending)
+            } else {
+                Vec::new()
+            };
+            for command in &mut commands {
+                command.execute_tick = tick;
+            }
+            emit(json!({"type":"input","matchId":session.match_id,
+                "tick":tick,"commands":commands}));
         }
-        emit(
-            json!({"type":"input","matchId":session.match_id,"tick":session.next_tick,
-            "prevHash":session.last_hash,"commands":commands}),
-        );
-        session.submitted = true;
+        if session.accepted.is_none()
+            && let Some(commands) = pipeline.take_current(session.next_tick)
+        {
+            let mut admitted = Vec::with_capacity(commands.len());
+            for wire in commands {
+                let owner = session.owners[wire.player];
+                if validate_command(sim, owner, &wire.envelope, session.next_tick)?
+                    == Admission::Apply
+                {
+                    admitted.push(wire.envelope);
+                }
+            }
+            session.accepted = Some(admitted);
+        }
     }
     Ok(())
 }
@@ -659,7 +719,6 @@ pub(crate) fn frame_finished(state: &mut AppState, committed: bool, checksum: Op
             && session.committing_frame == Some(frame)
         {
             session.last_hash = format!("retail:{frame}:{value:08x}");
-            session.submitted = false;
             session.committing = false;
             session.committing_frame = None;
         } else if !committed || tick != Some(session.next_tick) {
@@ -672,8 +731,9 @@ pub(crate) fn frame_finished(state: &mut AppState, committed: bool, checksum: Op
             && session.committing_frame == Some(frame)
         {
             session.last_hash = format!("retail:{frame}:{value:08x}");
+            emit(json!({"type":"checksum", "matchId":session.match_id,
+                "tick":session.next_tick,"checksum":session.last_hash}));
             session.next_tick += 1;
-            session.submitted = false;
             session.committing = false;
             session.committing_frame = None;
         } else {

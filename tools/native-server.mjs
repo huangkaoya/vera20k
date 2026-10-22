@@ -5,13 +5,17 @@ import fs from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {requestPath, openRegularFile, fingerprint, sendFile, sendJson, methods, failRequest, listen, closeServer, httpError} from './services/http-files.mjs';
 import {attachNativeMultiplayer} from './services/native-websocket.mjs';
+import {NATIVE_PROTOCOL} from './services/native-room-coordinator.mjs';
 import {isNativeAssetName,readNativeResourceManifest,readNativeContentIndex,verifyNativeBuild,nativeAssetManifestIdentity} from './native-build-manifest.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const isNativeRetailFile = isNativeAssetName;
 export async function createNativeServer({root=projectRoot, host='127.0.0.1', port=5280,
   verifyBuild=true,requireChecked=false,sourceCheck=false,
+  diagnosticRttMs=0,
   assetRoot=process.env.VERA_ASSET_ROOT ?? path.join(os.homedir(),'Library/Application Support/VERA20k/retail-assets')} = {}) {
+  if(!Number.isInteger(diagnosticRttMs)||diagnosticRttMs<0||diagnosticRttMs>2000||diagnosticRttMs%2)throw new Error('Diagnostic RTT must be an even integer from 0 to 2000 ms');
+  if(diagnosticRttMs&&!['127.0.0.1','localhost','::1'].includes(host))throw new Error('Network delay diagnostics require a loopback listener');
   root = await fs.realpath(path.resolve(root));
   const retailRoot = await fs.realpath(path.resolve(assetRoot));
   let content;
@@ -50,7 +54,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
       if (pathname==='/api/health') {
         let ready=false;
         try {ready=(await fs.stat(path.join(nativeRoot,'vera20k_bg.wasm'))).isFile();}catch{}
-        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',renderer:'VERA wgpu/WebGPU',multiplayer:{protocol:2,rooms:multiplayer.coordinator.rooms.size},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
+        sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,patchSha256:build?.patchSha256,resourceManifestSha256:build?.resourceManifestSha256??nativeAssetManifestIdentity(index.manifest),renderer:'VERA wgpu/WebGPU',multiplayer:{protocol:NATIVE_PROTOCOL,rooms:multiplayer.coordinator.rooms.size,diagnosticRttMs},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
       }
       if (pathname==='/api/native/resources') {sendJson(request,response,200,index.manifest);return;}
       if(/^\/content\/objects\/[a-f0-9]{64}$/.test(pathname)) {
@@ -78,7 +82,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
     }catch(error){failRequest(request,response,error);}
   });
   // The HTTP listener is not exposed until the same-origin WebSocket gate is attached.
-  const multiplayer=attachNativeMultiplayer(server,{allowedOrigins:[]});
+  const multiplayer=attachNativeMultiplayer(server,{allowedOrigins:[],messageDelayMs:diagnosticRttMs/2});
   const url=await listen(server,port,host);
   // Port 0 is useful for integration tests. Admission uses the actual bound origin.
   multiplayer.allowOrigin(url);
@@ -87,7 +91,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
   return {server,url,manifest:index.manifest,multiplayer,close(){return closing??=(async()=>{await multiplayer.close();await closeServer(server);})();}};
 }
 if (process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
-  const app=await createNativeServer({port:Number(process.env.PORT??5280)});
+  const app=await createNativeServer({port:Number(process.env.PORT??5280),diagnosticRttMs:Number(process.env.VERA_NATIVE_DIAGNOSTIC_RTT_MS??0)});
   console.log(`王二火大 · VERA WebGPU ${app.url}`);
   console.log(`只读游戏资源 ${app.manifest.files.length} 项；${Math.round(app.manifest.totalBytes/1048576)} MB`);
   let closing=false;

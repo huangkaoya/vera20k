@@ -1,7 +1,8 @@
 import {WebSocketServer,WebSocket} from 'ws';
 import {NativeRoomCoordinator} from './native-room-coordinator.mjs';
 
-export function attachNativeMultiplayer(server,{path='/ws/native',allowedOrigins,loadingTimeoutMs,turnTimeoutMs}={}) {
+export function attachNativeMultiplayer(server,{path='/ws/native',allowedOrigins,loadingTimeoutMs,turnTimeoutMs,messageDelayMs=0}={}) {
+  if(!Number.isInteger(messageDelayMs)||messageDelayMs<0||messageDelayMs>1000)throw new Error('Invalid diagnostic message delay');
   const coordinator=new NativeRoomCoordinator({loadingTimeoutMs,turnTimeoutMs});
   const sockets=new Set();
   const wss=new WebSocketServer({noServer:true,maxPayload:262144});
@@ -14,12 +15,22 @@ export function attachNativeMultiplayer(server,{path='/ws/native',allowedOrigins
   server.on('upgrade',upgrade);
   wss.on('connection',ws=>{
     sockets.add(ws);let client;
-    try{client=coordinator.connect({send:message=>{if(ws.readyState===WebSocket.OPEN)ws.send(message);},close:()=>ws.close(1000,'Server stopped')});}
+    // Local diagnostic port only: delay each direction without changing the
+    // coordinator or native simulation. Constant delay preserves WS ordering.
+    const pending=new Set();
+    const deliver=callback=>{
+      if(ws.readyState!==WebSocket.OPEN)return;
+      if(!messageDelayMs){callback();return;}
+      if(pending.size>=512){ws.close(1009,'Diagnostic queue overflow');return;}
+      const timer=setTimeout(()=>{pending.delete(timer);if(ws.readyState===WebSocket.OPEN)callback();},messageDelayMs);
+      pending.add(timer);
+    };
+    try{client=coordinator.connect({send:message=>deliver(()=>ws.send(message)),close:()=>ws.close(1000,'Server stopped')});}
     catch(error){ws.close(1013,error.message);return;}
     let alive=true;
     ws.on('pong',()=>{alive=true;});ws.on('error',()=>{});
-    ws.on('message',(bytes,binary)=>{if(binary){ws.close(1003,'JSON required');return;}coordinator.receive(client,bytes.toString());});
-    ws.on('close',()=>{sockets.delete(ws);coordinator.disconnect(client);});
+    ws.on('message',(bytes,binary)=>{if(binary){ws.close(1003,'JSON required');return;}const text=bytes.toString();deliver(()=>coordinator.receive(client,text));});
+    ws.on('close',()=>{for(const timer of pending)clearTimeout(timer);pending.clear();sockets.delete(ws);coordinator.disconnect(client);});
     ws.nativeHeartbeat=()=>{if(!alive)ws.terminate();else{alive=false;ws.ping();}};
   });
   const heartbeat=setInterval(()=>{for(const ws of sockets)ws.nativeHeartbeat?.();},15000);heartbeat.unref();

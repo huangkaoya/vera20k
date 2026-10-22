@@ -33,9 +33,9 @@ npm run start:native-web
 
 主菜单选择「网络」，创建房间，将房间代码交给另一位玩家。加入者准备后，房主开始作战。本阶段入口固定为「火线冲突（2）」、两位真人；房主可设置国家、颜色、出生点、队伍与游戏选项。资源管理和联机大厅均由 Rust 在游戏中绘制并处理输入，JS 只提供隐藏的缓存/传输适配层。单机遭遇战继续使用原生菜单。
 
-本地 HTTP 服务同时提供同源 `/ws/native`。大厅负责房间和冻结启动配置；两端完整 VERA 客户端各自持有世界，服务端按玩家顺序聚合原生指令。选择状态保留本地，游戏指令沿用原生输入解析。每帧等待所有玩家，断线或校验失败停止对局，不承诺断线续局。
+本地 HTTP 服务同时提供同源 `/ws/native`。大厅负责房间和冻结启动配置；两端完整 VERA 客户端各自持有世界，服务端按玩家顺序聚合原生指令。选择状态保留本地，游戏指令沿用原生输入解析。协议 3 提前封存 8 个逻辑帧的输入，允许多个回合同时在途；客户端仍只按序执行双方输入齐全的回合。断线或校验失败停止对局，不承诺断线续局。
 
-加载屏障核对版本、资源、玩家映射和初始帧。完整存档哈希含本地视角状态，仅作诊断；第一回合使用服务器会话收据，此后立即比较原有 `Queue_AI` 产出的联机 CRC，不重复计算、不增加随机数抽取。编译、协议测试、CRC 一致和实际浏览器实玩是不同的验收层次。
+加载屏障核对版本、资源、玩家映射和初始帧。完整存档哈希含本地视角状态，仅作诊断；每个实际执行帧独立上报原有 `Queue_AI` 产出的联机 CRC，服务端比较同帧结果，不把上一帧校验作为下一帧输入的往返屏障，也不重复计算或增加随机数抽取。8 帧缓冲在正常速度（48 ms/帧）下约为 384 ms；逻辑速度与输入延迟分别验收，超过窗口的网络延迟仍会造成等待。协议、延迟验证和容量边界见 [联机同步说明](docs/native-network.md)。
 
 独立 Cloudflare Worker、R2 和 Durable Object 的打包与部署说明见 [deployment/README.md](deployment/README.md)。本地代码、部署包和目标域名发布分别验证。
 
@@ -63,6 +63,17 @@ npm run native:test-sync
 ```
 
 `native:sync` 内容一致时不修改时间戳；显式 `npm run native:sync -- --rebuild` 可从已记录的源树反向验证基线并重放补丁，不要求原项目或远端存在本机整合提交。存在未记录编辑时拒绝重建。审阅适配修改后，`npm run native:record` 使用本仓库的 `.build/vera-upstream` 基线更新补丁；它不会同步新的上游提交。
+
+升级新上游使用独立的候选流程，而不是上述固定版本重放：
+
+```sh
+npm run native:update -- stage --source upstream --ref main
+npm run native:validate -- <candidate-id>
+npm run native:update -- promote <candidate-id> --runtime-receipt /absolute/path/runtime-receipt.json
+npm run native:test-update
+```
+
+`stage` 只在本仓库 `.build/native-updates` 拉取显式 ref、保留现有整合分支定制并三方合并浏览器适配；冲突或验收失败不更新稳定源码。`validate` 执行候选的联机合同、延迟回归、原生网络模块测试及 WASM 构建，真正双客户端/原生与 WASM 回放验收另有绑定候选身份的记录。全部通过后才能显式 `promote`，失败事务可恢复。完整边界和验收格式见 [原生上游更新流程](docs/native-updates.md)。旧 `sync:upstream` 属于历史 Canvas 原型，不升级当前 `native-client`。
 
 浏览器持久化使用当前站点的 localStorage。存档超出浏览器容量时会报告错误并保留原存档。网页触屏操作、浏览器截图导出与跨浏览器兼容性需要单独验证；不能用桌面菜单成功替代这些验收。
 

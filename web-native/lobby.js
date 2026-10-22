@@ -3,7 +3,7 @@ function stored(storage, key, fallback) {
   try { return storage.getItem(key) || fallback; } catch { return fallback; }
 }
 function save(storage, key, value) { try { storage.setItem(key, value); } catch {} }
-/** DOM-free native-v2 transport. The caller owns all visible UI and forwards
+/** DOM-free native-v3 transport. The caller owns all visible UI and forwards
  * semantic snapshots to its shell; no element, stylesheet or renderer is made. */
 export function installNativeLobby({native, canvas, socketUrl, onState = () => {}} = {}) {
   if (!native || !canvas) throw new Error('联机大厅缺少游戏入口');
@@ -55,7 +55,7 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
       current.addEventListener('open', () => {
         if (epoch !== socketEpoch || socket !== current || disposed) return;
         state.connected = true;
-        current.send(JSON.stringify({type: 'hello', protocol: 2, playerId}));
+        current.send(JSON.stringify({type: 'hello', protocol: 3, playerId}));
         settled = true; resolve(); render();
       });
       current.addEventListener('message', event => {
@@ -64,11 +64,18 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
       });
       current.addEventListener('error', () => {
         if (epoch !== socketEpoch || socket !== current || disposed) return;
-        if (!settled) { settled = true; reject(new Error('无法连接本地联机服务')); }
+        if (!settled) { settled = true; reject(new Error('无法连接联机服务')); }
         else if (state.matchId) transportFailed('联机连接发生错误，对局已停止。');
       });
-      current.addEventListener('close', () => {
+      current.addEventListener('close', event => {
         if (epoch !== socketEpoch || socket !== current || disposed) return;
+        // Preserve the transport outcome without logging player identity or
+        // command payloads. A normal protocol stop and a broken link need
+        // different evidence when diagnosing a public match.
+        console.info('[VERA transport] WebSocket closed', JSON.stringify({
+          code: event.code ?? null, wasClean: event.wasClean ?? null,
+          matchActive: Boolean(state.matchId), completed: completed(),
+        }));
         socket = null; connecting = null; state.connected = false; state.busy = false;
         if (!settled) { settled = true; reject(new Error('联机服务连接已关闭')); }
         if (state.matchId) transportFailed('联机连接已中断，对局已停止。');
@@ -116,7 +123,13 @@ export function installNativeLobby({native, canvas, socketUrl, onState = () => {
     if (socket?.readyState === WebSocket.OPEN) sendNow({type: 'leave'});
   }
   function receive(message) {
-    if (message.type === 'hello') return;
+    if (message.type === 'hello') {
+      if (message.protocol !== 3) {
+        closeSocket();
+        throw new Error('联机协议版本不兼容，请刷新游戏后重试');
+      }
+      return;
+    }
     if (message.type === 'room') {
       state.room = message.room; state.status = message.room?.status ?? ''; state.busy = false;
       if (!state.stopped) state.error = ''; render(); return;

@@ -154,7 +154,8 @@ async function socket(mf) {
 }
 async function launchPair(t,mf) {
   const a=await socket(mf),b=await socket(mf);t.after(()=>{for(const client of [a,b])if(client.ws.readyState===1)client.ws.close();});
-  assert.equal((await a.wait('hello')).protocol,2);
+  assert.equal((await a.wait('hello')).protocol,3);
+  for(const client of [a,b])client.send({type:'hello',protocol:3});
   a.send({type:'create',name:'Host'});const room=(await a.wait('room')).room;
   b.send({type:'join',name:'Guest',code:room.code});await b.wait('room');
   b.send({type:'ready'});await a.wait('room',message=>message.room?.canStart);
@@ -163,41 +164,41 @@ async function launchPair(t,mf) {
   await a.wait('progress',message=>message.source===1);
   // A full save includes player-local view state. Different diagnostic hashes
   // must still admit identical shared build/resources/owners/initial tick.
-  for(const [index,client] of [a,b].entries())client.send({type:'loaded',matchId:start.matchId,tick:100,hash:`local-view-${index}`,owners:[0,14],build:'native-test',resourceManifest:resourceIdentity});
+  for(const [index,client] of [a,b].entries())client.send({type:'loaded',protocol:3,matchId:start.matchId,tick:100,hash:`local-view-${index}`,owners:[0,14],build:'native-test',resourceManifest:resourceIdentity});
   const ready=await a.wait('ready');assert.equal(ready.tick,101);assert.equal(ready.bootstrap,start.matchId);assert.deepEqual(await b.wait('ready'),ready);
   return {a,b,start,ready,room};
 }
-test('Durable Object reuses native v2 authority for two clients, barrier, turn order, ownership and disconnect',async t=>{
+test('Durable Object shares v3 pipeline authority, ownership checks and independent CRC',async t=>{
   const {mf}=await fixture(t);
   assert.equal((await mf.dispatchFetch('https://game.test/ws/native',{headers:{Upgrade:'websocket'}})).status,403);
   assert.equal((await mf.dispatchFetch('https://game.test/ws/native',{headers:{Upgrade:'websocket',Origin:'https://other.test'}})).status,403);
   const {a,b,start,ready}=await launchPair(t,mf);
-  const bootstrap=`launch:${ready.bootstrap}`;
-  a.send({type:'input',matchId:start.matchId,tick:101,prevHash:'local-view-0',commands:[]});
-  assert.match((await a.wait('error')).error,/初始装载凭据/);
-  b.send({type:'input',matchId:start.matchId,tick:101,prevHash:bootstrap,commands:[{owner:0,execute_tick:101,payload:'Stop'}]});
+  assert.equal(ready.protocol,3);assert.equal(ready.inputDelayTicks,8);
+  a.send({type:'input',matchId:start.matchId,tick:101,prevHash:'old-v2',commands:[]});
+  await a.wait('error');
+  b.send({type:'input',matchId:start.matchId,tick:101,commands:[{owner:0,execute_tick:101,payload:'Stop'}]});
   assert.match((await b.wait('error')).error,/其他玩家/);
-  a.send({type:'input',matchId:start.matchId,tick:101,prevHash:bootstrap,commands:[{owner:0,execute_tick:101,payload:'Stop'}]});
-  b.send({type:'input',matchId:start.matchId,tick:101,prevHash:bootstrap,commands:[]});
-  const turn=await a.wait('turn');assert.equal(turn.tick,101);assert.equal(turn.commands.length,1);assert.equal(turn.commands[0].player,0);
-  assert.deepEqual(await b.wait('turn'),turn);
-  a.send({type:'input',matchId:start.matchId,tick:102,prevHash:bootstrap,commands:[]});
-  assert.match((await a.wait('error',message=>/原生逐帧校验凭据/.test(message.error))).error,/原生逐帧校验凭据/);
-  for(const client of [a,b])client.send({type:'input',matchId:start.matchId,tick:102,prevHash:'retail:101:1a2b3c4d',commands:[]});
-  const second=await a.wait('turn',message=>message.tick===102);assert.deepEqual(second.commands,[]);
-  assert.deepEqual(await b.wait('turn',message=>message.tick===102),second);
-  b.ws.close(1000,'exit');assert.match((await a.wait('stopped')).reason,/离开/);
+  // Two turns can be broadcast before either simulation supplies a checksum.
+  for(const tick of [101,102])for(const client of [a,b])client.send({type:'input',matchId:start.matchId,tick,commands:[]});
+  for(const tick of [101,102]){
+    const turn=await a.wait('turn',message=>message.tick===tick);
+    assert.deepEqual(turn.commands,[]);assert.deepEqual(await b.wait('turn',message=>message.tick===tick),turn);
+  }
+  a.send({type:'checksum',matchId:start.matchId,tick:101,checksum:'retail:100:1a2b3c4d'});
+  b.send({type:'checksum',matchId:start.matchId,tick:101,checksum:'retail:100:1a2b3c4e'});
+  assert.match((await a.wait('stopped')).reason,/校验/);
 });
 test('Durable Object confirms normal native results, clears the room and ignores completed-match output',async t=>{
   const {mf}=await fixture(t),{a,b,start,ready,room}=await launchPair(t,mf);
-  for(const client of [a,b])client.send({type:'input',matchId:start.matchId,tick:101,prevHash:`launch:${ready.bootstrap}`,commands:[]});
+  for(const client of [a,b])client.send({type:'input',matchId:start.matchId,tick:101,commands:[]});
   await a.wait('turn',message=>message.tick===101);await b.wait('turn',message=>message.tick===101);
+  for(const client of [a,b])client.send({type:'checksum',matchId:start.matchId,tick:101,checksum:'retail:100:1a2b3c4d'});
   const result={type:'finished',matchId:start.matchId,tick:101,checksum:'retail:100:1a2b3c4d'};
   for(const client of [a,b])client.send(result);
   assert.deepEqual(await a.wait('finished'),result);assert.deepEqual(await b.wait('finished'),result);
   await a.wait('room',message=>message.room===null);await b.wait('room',message=>message.room===null);
   const marker=a.messages.length;
-  a.send({type:'input',matchId:start.matchId,tick:102,prevHash:'retail:101:1a2b3c4d',commands:[]});
+  a.send({type:'input',matchId:start.matchId,tick:102,commands:[]});
   a.send(result);
   a.send({type:'create',name:'New match after results'});
   const next=await a.wait('room',message=>message.room&&message.room.code!==room.code);

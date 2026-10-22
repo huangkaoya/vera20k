@@ -87583,10 +87583,10 @@ index 0000000000000000000000000000000000000000..d60618c4c05ed411c5460c9370117c9d
 +}
 diff --git a/src/app/browser_network.rs b/src/app/browser_network.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b00f1faa7
+index 0000000000000000000000000000000000000000..b35e13ce54cdfa74d2f03434fa1bde1ef2a80310
 --- /dev/null
 +++ b/src/app/browser_network.rs
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,753 @@
 +//! Browser transport for the native command stream. This module owns only
 +//! admission, ordered turns and readiness; SimRuntime remains the sole world.
 +//! Select is a process-local input snapshot and never crosses the network.
@@ -87602,6 +87602,9 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +use crate::net::browser_command_admission::{Admission, validate_command};
 +use crate::sim::command::{Command, CommandEnvelope};
 +use crate::sim::intern::InternedId;
++
++mod pipeline;
++use pipeline::{PROTOCOL, TurnPipeline};
 +
 +const MAX_COMMANDS: usize = 1024;
 +const SOURCE_REVISION: &str = match option_env!("VERA_WEB_SOURCE_REVISION") {
@@ -87661,8 +87664,11 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +        percent: i32,
 +    },
 +    Ready {
++        protocol: u32,
 +        tick: u64,
 +        bootstrap: String,
++        #[serde(rename = "inputDelayTicks")]
++        input_delay_ticks: u64,
 +    },
 +    Turn {
 +        tick: u64,
@@ -87692,16 +87698,51 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +    owners: Vec<InternedId>,
 +    next_tick: u64,
 +    pending: Vec<CommandEnvelope>,
-+    submitted: bool,
++    pipeline: Option<TurnPipeline<Vec<WireCommand>>>,
 +    accepted: Option<Vec<CommandEnvelope>>,
 +    committing: bool,
 +    committing_frame: Option<u32>,
 +    finished_tick: Option<u64>,
-+    in_flight_turn: Option<u64>,
 +    error: Option<String>,
 +    last_hash: String,
 +    full_state_hash: String,
 +    full_state_tick: Option<u64>,
++}
++
++/// Check transport identity and ordering without querying mutable gameplay
++/// state. Stateful actor and rule admission belongs to the execution tick.
++fn validate_turn_headers(commands: &[WireCommand], owners: &[InternedId], tick: u64) -> Result<()> {
++    ensure!(
++        commands.len() <= MAX_COMMANDS,
++        "too many native commands in one turn"
++    );
++    let mut previous_player = 0;
++    for wire in commands {
++        let owner = owners
++            .get(wire.player)
++            .ok_or_else(|| anyhow::anyhow!("invalid native source participant"))?;
++        ensure!(
++            wire.player >= previous_player,
++            "native turn is not in participant order"
++        );
++        previous_player = wire.player;
++        ensure!(
++            wire.envelope.owner == *owner,
++            "native command has a foreign participant header"
++        );
++        ensure!(
++            wire.envelope.execute_tick == tick,
++            "native command has a foreign execute tick"
++        );
++        ensure!(
++            !matches!(
++                wire.envelope.payload,
++                Command::Select { .. } | Command::RemovePlayer { .. }
++            ),
++            "local or transport-only command must not cross native input turns"
++        );
++    }
++    Ok(())
 +}
 +
 +fn emit(value: Value) {
@@ -87712,7 +87753,12 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +    STATUS.with(|status| *status.borrow_mut() = json!({
 +        "phase":session.phase.text(), "matchId":session.match_id,
 +        "localPlayer":session.local_player, "nextTick":session.next_tick,
-+        "submitted":session.submitted, "turnReady":session.accepted.is_some(), "finishedTick":session.finished_tick,
++        "submitted":session.pipeline.as_ref().is_some_and(|p| p.submitted_through() >= session.next_tick),
++        "turnReady":session.accepted.is_some(), "finishedTick":session.finished_tick,
++        "protocol":PROTOCOL,"inputDelayTicks":session.pipeline.as_ref().map(TurnPipeline::input_delay),
++        "submittedThrough":session.pipeline.as_ref().map(TurnPipeline::submitted_through),
++        "receivedThrough":session.pipeline.as_ref().map(TurnPipeline::received_through),
++        "queuedTurns":session.pipeline.as_ref().map_or(0, TurnPipeline::queued_turns),
 +        "hash":session.last_hash, "hashAlgorithm":if session.last_hash.starts_with("retail:") { "retail-multiplayer-v1" } else if session.last_hash.starts_with("launch:") { "launch-receipt-v1" } else { "diagnostic-full-state-v1" },
 +        "diagnosticFullStateHash":session.full_state_hash,"diagnosticFullStateTick":session.full_state_tick, "owners":session.owners.iter().map(|id| id.index()).collect::<Vec<_>>(),
 +        "error":session.error,
@@ -87757,12 +87803,11 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +        owners: Vec::new(),
 +        next_tick: 0,
 +        pending: Vec::new(),
-+        submitted: false,
++        pipeline: None,
 +        accepted: None,
 +        committing: false,
 +        committing_frame: None,
 +        finished_tick: None,
-+        in_flight_turn: None,
 +        error: None,
 +        last_hash: String::new(),
 +        full_state_hash: String::new(),
@@ -87781,6 +87826,9 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +    session.phase = Phase::Stopped;
 +    session.pending.clear();
 +    session.accepted = None;
++    if let Some(pipeline) = session.pipeline.as_mut() {
++        pipeline.clear_buffer();
++    }
 +    session.committing = false;
 +    session.committing_frame = None;
 +    session.error = Some(reason.clone());
@@ -87800,6 +87848,9 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +            session.error = None;
 +            session.pending.clear();
 +            session.accepted = None;
++            if let Some(pipeline) = session.pipeline.as_mut() {
++                pipeline.clear_buffer();
++            }
 +            emit(json!({"type":"leave", "matchId":session.match_id,"reason":reason}));
 +        } else {
 +            fail(session, reason.to_owned(), true);
@@ -87929,14 +87980,15 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +        "finished native world has no committed Queue_AI checksum"
 +    );
 +    session.finished_tick = Some(tick);
-+    // A turn already broadcast before the server learns this terminal edge
-+    // may still arrive. Authenticate and discard at most that one turn.
-+    session.in_flight_turn =
-+        (session.submitted && session.accepted.is_none()).then_some(session.next_tick);
++    // Already sealed future turns may have been broadcast before the server
++    // learns this native terminal edge. Retain only their bounded frontiers;
++    // queued commands are discarded and never reach another simulation call.
++    if let Some(pipeline) = session.pipeline.as_mut() {
++        pipeline.clear_buffer();
++    }
 +    session.phase = Phase::Finishing;
 +    session.pending.clear();
 +    session.accepted = None;
-+    session.submitted = false;
 +    emit(json!({"type":"finished", "matchId":session.match_id,
 +        "tick":tick, "checksum":session.last_hash}));
 +    Ok(())
@@ -87994,7 +88046,12 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +                );
 +                crate::app::loading::pump::accept_network_loading_progress(state, source, percent);
 +            }
-+            Incoming::Ready { tick, bootstrap } => {
++            Incoming::Ready {
++                protocol,
++                tick,
++                bootstrap,
++                input_delay_ticks,
++            } => {
 +                ensure!(
 +                    session.phase == Phase::Loaded && tick == session.next_tick,
 +                    "unexpected native ready tick"
@@ -88003,52 +88060,35 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +                    bootstrap == session.match_id,
 +                    "native launch receipt belongs to another match"
 +                );
-+                // This is the server's frozen launch receipt, not an initial
-+                // shared-world digest. The first real Queue_AI checksum is
-+                // compared immediately after the first committed world frame.
++                session.pipeline = Some(
++                    TurnPipeline::new(protocol, tick, input_delay_ticks)
++                        .map_err(anyhow::Error::msg)?,
++                );
++                // Full saves include process-local presentation state. Native
++                // Queue_AI checksums are sent separately after actual commits;
++                // they never gate the next future input submission.
 +                session.last_hash = format!("launch:{}", session.match_id);
 +                session.phase = Phase::Running;
 +            }
 +            Incoming::Turn { tick, commands } => {
-+                let retiring_in_flight =
-+                    session.phase == Phase::Finishing && session.in_flight_turn == Some(tick);
 +                ensure!(
-+                    ((session.phase == Phase::Running && session.submitted) || retiring_in_flight)
-+                        && session.accepted.is_none()
-+                        && !session.committing
-+                        && tick == session.next_tick,
-+                    "duplicate, stale or future native turn"
++                    matches!(session.phase, Phase::Running | Phase::Finishing),
++                    "native turn requires an active or retiring match"
 +                );
-+                let sim = &state
-+                    .match_state
-+                    .sim_runtime
-+                    .as_ref()
-+                    .ok_or_else(|| anyhow::anyhow!("native world is missing"))?
-+                    .simulation;
-+                ensure!(
-+                    tick == sim.session().tick() + 1,
-+                    "native turn is not the world's next tick"
-+                );
-+                let mut admitted = Vec::with_capacity(commands.len());
-+                let mut previous_player = 0;
-+                for wire in commands {
-+                    let owner = *session
-+                        .owners
-+                        .get(wire.player)
-+                        .ok_or_else(|| anyhow::anyhow!("invalid native source participant"))?;
-+                    ensure!(
-+                        wire.player >= previous_player,
-+                        "native turn is not in participant order"
-+                    );
-+                    previous_player = wire.player;
-+                    if validate_command(sim, owner, &wire.envelope, tick)? == Admission::Apply {
-+                        admitted.push(wire.envelope);
-+                    }
-+                }
-+                if retiring_in_flight {
-+                    session.in_flight_turn = None;
++                validate_turn_headers(&commands, &session.owners, tick)?;
++                let pipeline = session
++                    .pipeline
++                    .as_mut()
++                    .ok_or_else(|| anyhow::anyhow!("native input pipeline is missing"))?;
++                if session.phase == Phase::Finishing {
++                    pipeline.retire_receipt(tick).map_err(anyhow::Error::msg)?;
 +                } else {
-+                    session.accepted = Some(admitted);
++                    // Gameplay authorization is deferred until this is the
++                    // exact world's next tick: actors may die or change owner
++                    // while their future transport turn is buffered.
++                    pipeline
++                        .receive(tick, session.next_tick, commands)
++                        .map_err(anyhow::Error::msg)?;
 +                }
 +            }
 +            Incoming::Finished { tick, checksum } => {
@@ -88059,7 +88099,9 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +                    "native finished acknowledgement differs from the committed result"
 +                );
 +                session.phase = Phase::Finished;
-+                session.in_flight_turn = None;
++                if let Some(pipeline) = session.pipeline.as_mut() {
++                    pipeline.clear_buffer();
++                }
 +                session.pending.clear();
 +                session.accepted = None;
 +                log::info!("Native network match finished at committed tick {tick}");
@@ -88136,34 +88178,52 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +        session.last_hash = format!("full:{}", session.full_state_hash);
 +        session.phase = Phase::Loaded;
 +        emit(
-+            json!({"type":"loaded", "matchId":session.match_id, "tick":sim.session().tick(),
++            json!({"type":"loaded", "protocol":PROTOCOL, "matchId":session.match_id, "tick":sim.session().tick(),
 +            "hash":session.full_state_hash,"owners":session.owners.iter().map(|id| id.index()).collect::<Vec<_>>(),
 +            "build":format!("{SOURCE_REVISION}:{PATCH_HASH}"),"resourceManifest":RESOURCE_MANIFEST }),
 +        );
 +    }
-+    if session.phase == Phase::Running
-+        && !session.submitted
-+        && session.accepted.is_none()
-+        && !session.committing
-+    {
++    if session.phase == Phase::Running && !session.committing {
 +        ensure!(
-+            sim.session().tick() + 1 == session.next_tick,
++            sim.session().tick().checked_add(1) == Some(session.next_tick),
 +            "native world advanced outside ordered turn"
 +        );
-+        // The preceding native Queue_AI already produced the sync checksum.
-+        // Recomputing it would consume two extra Scenario RNG draws. Full state
-+        // hashes include process-local presentation/defeat state, so they are
-+        // retained only as diagnostics; the loaded barrier authenticates the
-+        // frozen launch/build/assets rather than local presentation state.
-+        let mut commands = std::mem::take(&mut session.pending);
-+        for command in &mut commands {
-+            command.execute_tick = session.next_tick;
++        let pipeline = session
++            .pipeline
++            .as_mut()
++            .ok_or_else(|| anyhow::anyhow!("native input pipeline is missing"))?;
++        let targets = pipeline
++            .seal(session.next_tick)
++            .map_err(anyhow::Error::msg)?;
++        let authored_tick = targets.end.checked_sub(1);
++        for tick in targets {
++            // Only the far end of the initial window may contain authored
++            // input. Earlier bootstrap turns are deterministic empty turns.
++            let mut commands = if Some(tick) == authored_tick {
++                std::mem::take(&mut session.pending)
++            } else {
++                Vec::new()
++            };
++            for command in &mut commands {
++                command.execute_tick = tick;
++            }
++            emit(json!({"type":"input","matchId":session.match_id,
++                "tick":tick,"commands":commands}));
 +        }
-+        emit(
-+            json!({"type":"input","matchId":session.match_id,"tick":session.next_tick,
-+            "prevHash":session.last_hash,"commands":commands}),
-+        );
-+        session.submitted = true;
++        if session.accepted.is_none()
++            && let Some(commands) = pipeline.take_current(session.next_tick)
++        {
++            let mut admitted = Vec::with_capacity(commands.len());
++            for wire in commands {
++                let owner = session.owners[wire.player];
++                if validate_command(sim, owner, &wire.envelope, session.next_tick)?
++                    == Admission::Apply
++                {
++                    admitted.push(wire.envelope);
++                }
++            }
++            session.accepted = Some(admitted);
++        }
 +    }
 +    Ok(())
 +}
@@ -88248,7 +88308,6 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +            && session.committing_frame == Some(frame)
 +        {
 +            session.last_hash = format!("retail:{frame}:{value:08x}");
-+            session.submitted = false;
 +            session.committing = false;
 +            session.committing_frame = None;
 +        } else if !committed || tick != Some(session.next_tick) {
@@ -88261,8 +88320,9 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +            && session.committing_frame == Some(frame)
 +        {
 +            session.last_hash = format!("retail:{frame}:{value:08x}");
++            emit(json!({"type":"checksum", "matchId":session.match_id,
++                "tick":session.next_tick,"checksum":session.last_hash}));
 +            session.next_tick += 1;
-+            session.submitted = false;
 +            session.committing = false;
 +            session.committing_frame = None;
 +        } else {
@@ -88279,6 +88339,208 @@ index 0000000000000000000000000000000000000000..3419789d4d04f57fa4e51f7216296c8b
 +    publish(&session);
 +    state.platform.browser_online = !matches!(session.phase, Phase::Stopped | Phase::Finished);
 +    state.match_state.browser_network = Some(session);
++}
+diff --git a/src/app/browser_network/pipeline.rs b/src/app/browser_network/pipeline.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b33659d62331911621eeb6f35fc7f4909ff303e
+--- /dev/null
++++ b/src/app/browser_network/pipeline.rs
+@@ -0,0 +1,196 @@
++//! Bounded transport frontiers. This owner never advances the simulation or
++//! authorizes gameplay commands; the caller admits a buffered turn only when
++//! its exact world tick is about to execute.
++
++use std::collections::VecDeque;
++use std::ops::Range;
++
++pub(super) const PROTOCOL: u32 = 3;
++pub(super) const MAX_INPUT_DELAY_TICKS: u64 = 16;
++
++pub(super) struct TurnPipeline<T> {
++    input_delay: u64,
++    first_tick: u64,
++    next_submit: u64,
++    next_receive: u64,
++    turns: VecDeque<(u64, T)>,
++}
++
++impl<T> TurnPipeline<T> {
++    pub(super) fn new(
++        protocol: u32,
++        first_tick: u64,
++        input_delay: u64,
++    ) -> Result<Self, &'static str> {
++        if protocol != PROTOCOL
++            || first_tick == 0
++            || !(1..=MAX_INPUT_DELAY_TICKS).contains(&input_delay)
++        {
++            return Err("unsupported native input delay or first tick");
++        }
++        first_tick
++            .checked_add(input_delay)
++            .ok_or("native input horizon overflow")?;
++        Ok(Self {
++            input_delay,
++            first_tick,
++            next_submit: first_tick,
++            next_receive: first_tick,
++            turns: VecDeque::new(),
++        })
++    }
++
++    pub(super) fn input_delay(&self) -> u64 {
++        self.input_delay
++    }
++
++    pub(super) fn submitted_through(&self) -> u64 {
++        self.next_submit - 1
++    }
++
++    pub(super) fn received_through(&self) -> u64 {
++        self.next_receive - 1
++    }
++
++    pub(super) fn queued_turns(&self) -> usize {
++        self.turns.len()
++    }
++
++    /// Seal the initial empty prefix, then one future input per actual world
++    /// commit. Repeated polls at the same tick produce no extra submissions.
++    /// The caller places its authored input only in the last returned tick.
++    pub(super) fn seal(&mut self, next_world_tick: u64) -> Result<Range<u64>, &'static str> {
++        if next_world_tick < self.first_tick || next_world_tick > self.next_submit {
++            return Err("native world advanced outside submitted input horizon");
++        }
++        let end = next_world_tick
++            .checked_add(self.input_delay)
++            .ok_or("native input horizon overflow")?;
++        if end < self.next_submit {
++            return Err("native world tick moved backwards");
++        }
++        let range = self.next_submit..end;
++        self.next_submit = end;
++        Ok(range)
++    }
++
++    fn admit_receipt(&mut self, tick: u64) -> Result<(), &'static str> {
++        if tick != self.next_receive || tick >= self.next_submit {
++            return Err("duplicate, stale, unsubmitted or unordered native turn");
++        }
++        self.next_receive = tick.checked_add(1).ok_or("native receipt tick overflow")?;
++        Ok(())
++    }
++
++    pub(super) fn receive(
++        &mut self,
++        tick: u64,
++        next_world_tick: u64,
++        commands: T,
++    ) -> Result<(), &'static str> {
++        let end = next_world_tick
++            .checked_add(self.input_delay)
++            .ok_or("native receipt horizon overflow")?;
++        if tick < next_world_tick || tick >= end || self.turns.len() >= self.input_delay as usize {
++            return Err("native turn exceeds the current input window");
++        }
++        self.admit_receipt(tick)?;
++        self.turns.push_back((tick, commands));
++        Ok(())
++    }
++
++    pub(super) fn take_current(&mut self, next_world_tick: u64) -> Option<T> {
++        if self
++            .turns
++            .front()
++            .is_some_and(|(tick, _)| *tick == next_world_tick)
++        {
++            self.turns.pop_front().map(|(_, commands)| commands)
++        } else {
++            None
++        }
++    }
++
++    pub(super) fn clear_buffer(&mut self) {
++        self.turns.clear();
++    }
++
++    /// An already sealed turn may arrive after local terminal observation.
++    /// Authenticate that bounded tail without storing or executing it.
++    pub(super) fn retire_receipt(&mut self, tick: u64) -> Result<(), &'static str> {
++        self.admit_receipt(tick)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn initial_window_and_refill_do_not_wait_for_receipts() {
++        let mut pipeline = TurnPipeline::<()>::new(PROTOCOL, 101, 8).unwrap();
++        assert_eq!(pipeline.seal(101).unwrap(), 101..109);
++        assert_eq!(pipeline.seal(101).unwrap(), 109..109);
++        for tick in 101..109 {
++            pipeline.receive(tick, 101, ()).unwrap();
++        }
++        assert_eq!(pipeline.queued_turns(), 8);
++        assert_eq!(pipeline.take_current(101), Some(()));
++        assert_eq!(pipeline.seal(102).unwrap(), 109..110);
++        assert_eq!(pipeline.submitted_through(), 109);
++        assert_eq!(pipeline.received_through(), 108);
++        assert_eq!(pipeline.input_delay(), 8);
++    }
++
++    #[test]
++    fn buffered_future_commands_are_not_exposed_early() {
++        let mut pipeline = TurnPipeline::new(PROTOCOL, 11, 3).unwrap();
++        pipeline.seal(11).unwrap();
++        pipeline.receive(11, 11, vec!["first"]).unwrap();
++        pipeline.receive(12, 11, vec!["future"]).unwrap();
++        assert_eq!(pipeline.take_current(12), None);
++        assert_eq!(pipeline.take_current(11), Some(vec!["first"]));
++        assert_eq!(pipeline.take_current(11), None);
++        assert_eq!(pipeline.take_current(12), Some(vec!["future"]));
++    }
++
++    #[test]
++    fn out_of_order_duplicate_and_unsubmitted_receipts_are_rejected() {
++        let mut pipeline = TurnPipeline::new(PROTOCOL, 1, 2).unwrap();
++        assert!(pipeline.receive(1, 1, ()).is_err());
++        pipeline.seal(1).unwrap();
++        assert!(pipeline.receive(2, 1, ()).is_err());
++        pipeline.receive(1, 1, ()).unwrap();
++        assert!(pipeline.receive(1, 1, ()).is_err());
++        pipeline.receive(2, 1, ()).unwrap();
++        assert!(pipeline.receive(3, 1, ()).is_err());
++        assert_eq!(pipeline.received_through(), 2);
++    }
++
++    #[test]
++    fn terminal_tail_is_bounded_and_never_buffers() {
++        let mut pipeline = TurnPipeline::new(PROTOCOL, 1, 8).unwrap();
++        pipeline.seal(1).unwrap();
++        pipeline.receive(1, 1, ()).unwrap();
++        pipeline.receive(2, 1, ()).unwrap();
++        pipeline.clear_buffer();
++        assert!(pipeline.retire_receipt(2).is_err());
++        for tick in 3..9 {
++            pipeline.retire_receipt(tick).unwrap();
++        }
++        assert!(pipeline.retire_receipt(9).is_err());
++        assert_eq!(pipeline.queued_turns(), 0);
++    }
++
++    #[test]
++    fn unsupported_window_and_tick_overflow_are_rejected() {
++        assert!(TurnPipeline::<()>::new(2, 1, 8).is_err());
++        assert!(TurnPipeline::<()>::new(PROTOCOL, 0, 8).is_err());
++        assert!(TurnPipeline::<()>::new(PROTOCOL, 1, 0).is_err());
++        assert!(TurnPipeline::<()>::new(PROTOCOL, 1, MAX_INPUT_DELAY_TICKS + 1).is_err());
++        assert!(TurnPipeline::<()>::new(PROTOCOL, u64::MAX - 1, 8).is_err());
++        let mut pipeline = TurnPipeline::<()>::new(PROTOCOL, 10, 8).unwrap();
++        assert!(pipeline.seal(9).is_err());
++        assert!(pipeline.seal(11).is_err());
++    }
 +}
 diff --git a/src/app/browser_shell.rs b/src/app/browser_shell.rs
 new file mode 100644
@@ -93077,7 +93339,7 @@ index 9a397690e7cf41d01aee73ea976f504ac07ca2f6..86e52d6acb244d44d6a367425fc71c2f
  use crate::sim::telemetry::TimingSample;
  
 diff --git a/src/app/mod.rs b/src/app/mod.rs
-index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e1094baf416 100644
+index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a30778835d7d 100644
 --- a/src/app/mod.rs
 +++ b/src/app/mod.rs
 @@ -3,7 +3,7 @@
@@ -93089,7 +93351,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e10
  
  use anyhow::Result;
  use winit::application::ApplicationHandler;
-@@ -33,6 +33,11 @@ use crate::util::config::GameConfig;
+@@ -33,6 +33,14 @@ use crate::util::config::GameConfig;
  
  pub mod app_bundle;
  pub(crate) mod audio_runtime;
@@ -93098,10 +93360,13 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e10
 +pub mod browser;
 +#[cfg(target_arch = "wasm32")]
 +pub(crate) mod browser_network;
++#[cfg(all(test, not(target_arch = "wasm32")))]
++#[path = "browser_network/pipeline.rs"]
++mod browser_network_pipeline;
  pub(crate) mod campaign_defeat;
  pub(crate) mod campaign_victory;
  pub(crate) mod chinese_ui;
-@@ -141,6 +146,8 @@ pub struct App {
+@@ -141,6 +149,8 @@ pub struct App {
      /// Make sure config.toml names a game folder before the window opens
      /// ([`app_bundle`]).
      ask_for_game_folder: bool,
@@ -93110,7 +93375,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e10
  }
  
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -192,6 +199,8 @@ impl App {
+@@ -192,6 +202,8 @@ impl App {
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -93119,7 +93384,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e10
          }
      }
  
-@@ -212,6 +221,8 @@ impl App {
+@@ -212,6 +224,8 @@ impl App {
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -93128,7 +93393,7 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..8daf76c6630eea52911d04ab76611e10
          }
      }
  
-@@ -234,6 +245,8 @@ impl App {
+@@ -234,6 +248,8 @@ impl App {
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,

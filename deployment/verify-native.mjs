@@ -1,4 +1,4 @@
-// Post-deployment HTTP and native-v2 TRANSPORT probe. No engine is loaded or
+// Post-deployment HTTP and native-v3 TRANSPORT probe. No engine is loaded or
 // simulated: the test receipts/CRC below are deliberately synthetic. A passing
 // result does not replace a real two-browser WebGPU battle.
 import fs from 'node:fs/promises';
@@ -307,9 +307,9 @@ async function transportProbe(origin, release) {
     peers.push(host, guest);
     await Promise.all(peers.map(peer => peer.opened));
     const hellos = await Promise.all(peers.map(peer => peer.wait('hello')));
-    hellos.forEach(message => assert.equal(message.protocol, 2, 'Native protocol'));
+    hellos.forEach(message => assert.equal(message.protocol, 3, 'Native protocol'));
     assert.notEqual(hellos[0].playerId, hellos[1].playerId, 'Distinct server-assigned probe identities');
-    peers.forEach(peer => peer.send({type: 'hello', protocol: 2, playerId: randomUUID()}));
+    peers.forEach(peer => peer.send({type: 'hello', protocol: 3, playerId: randomUUID()}));
     const suffix = randomUUID().slice(0, 8);
     host.send({type: 'create', name: `ProbeHost-${suffix}`, config: {map: 'XMP29U2.MAP', seed: 0x56455241}});
     const room = (await host.wait('room', message => message.room?.isHost && message.room.members.length === 1)).room;
@@ -328,14 +328,15 @@ async function transportProbe(origin, release) {
     const initialTick = 100;
     // These receipts describe no actual engine. Both sources use an isolated
     // test build and fixed owners; empty commands never mutate a real room.
-    peers.forEach((peer, index) => peer.send({type: 'loaded', matchId: start.matchId, tick: initialTick,
-      hash: `transport-probe-local-${index}`, owners: [0, 1], build: 'native-transport-probe-v2',
+    peers.forEach((peer, index) => peer.send({type: 'loaded', protocol: 3, matchId: start.matchId, tick: initialTick,
+      hash: `transport-probe-local-${index}`, owners: [0, 1], build: 'native-transport-probe-v3',
       resourceManifest: release.build.resourceManifestSha256}));
     const ready = await Promise.all(peers.map(peer => peer.wait('ready', message => message.matchId === start.matchId)));
-    ready.forEach(message => { assert.equal(message.tick, initialTick + 1, 'First probe turn'); assert.equal(message.bootstrap, start.matchId, 'Launch receipt'); });
-    peers.forEach(peer => peer.send({type: 'input', matchId: start.matchId, tick: initialTick + 1, prevHash: `launch:${start.matchId}`, commands: []}));
+    ready.forEach(message => { assert.equal(message.tick, initialTick + 1, 'First probe turn'); assert.equal(message.bootstrap, start.matchId, 'Launch receipt'); assert.equal(message.protocol, 3, 'Pipeline protocol'); assert.equal(message.inputDelayTicks, 8, 'Bounded pipeline window'); });
+    peers.forEach(peer => peer.send({type: 'input', matchId: start.matchId, tick: initialTick + 1, commands: []}));
     const turns = await Promise.all(peers.map(peer => peer.wait('turn', message => message.matchId === start.matchId)));
     turns.forEach(turn => { assert.equal(turn.tick, initialTick + 1, 'Ordered probe turn'); equal(turn.commands, [], 'Empty probe turn'); });
+    peers.forEach(peer => peer.send({type: 'checksum', matchId: start.matchId, tick: initialTick + 1, checksum: 'retail:100:00000000'}));
     const result = {type: 'finished', matchId: start.matchId, tick: initialTick + 1, checksum: 'retail:100:00000000'};
     peers.forEach(peer => peer.send(result));
     const finished = await Promise.all(peers.map(peer => peer.wait('finished', message => message.matchId === start.matchId)));
@@ -362,7 +363,7 @@ async function transportProbe(origin, release) {
 }
 
 async function main() {
-  const report = {ok: false, scope: 'published HTTP assets and native-v2 transport probe', engineGameplayVerified: false, checks: {}};
+  const report = {ok: false, scope: 'published HTTP assets and native-v3 transport probe', engineGameplayVerified: false, checks: {}};
   let stage = 'arguments';
   try {
     const origin = originArgument(); report.origin = origin;
@@ -377,7 +378,7 @@ async function main() {
     const http = createHttp(origin);
     stage = 'health';
     const health = await http.json('/api/health');
-    assert.ok(health.ok && health.app === 'werhd-vera-native' && health.protocol === 2, 'Native service health/protocol');
+    assert.ok(health.ok && health.app === 'werhd-vera-native' && health.protocol === 3, 'Native service health/protocol');
     assert.equal(health.patchSha256, release.build.patchSha256, 'Published native patch');
     assert.equal(health.resourceManifestSha256, resourceIdentity, 'Published native resources');
     assert.equal(health.contentCatalogIdentity, catalogIdentity, 'Published native catalog');

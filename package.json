@@ -29,7 +29,10 @@
     "sync:upstream": "python3 tools/sync_upstream.py sync",
     "sync:check": "python3 tools/sync_upstream.py check",
     "sync:patches": "python3 tools/sync_upstream.py patches",
-    "check:isolation": "python3 tools/sync_upstream.py isolation"
+    "check:isolation": "python3 tools/sync_upstream.py isolation",
+    "native:update": "python3 tools/native-update.py",
+    "native:validate": "python3 tools/native-update.py validate",
+    "native:test-update": "python3 tools/native-update-test.py"
   },
   "dependencies": {
     "vite": "7.3.3",

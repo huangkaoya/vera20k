@@ -38,6 +38,9 @@ pub(crate) mod browser_shell;
 pub mod browser;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod browser_network;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "browser_network/pipeline.rs"]
+mod browser_network_pipeline;
 pub(crate) mod campaign_defeat;
 pub(crate) mod campaign_victory;
 pub(crate) mod chinese_ui;

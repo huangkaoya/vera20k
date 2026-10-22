@@ -111,7 +111,7 @@ test('semantic actions drive host settings and preserve a detached server-author
   await f.controller.dispatch({action: 'setCode', code: ' ab cd12 '});
   assert.equal(f.current.name, '指挥官测试'); assert.equal(f.current.code, 'ABCD12');
   const creating = f.controller.dispatch({action: 'create'}), socket = f.sockets.at(-1); socket.open(); await creating;
-  assert.equal(socket.sent[0].type, 'hello'); assert.equal(socket.sent[0].protocol, 2);
+  assert.equal(socket.sent[0].type, 'hello'); assert.equal(socket.sent[0].protocol, 3);
   assert.deepEqual(socket.sent[1], {type: 'create', name: '指挥官测试'});
   socket.receive({type: 'room', room: room()}); assert.equal(f.current.phase, 'room');
   f.current.room.config.options.credits = 1;

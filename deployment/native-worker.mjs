@@ -1,5 +1,5 @@
 import {DurableObject} from 'cloudflare:workers';
-import {NativeRoomCoordinator} from '../tools/services/native-room-coordinator.mjs';
+import {NativeRoomCoordinator,NATIVE_PROTOCOL} from '../tools/services/native-room-coordinator.mjs';
 import release from './generated/release.json';
 
 const json=(value,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
@@ -69,8 +69,19 @@ export class NativeRooms extends DurableObject {
       if(typeof event.data!=='string'||new TextEncoder().encode(event.data).byteLength>262144){disconnect();serverSocket.close(1009,'Message too large');return;}
       this.coordinator.receive(client,event.data);
     });
-    serverSocket.addEventListener('close',disconnect);
-    serverSocket.addEventListener('error',disconnect);
+    serverSocket.addEventListener('close',event=>{
+      // Record only transport metadata; close reasons and payloads may contain
+      // client-controlled text and never belong in operational diagnostics.
+      console.info(JSON.stringify({event:'native-socket-close',atMs:Date.now(),
+        code:event.code,wasClean:event.wasClean,
+        hasRoom:Boolean(client?.room),roomPhase:client?.room?.phase??null}));
+      disconnect();
+    });
+    serverSocket.addEventListener('error',()=>{
+      console.error(JSON.stringify({event:'native-socket-error',atMs:Date.now(),
+        hasRoom:Boolean(client?.room),roomPhase:client?.room?.phase??null}));
+      disconnect();
+    });
     try {
       client=this.coordinator.connect({send:text=>serverSocket.send(text),close:()=>serverSocket.close(1001,'Server stopped')});
     } catch {
@@ -87,10 +98,10 @@ export default {
     try {
       if(url.pathname==='/ws/native') {
         if(!sameOrigin(request))return json({error:'Origin rejected'},403);
-        return env.NATIVE_ROOMS.getByName('native-v2').fetch(request);
+        return env.NATIVE_ROOMS.getByName('native-v3').fetch(request);
       }
       if(!methodAllowed(request))return new Response(null,{status:405,headers:{Allow:'GET, HEAD'}});
-      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:2,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
+      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:NATIVE_PROTOCOL,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
       if(url.pathname==='/api/native/resources')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.resources);
       if(url.pathname==='/native/build.json')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.build);
       let pathname;

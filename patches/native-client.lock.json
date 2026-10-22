@@ -5,7 +5,7 @@
   "baselineModes": {},
   "patch": {
     "path": "patches/native-client.patch",
-    "sha256": "c8df1a92ba80a45f5e75aaaf91dbfba0266846bf70eaf8c2abc1f1be8935e247"
+    "sha256": "f2def12046dacde6480c693d92e1cd9451d4d8efb9879dc266c65a830a0b93b3"
   },
   "files": {
     "Cargo.lock": {
@@ -45,7 +45,11 @@
       "mode": "100644"
     },
     "src/app/browser_network.rs": {
-      "sha256": "222d96de99b922be2ded52c1134adc2554fa407ec9222e9a4fae64037670c211",
+      "sha256": "3b9730fc7fd2d8eb3e88f2bcba4ba3c8156b6f92ccbbbc4f21775d194af7a6a3",
+      "mode": "100644"
+    },
+    "src/app/browser_network/pipeline.rs": {
+      "sha256": "fa90d6476d2ed1a2a2bb9d09b2ce01c3e48d13aea78fba573f081dcbc6d47966",
       "mode": "100644"
     },
     "src/app/browser_shell.rs": {
@@ -321,7 +325,7 @@
       "mode": "100644"
     },
     "src/app/mod.rs": {
-      "sha256": "a886da0352c2b16de8076e6771f3dc61aaf9ea81454d18e8a08e13ac6e9510dc",
+      "sha256": "8770ecd6f66557032ba2a0fd810cc87e9c58fc4ea02f9160732a504d48bd487a",
       "mode": "100644"
     },
     "src/app/movie_playback.rs": {

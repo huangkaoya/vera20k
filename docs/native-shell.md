@@ -30,7 +30,7 @@ downloads, cancellation, quota notices and a final activation guard. Downloading
 a pack alone does not enable it; activation persists a small selection and
 reloads before resources are mounted.
 
-`lobby.js` retains the native-v2 transport, server-authoritative room/roster,
+`lobby.js` uses the native-v3 buffered transport, server-authoritative room/roster,
 initial loading barrier, ordered outbox, background service wakeups, finished
 acknowledgment and connection epochs. It exposes `dispatch` and `onState`, creates
 no visible elements, and keeps transport decisions out of the renderer. The
