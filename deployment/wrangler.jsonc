@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "werhd-vera-native",
+  "account_id": "a143c234b30a44c323ed2f2273c9c9da",
   "main": "native-worker.mjs",
   "compatibility_date": "2026-10-19",
   "workers_dev": true,
@@ -12,8 +13,36 @@
     "html_handling": "none",
     "not_found_handling": "none"
   },
-  "r2_buckets": [{"binding": "NATIVE_DATA", "bucket_name": "ra2res"}],
-  "durable_objects": {"bindings": [{"name": "NATIVE_ROOMS", "class_name": "NativeRooms"}]},
-  "migrations": [{"tag": "native-v2-1", "new_sqlite_classes": ["NativeRooms"]}],
-  "observability": {"enabled": true, "head_sampling_rate": 1}
+  "r2_buckets": [
+    {
+      "binding": "NATIVE_DATA",
+      "bucket_name": "youlidefuchou-res"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NATIVE_ROOMS",
+        "class_name": "NativeRooms"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "native-v2-1",
+      "new_sqlite_classes": [
+        "NativeRooms"
+      ]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "routes": [
+    {
+      "pattern": "wan.youlidefuchou.com/*",
+      "zone_id": "6af2d4065f7f473419acaf79c28899d1"
+    }
+  ]
 }

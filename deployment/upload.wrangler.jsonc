@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "werhd-vera-native-upload",
+  "account_id": "a143c234b30a44c323ed2f2273c9c9da",
   "compatibility_date": "2026-10-19",
-  "r2_buckets": [{"binding": "NATIVE_DATA", "bucket_name": "ra2res", "remote": true}]
+  "r2_buckets": [{"binding": "NATIVE_DATA", "bucket_name": "youlidefuchou-res", "remote": true}]
 }

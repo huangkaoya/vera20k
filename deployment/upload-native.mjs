@@ -5,26 +5,32 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
 import {hashNativeFile,verifyNativeBuild} from '../tools/native-build-manifest.mjs';
+import {loadDeploymentTarget,assertUploadPlanTarget,assertReleaseTarget,deploymentIdentity} from './deployment-target.mjs';
+import {withDeploymentCredentials} from './cloudflare-upload-auth.mjs';
 
 const directory=path.dirname(fileURLToPath(import.meta.url)),root=path.resolve(directory,'..');
+const target=await loadDeploymentTarget();
 const plan=JSON.parse(await fs.readFile(path.join(directory,'generated/upload-plan.json'),'utf8'));
-if(plan.schema!==1||plan.bucket!=='ra2res'||!Array.isArray(plan.objects))throw new Error('Invalid native upload plan');
+assertUploadPlanTarget(plan,target);
 const release=await fs.readFile(path.join(directory,'generated/release.json'));
 if(createHash('sha256').update(release).digest('hex')!==plan.releaseSha256)throw new Error('Release manifest changed after packaging');
+assertReleaseTarget(JSON.parse(release),target);
 await verifyNativeBuild({root,sourceCheck:true,requireChecked:true});
 for(const object of plan.objects) {
-  if(object.key!==`vera20k/web-native/objects/sha256/${object.sha256}`||!/^[a-f0-9]{64}$/.test(object.sha256))throw new Error('Object must use the isolated native content-addressed prefix');
+  if(object.key!==target.objectPrefix+object.sha256||!/^[a-f0-9]{64}$/.test(object.sha256))throw new Error('Object must use the isolated native content-addressed prefix');
   const stat=await fs.lstat(object.file);
   if(!stat.isFile()||stat.isSymbolicLink()||stat.size!==object.bytes||await hashNativeFile(object.file)!==object.sha256)throw new Error('Local upload object differs from its immutable plan');
 }
 console.log(JSON.stringify({validated:true,objects:plan.objects.length,bytes:plan.objects.reduce((sum,object)=>sum+object.bytes,0),upload:process.argv.includes('--upload')}));
 if(!process.argv.includes('--upload'))process.exit(0);
+await withDeploymentCredentials(target,async({profile})=>{
 const {getPlatformProxy}=await import('wrangler');
-const proxy=await getPlatformProxy({configPath:path.join(directory,'upload.wrangler.jsonc'),persist:false,remoteBindings:true});
-const stateRoot=path.join(directory,'generated/upload-state');await fs.mkdir(stateRoot,{recursive:true});
+const proxy=await getPlatformProxy({configPath:path.join(directory,'upload.wrangler.jsonc'),envFiles:[],persist:false,remoteBindings:true});
+const stateRoot=path.join(directory,'generated/upload-state',target.accountId,target.bucket);
 const chunkSize=8*1024*1024,md5=bytes=>createHash('md5').update(bytes).digest('hex');
 const same=(actual,expected)=>actual&&actual.size===expected.bytes&&actual.customMetadata?.sha256===expected.sha256;
 try {
+  await fs.mkdir(stateRoot,{recursive:true});
   const bucket=proxy.env.NATIVE_DATA,receipt=[];
   for(const object of plan.objects) {
     const existing=await bucket.head(object.key);
@@ -34,12 +40,12 @@ try {
     }
     const stateFile=path.join(stateRoot,object.sha256+'.json');
     let state;try{state=JSON.parse(await fs.readFile(stateFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
-    if(state&&(state.key!==object.key||state.bytes!==object.bytes||state.sha256!==object.sha256||state.chunkSize!==chunkSize))throw new Error('Multipart resume state differs from upload plan');
+    if(state&&(state.accountId!==target.accountId||state.bucket!==target.bucket||state.key!==object.key||state.bytes!==object.bytes||state.sha256!==object.sha256||state.chunkSize!==chunkSize))throw new Error('Multipart resume state differs from upload target/plan');
     const upload=state?bucket.resumeMultipartUpload(object.key,state.uploadId):await bucket.createMultipartUpload(object.key,{
       httpMetadata:{contentType:object.contentType,cacheControl:'public, max-age=31536000, immutable'},
       customMetadata:{sha256:object.sha256,product:'werhd-vera-native'},
     });
-    state??={key:object.key,bytes:object.bytes,sha256:object.sha256,chunkSize,uploadId:upload.uploadId,parts:[]};
+    state??={...deploymentIdentity(target),key:object.key,bytes:object.bytes,sha256:object.sha256,chunkSize,uploadId:upload.uploadId,parts:[]};
     let saving=Promise.resolve();
     const save=()=>{
       const body=JSON.stringify(state,null,2)+'\n';
@@ -79,5 +85,6 @@ try {
     receipt.push({key:object.key,bytes:actual.size,etag:actual.etag,reused:false});
     console.log(JSON.stringify({uploaded:true,key:object.key,bytes:actual.size}));
   }
-  await fs.writeFile(path.join(directory,'generated/upload-receipt.json'),JSON.stringify({schema:1,releaseSha256:plan.releaseSha256,objects:receipt},null,2)+'\n');
+  await fs.writeFile(path.join(directory,'generated/upload-receipt.json'),JSON.stringify({schema:1,...deploymentIdentity(target),profile,releaseSha256:plan.releaseSha256,objects:receipt},null,2)+'\n');
 }finally{await proxy.dispose();}
+});

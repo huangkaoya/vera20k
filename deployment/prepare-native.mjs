@@ -3,8 +3,10 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
 import {verifyNativeBuild,readNativeResourceManifest,nativeAssetManifestIdentity} from '../tools/native-build-manifest.mjs';
+import {loadDeploymentTarget,deploymentIdentity} from './deployment-target.mjs';
 
 const directory=path.dirname(fileURLToPath(import.meta.url)),root=path.resolve(directory,'..');
+const target=await loadDeploymentTarget();
 const build=await verifyNativeBuild({root,sourceCheck:true,requireChecked:true});
 const index=await readNativeResourceManifest();
 const resourceManifestSha256=nativeAssetManifestIdentity(index.manifest);
@@ -36,7 +38,7 @@ for(const name of ['FiraSansCondensed-Medium.ttf','FiraSansCondensed-OFL'])await
 await fs.copyFile(path.join(assets,'branding/icon.png'),path.join(assets,'favicon.ico'));
 const objects={},uploads=new Map();
 function object(file,pathname,bytes,sha256,contentType) {
-  const key=`vera20k/web-native/objects/sha256/${sha256}`;
+  const key=target.objectPrefix+sha256;
   objects[pathname]={key,bytes,sha256,contentType};
   if(!uploads.has(key))uploads.set(key,{file,key,bytes,sha256,contentType});
 }
@@ -48,8 +50,8 @@ for(const file of index.manifest.files) {
 }
 const resources={...index.manifest,identity:resourceManifestSha256,
   files:index.manifest.files.map(file=>({...file,url:file.url+'?sha256='+file.sha256}))};
-const release={schema:1,build,resources,objects};
+const release={schema:1,deployment:deploymentIdentity(target),build,resources,objects};
 const releaseBytes=JSON.stringify(release,null,2)+'\n';
 await fs.writeFile(path.join(output,'release.json'),releaseBytes);
-await fs.writeFile(path.join(output,'upload-plan.json'),JSON.stringify({schema:1,bucket:'ra2res',releaseSha256:createHash('sha256').update(releaseBytes).digest('hex'),objects:[...uploads.values()],smallFiles},null,2)+'\n');
+await fs.writeFile(path.join(output,'upload-plan.json'),JSON.stringify({schema:1,...deploymentIdentity(target),releaseSha256:createHash('sha256').update(releaseBytes).digest('hex'),objects:[...uploads.values()],smallFiles},null,2)+'\n');
 console.log(JSON.stringify({prepared:true,patchSha256:build.patchSha256,resourceManifestSha256,staticFiles:smallFiles.length,r2Objects:uploads.size,r2Bytes:[...uploads.values()].reduce((sum,file)=>sum+file.bytes,0)}));

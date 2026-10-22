@@ -4,13 +4,14 @@
   "type": "module",
   "scripts": {
     "package": "node prepare-native.mjs",
-    "test": "node --test native-worker.test.mjs",
-    "check": "wrangler deploy --dry-run --outdir generated/worker",
-    "types": "wrangler types generated/worker-configuration.d.ts",
+    "test": "node --test native-worker.test.mjs deployment-target.test.mjs",
+    "check": "wrangler --profile=youlidefuchou deploy --dry-run --outdir generated/worker",
+    "types": "wrangler --profile=youlidefuchou types generated/worker-configuration.d.ts",
     "check:types": "node ../node_modules/typescript/bin/tsc -p tsconfig.json",
-    "dev": "wrangler dev --local",
+    "dev": "wrangler --profile=youlidefuchou dev --local",
     "upload": "node upload-native.mjs",
-    "deploy": "wrangler deploy"
+    "verify": "node verify-native.mjs",
+    "deploy": "wrangler --profile=youlidefuchou deploy"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261021.1",
