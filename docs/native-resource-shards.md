@@ -52,8 +52,11 @@ node tools/publish-native-resource-shards.mjs --submit --limit=1
 # Continue sequentially; confirmed matching journal entries are reused.
 node tools/publish-native-resource-shards.mjs --submit
 
-# Read current platform status and refresh local receipts, without uploads.
+# Refresh confirmed IDs only; preserve no-ID rejected/unknown receipts.
 node tools/publish-native-resource-shards.mjs --refresh-status
+
+# After quota recovery, explicitly resume a confirmed -509 rejection.
+node tools/publish-native-resource-shards.mjs --submit --retry-quota
 ```
 
 Before any submission, the publisher rechecks all ZIP sizes/SHA256 values and
@@ -73,10 +76,10 @@ visibility, category, preview/public URLs and exact submission outcome.
 If a create call fails without a confirmed ID, the script records that fact,
 queries the Toy list for reconciliation, and stops. Running it again never
 blindly repeats an unknown create. An operator must reconcile the stored receipt
-with the platform; do not delete the journal to force a retry. Explicit business
-rejections can be retried only after the publishing metadata has changed and
-the exact destination remains absent. Earlier attempts and safe API errors are
-retained.
+with the platform; do not delete the journal to force a retry. Earlier attempts
+and sanitized API errors are retained. `--refresh-status` updates confirmed IDs
+only: no-ID rejection and unknown receipts keep their recorded state and failure
+details, without a create attempt or an inferred outcome.
 
 A confirmed create ID proves that submission was accepted even when a Toy has
 not yet entered `mylist`. The publisher persists the ID, performs up to three
@@ -84,16 +87,31 @@ bounded read-only list checks, then retains `submitted-awaiting-list` and
 `metadataVerified:false` while continuing independent uploads. A later list
 result must match the exact ID, title, slug, `TOOL` category and `LINK_ONLY`
 visibility before verification is marked complete. A mismatch stops the batch;
-an absent list record never triggers a duplicate upload. The summary separates
-confirmed submissions, pending list verification and pending review.
+an absent list record never triggers a duplicate upload. The summary separately
+reports `confirmed`, `pendingList`, `quotaRejected`, `notSubmitted` (never
+attempted) and `awaitingReview`. Pending review counts confirmed IDs only.
 
-A precisely recorded API rejection can be retried only when its state is
-`rejected`, `lastFailure.outcome` is `rejected`, the original ZIP identity still
+A precisely recorded non-quota validation rejection can be retried only when
+its state is `rejected`, `lastFailure.outcome` is `rejected`, the original ZIP identity still
 matches, no ID or current matching Toy exists, and the publishing image content
 has changed. The prior failure and any earlier unknown observation stay in the
-attempt history. Unchanged metadata or an unresolved unknown result never
-triggers another create. API status/code/message are retained in sanitized
-failure receipts; raw CLI stdout/stderr and credentials are not journaled.
+attempt history. Unchanged publishing images do not retry a validation rejection.
+
+Daily creation quota rejection is a separate case. Only a recorded
+`lastFailure.apiCode === -509`, `lastFailure.outcome === 'rejected'` and
+`state === 'rejected'` with no confirmed ID can use the explicit
+`--submit --retry-quota` command. The ZIP and publishing image SHA values must
+remain unchanged, and a fresh `mylist` must show no Toy at the exact destination.
+Default submission never retries this quota rejection. Do not change slugs or
+images to avoid the quota. Each explicit invocation makes at most one attempt
+for that rejected pack; if the platform still reports the limit, it stops and
+retains the new rejection. It does not loop, schedule a retry or assume a quota
+reset time or time zone. Confirmed IDs are reused before continuing the remaining
+independent packs.
+
+An unresolved unknown result never permits another create, including with
+`--retry-quota`. API status/code/message are retained in sanitized failure
+receipts; raw CLI stdout/stderr and credentials are not journaled.
 
 `staged-sources.json` and the journal's source list always retain
 `enabled:false`. Canonical candidate resource bases use
