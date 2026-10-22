@@ -77,6 +77,11 @@ coordinator with synthetic empty commands/checksums. Its explicit
 `engineGameplayVerified:false` prevents treating it as 100 engine instances.
 The two actual-game matches above are a separate gate on the unchanged WASM;
 their server version precedes the final heartbeat/cleanup additions.
+An actual browser on the latest deployment also retained native lobby room
+`S48A662` beyond 80 seconds of idle time and then received an acknowledged
+configuration change. It subsequently left the room. Evidence:
+`validation/native-sharded-lobby-idle.json` and PNG. This checks that the new
+client heartbeat preserves a waiting lobby beyond the server's idle deadline.
 
 ## Earlier public failures and diagnostic limits
 
