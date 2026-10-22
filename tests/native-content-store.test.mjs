@@ -136,11 +136,15 @@ test('unavailable storage and quota errors allow verified play and report not in
   assert.equal(result.cacheAvailable, true); assert.equal(result.installed, false); assert.equal(result.files[0].cacheStatus, 'write-failed');
 });
 
-test('prefetch is bounded, reports aggregate wire progress, and never retains result byte arrays', async () => {
-  const files = [0, 1, 2].map(index => descriptor(raw(`file-${index}`), `${index}.mix`)), gates = files.map(() => deferred()), entered = []; let active = 0, peak = 0;
-  const f = fixture({fetch: async url => { const index = Number(new URL(url).pathname.split('/').pop().split('.')[0]); entered.push(index); peak = Math.max(peak, ++active); await gates[index].promise; active--; return new Response(raw(`file-${index}`)); }}), progress = [];
+test('prefetch is bounded, reports aggregate wire progress, and never retains result byte arrays', {timeout: 1000}, async () => {
+  const files = [0, 1, 2].map(index => descriptor(raw(`file-${index}`), `${index}.mix`)), gates = files.map(() => deferred()), started = files.map(() => deferred()), entered = []; let active = 0, peak = 0;
+  const f = fixture({fetch: async url => { const index = Number(new URL(url).pathname.split('/').pop().split('.')[0]); entered.push(index); peak = Math.max(peak, ++active); started[index].resolve(); await gates[index].promise; active--; return new Response(raw(`file-${index}`)); }}), progress = [];
   const pending = f.store.prefetch(files, {concurrency: 2, onProgress: event => progress.push(event)});
-  await flush(); assert.deepEqual(entered, [0, 1]); gates[0].resolve(); await flush(); await flush();
+  await Promise.all([started[0].promise, started[1].promise]);
+  assert.deepEqual(entered, [0, 1]); gates[0].resolve();
+  // Wait for actual delivery admission; native WebCrypto completion need not
+  // fit into an arbitrary number of event-loop turns on a busy build host.
+  await started[2].promise;
   assert.deepEqual(entered, [0, 1, 2]); gates[1].resolve(); gates[2].resolve();
   const result = await pending;
   assert.equal(peak, 2); assert.equal(result.installed, true); assert.deepEqual(result.files.map(file => file.name), files.map(file => file.name));

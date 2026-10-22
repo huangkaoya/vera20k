@@ -26,10 +26,17 @@ export async function createVeraRuntime({moduleUrl, engineBytes, importModule = 
       native.start_browser(canvas);
       started = true;
     },
+    installMenuAnimation(bytes) {
+      if (!started) throw new Error('请先初始化游戏画面');
+      if (!(bytes instanceof Uint8Array)) throw new Error('菜单动画必须是已校验的二进制内容');
+      native.install_menu_animation(bytes);
+    },
     network,
     updateShell: snapshot => native.browser_shell_update(JSON.stringify(snapshot)),
     sourceRevision: () => native.source_revision(),
     diagnostics: () => native.browser_diagnostics?.(),
+    pointerCaptureAllowed: () => started && native.browser_pointer_capture_allowed?.() === true,
+    menuActive: () => started && native.browser_menu_active?.() === true,
     networkStatus: () => native.network_status(),
   });
 }

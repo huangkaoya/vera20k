@@ -63,7 +63,11 @@ pub(crate) fn handle_mouse_input(
     button: MouseButton,
     btn_state: ElementState,
 ) {
+    #[cfg(target_arch = "wasm32")]
+    let mouse_force = crate::app::ios_controls::begin_mouse_input(state, button);
     handle_mouse_input_inner(state, button, btn_state);
+    #[cfg(target_arch = "wasm32")]
+    crate::app::ios_controls::end_mouse_input(state, button, btn_state, mouse_force);
     super::commands::reconcile_paid_super_weapon_cursor(state);
 }
 
@@ -2043,12 +2047,12 @@ pub(crate) fn is_ctrl_held(state: &AppState) -> bool {
 }
 
 fn touch_order_modifiers(state: &AppState) -> (bool, bool) {
-    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
     {
         let controls = &state.match_state.input.ios_controls;
         controls.order_modifiers()
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test)))]
     {
         let _ = state;
         (false, false)

@@ -264,9 +264,15 @@ impl App {
                         &raw_session,
                     ) {
                     Ok(resolved_session) => {
+                        // A web Start action hands the canvas straight to its
+                        // native loading painter. A teardown slide would leave
+                        // the old menu visible before that first loading frame.
+                        #[cfg(target_arch = "wasm32")]
+                        Self::commit_skirmish_start(state, resolved_session);
                         // 0x006ACEE0 packs the session and writes
                         // result 0x617; the runner (0x006AE2C0) then
                         // slides the dialog out before the launch.
+                        #[cfg(not(target_arch = "wasm32"))]
                         Self::leave_shell_dialog(
                             state,
                             crate::app::frontend::shell_transition::ShellExitThen::SkirmishStart(

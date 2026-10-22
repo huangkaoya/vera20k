@@ -53,7 +53,7 @@ pub(super) fn render(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
 ) {
-    if !super::ios_controls::enabled(state) {
+    if !super::ios_controls::hud_enabled(state) {
         return;
     }
     let layout = super::ios_controls::layout(state);
@@ -63,8 +63,27 @@ pub(super) fn render(
         state.renderer.gpu.config.width as f32,
         state.renderer.gpu.config.height as f32,
     ];
-    let sprites = prepare(&layout, size, &controls.touch, controls.save_failed, theme);
+    let sprites = prepare(&layout, size, controls, controls.save_failed, theme);
     let tags = super::ios_unit_tags::build(state);
+    // The bar is composed after the zoomed match. Reuse the existing cursor
+    // instances above this final layer so desktop clicks retain a visible
+    // pointer even while Pointer Lock hides the operating-system cursor.
+    let mut cursor = if super::ios_controls::mouse_hud_covers_pointer(state) {
+        super::presentation::ui_overlays::build_software_cursor_instances(state)
+    } else {
+        Vec::new()
+    };
+    for instance in &mut cursor {
+        let source = (
+            instance.position[0] - state.match_state.input.camera_x,
+            instance.position[1] - state.match_state.input.camera_y,
+        );
+        let zoom = state.tactical_zoom();
+        let position = zoom.map_or(source, |zoom| zoom.source_to_window(source.0, source.1));
+        instance.position = [position.0, position.1];
+        let scale = zoom.map_or(1.0, |zoom| zoom.scale());
+        instance.size = [instance.size[0] * scale, instance.size[1] * scale];
+    }
     let renderer = &mut state.renderer;
     let faction = renderer.ios_sidebar_art.get_or_insert_with(|| {
         super::ios_sidebar_art::IosSidebarArt::new(&renderer.gpu, &renderer.batch_renderer)
@@ -92,6 +111,7 @@ pub(super) fn render(
         ("ios_touch_strip", &sprites.strip),
         ("ios_touch_art", &sprites.art),
         ("ios_touch_foreground", &sprites.foreground),
+        ("ios_hud_cursor", &cursor),
     ] {
         renderer.instance_pool.upload(&renderer.gpu, key, instances);
     }
@@ -134,6 +154,27 @@ pub(super) fn render(
             );
         }
     }
+    drop(pass);
+    if let Some(texture) = super::presentation::ui_overlays::current_software_cursor_texture(state)
+        && let Some((buffer, count)) = state.renderer.instance_pool.get("ios_hud_cursor")
+        && count > 0
+    {
+        let renderer = &state.renderer;
+        let art = renderer.ios_hud.as_ref().expect("HUD art was initialized");
+        let mut pass = super::presentation::sidebar_render::begin_main_load_pass(
+            encoder,
+            view,
+            &renderer.depth_view,
+        );
+        renderer.batch_renderer.draw_passthrough_range_bound(
+            &mut pass,
+            texture,
+            buffer,
+            &art.camera,
+            0,
+            count,
+        );
+    }
 }
 
 #[derive(Default)]
@@ -147,11 +188,12 @@ struct Sprites {
 fn prepare(
     layout: &LandscapeLayout,
     size: [f32; 2],
-    touch: &super::ios_battle_touch::BattleTouch,
+    controls: &super::ios_controls::IosControls,
     save_failed: bool,
     theme: crate::ui::sidebar::SidebarTheme,
 ) -> Sprites {
     let mut result = Sprites::default();
+    let touch = &controls.touch;
     let scale = layout.touch.scale_factor;
     if let Some(panel) = layout.editor_panel {
         result.background.push(glyph(
@@ -239,7 +281,7 @@ fn prepare(
         ));
     }
     for button in &layout.buttons {
-        let pressed = touch.is_pressed(button.command);
+        let pressed = touch.is_pressed(button.command) || controls.mouse_pressed(button.command);
         let selected = button.selected || pressed;
         let color = match button.icon {
             Shortcut::Save if save_failed => [1.0, 0.25, 0.18],

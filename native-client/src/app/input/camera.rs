@@ -1204,6 +1204,10 @@ fn keyboard_scroll_distance(state: &AppState) -> f32 {
 /// Main_Tick's keyboard requests run after logic (0x55DD42..0x55DD96), and
 /// remain pending until the next Tactical__AI commit with that frame's mouse.
 pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
+    #[cfg(target_arch = "wasm32")]
+    if crate::app::ios_controls::mouse_hud_captures_pointer(state) {
+        return;
+    }
     if state
         .match_state
         .sim_runtime
@@ -1260,7 +1264,11 @@ pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
 pub(crate) fn poll_mouse_scroll(state: &mut AppState) -> (f32, f32) {
     // A touch cursor stays at its last position after lifting. It must never
     // keep mouse edge/coast scrolling alive behind the joystick/pan owner.
-    if cfg!(any(target_os = "ios", target_os = "android")) {
+    if cfg!(any(target_os = "ios", target_os = "android")) || state.touch_input_mode() {
+        return (0.0, 0.0);
+    }
+    #[cfg(target_arch = "wasm32")]
+    if crate::app::ios_controls::mouse_hud_captures_pointer(state) {
         return (0.0, 0.0);
     }
     if state
@@ -1327,8 +1335,11 @@ pub(crate) fn poll_mouse_scroll(state: &mut AppState) -> (f32, f32) {
     right_drag
 }
 
-#[cfg(any(target_os = "ios", target_os = "android", test))]
-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+#[cfg_attr(
+    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
+    allow(dead_code)
+)]
 pub(crate) fn request_touch_scroll(state: &mut AppState, world_delta: (f32, f32)) {
     if state
         .match_state

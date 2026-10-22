@@ -5,7 +5,7 @@
   "baselineModes": {},
   "patch": {
     "path": "patches/native-client.patch",
-    "sha256": "f2def12046dacde6480c693d92e1cd9451d4d8efb9879dc266c65a830a0b93b3"
+    "sha256": "7bbc9f690ed9124f5c9305db06d241a366be1f77778503483f677a88ac643743"
   },
   "files": {
     "Cargo.lock": {
@@ -37,7 +37,7 @@
       "mode": "100644"
     },
     "src/app/browser.rs": {
-      "sha256": "149b40bf7c2542088accb9e35f2ab1bd1afcc9b652c0af5f3ef4ccf557b92e1b",
+      "sha256": "2c43cd470051a7bf26f6c7d26e1e14af58e8dc92a992ebc9bbfb25668671d4ce",
       "mode": "100644"
     },
     "src/app/browser/network_launch.rs": {
@@ -105,7 +105,7 @@
       "mode": "100644"
     },
     "src/app/frame.rs": {
-      "sha256": "512ed06784a2b708c4c60bd23c0cc98411a164179d284c727abc37ba81d2a4c8",
+      "sha256": "3c81cfada196568915cc3cf792d34be95da1afd7b654eab561191f1d76cfb8c5",
       "mode": "100644"
     },
     "src/app/frontend/campaign_score_shell_render.rs": {
@@ -117,7 +117,7 @@
       "mode": "100644"
     },
     "src/app/frontend/fullscreen_movie.rs": {
-      "sha256": "94ce20c41a22e715c2a9d653b1632bd5a53f63044b246019a68e8beef78f0d6f",
+      "sha256": "1bb1684ba50aff9f1a320eb775f834364cd3ec6dc88ed9ee65da1a8f67dede53",
       "mode": "100644"
     },
     "src/app/frontend/load_saved_game_render.rs": {
@@ -154,6 +154,14 @@
     },
     "src/app/frontend/skirmish_session.rs": {
       "sha256": "c1ce2869679366a24195b4c924b456f03bf73adb170b90e31bce6b7b8f88d227",
+      "mode": "100644"
+    },
+    "src/app/frontend/skirmish_shell_render/in_game_options.rs": {
+      "sha256": "ec60de68f3da093ae9b3aae230f0d2aab248e0ecc62951d42a0e9a8ec4d9e717",
+      "mode": "100644"
+    },
+    "src/app/frontend/skirmish_shell_render/in_game_shell.rs": {
+      "sha256": "a59ae66404f47e6831e968fa80eee0aefe1e43640dcfbd9fc8b57df33c4ca3f2",
       "mode": "100644"
     },
     "src/app/frontend/skirmish_shell_render/keyboard.rs": {
@@ -209,7 +217,7 @@
       "mode": "100644"
     },
     "src/app/handler.rs": {
-      "sha256": "c3bed0e01056b4d473820756e22f11890d0cf6cdf6b10274fe5e91a7349a6770",
+      "sha256": "62edcb8d51abcaa9c3f21fe7c7a6a305dd00720739c48aac3230d7d3f0caa9b6",
       "mode": "100644"
     },
     "src/app/in_game.rs": {
@@ -217,15 +225,23 @@
       "mode": "100644"
     },
     "src/app/initialize.rs": {
-      "sha256": "2bccd18959aa230b44e907e80630edf0cb2966a846c68015ed8e1d8fe1001ac7",
+      "sha256": "262c381b1a451ab5a5015cdf88076e71b8bb4d6a2354aab6ec69b48115faeb8d",
+      "mode": "100644"
+    },
+    "src/app/input/browser_cursor.rs": {
+      "sha256": "83be15c0da8a226fd9edbc217911415805b7f555f25f786d3c979952aa4d10a4",
       "mode": "100644"
     },
     "src/app/input/camera.rs": {
-      "sha256": "e67658fb80c0b81d4cdc9f3c2ea1ffab306221dbffba0997b5e01485a851a621",
+      "sha256": "f0a008f9126b704ee773ac2771ec3a80f429a7fc91c39d2210a77eb951fd29fd",
       "mode": "100644"
     },
     "src/app/input/campaign_input.rs": {
       "sha256": "5e2d28272ad2c45bef06fb379fb4d452fc0753a38fb3958e6b3092d48bc006e4",
+      "mode": "100644"
+    },
+    "src/app/input/command_bar_input.rs": {
+      "sha256": "ab7638978bed8ce159f150cf4405674022e6969c5fffb6a5f632af9f48d20c82",
       "mode": "100644"
     },
     "src/app/input/commands.rs": {
@@ -237,7 +253,7 @@
       "mode": "100644"
     },
     "src/app/input/cursor.rs": {
-      "sha256": "3e0e3381b3dc7b5c2aed92d01d6f4e9af908cd7dcba01a9ccd2dedf7e4ac3f3d",
+      "sha256": "2dea6ad1f0c2a0c99431785ee7d0d75d645898d16776a129b6b907480a406df4",
       "mode": "100644"
     },
     "src/app/input/diplomacy.rs": {
@@ -245,7 +261,11 @@
       "mode": "100644"
     },
     "src/app/input/dispatch.rs": {
-      "sha256": "77f084757ce2f11f40f3306d87827e83488af9432a3b6d31ed9846022b71a999",
+      "sha256": "814ee12b67799c1e12ddb65f67cf8af89af7b2ce3a522027d06d0bf40b6f7bcb",
+      "mode": "100644"
+    },
+    "src/app/input/in_game_options.rs": {
+      "sha256": "7ef3125060e5fe84ebdf8b2c2f0b14e099df3aa1ea05e02d0c23c04ae80c86df",
       "mode": "100644"
     },
     "src/app/input/keyboard.rs": {
@@ -264,6 +284,10 @@
       "sha256": "e4d3ae373c9be6de9b0a4a9dc2e3ec7d850d5c9916bcb35de01cd407864b90bb",
       "mode": "100644"
     },
+    "src/app/input/pointer_resolution_tests.rs": {
+      "sha256": "f46605b402dda9c331712045897cab64e173174231dc80288004ed792948c4a9",
+      "mode": "100644"
+    },
     "src/app/input/saved_local_view_tests.rs": {
       "sha256": "5f6422571bfc20af79fb2313fe5eac4f961313e10c618638fa31fa370c600429",
       "mode": "100644"
@@ -277,7 +301,7 @@
       "mode": "100644"
     },
     "src/app/input/state.rs": {
-      "sha256": "1ef0ed5ef02a8e778e882fb97938080eb382d003d47bee910be81d798e4b79c7",
+      "sha256": "41b667884cf9d3ba1dad841e5d5e6c690b514a3681a498980b7a6874363f41a1",
       "mode": "100644"
     },
     "src/app/ios_battle_touch.rs": {
@@ -285,7 +309,15 @@
       "mode": "100644"
     },
     "src/app/ios_controls.rs": {
-      "sha256": "b8dc820bb22f2b6b1d6eb0e8f63351fff03dbf65cb172da625c36409ac956605",
+      "sha256": "0db30116e41dc9f9ac3ebfc12440a0d9e25e622d66c42e3f404f07d1e209f670",
+      "mode": "100644"
+    },
+    "src/app/ios_hud_render.rs": {
+      "sha256": "6ee34d986038fff58299dcb4913e17f2cceae4e9e44e30db43324e4a6610a325",
+      "mode": "100644"
+    },
+    "src/app/ios_mouse_hud.rs": {
+      "sha256": "a5809b6111d52c96027e435c52cf94b635cb8520560b066fbe4e2a0e9f8131f6",
       "mode": "100644"
     },
     "src/app/ios_runtime.rs": {
@@ -293,7 +325,11 @@
       "mode": "100644"
     },
     "src/app/ios_shortcuts.rs": {
-      "sha256": "3da51a452d2159e6ea29866393d1972c52ea620c404a3c8acd61fadca87dead2",
+      "sha256": "6f4bfdb152dab4985b098a1c6e5327d2aafb5c00269f5360c665a555b8aff9be",
+      "mode": "100644"
+    },
+    "src/app/ios_unit_tags.rs": {
+      "sha256": "117aac6072e2c2321fc5fd54d17aad735647c2f820738ce1f5c07fc9ba3f6969",
       "mode": "100644"
     },
     "src/app/loading/init.rs": {
@@ -301,7 +337,11 @@
       "mode": "100644"
     },
     "src/app/loading/pump.rs": {
-      "sha256": "71a5b6430f7d39444f14c2029fcd0e51a2754dfcee3476d043289d7e2b88ae3a",
+      "sha256": "e0c015691a13a5290e5946100aec897a45880d58745f27a8d337e71c0c037aa8",
+      "mode": "100644"
+    },
+    "src/app/loading/pump/browser_paint.rs": {
+      "sha256": "c26bc480017b6221ddc023d0e582630407fefc4393b74bbb7d895176b855ab58",
       "mode": "100644"
     },
     "src/app/match_bootstrap.rs": {
@@ -325,7 +365,7 @@
       "mode": "100644"
     },
     "src/app/mod.rs": {
-      "sha256": "8770ecd6f66557032ba2a0fd810cc87e9c58fc4ea02f9160732a504d48bd487a",
+      "sha256": "3d088bea4d7ba2480eb9b83c897c69139742a5a9cdabb65111a08f3b653b6681",
       "mode": "100644"
     },
     "src/app/movie_playback.rs": {
@@ -344,8 +384,12 @@
       "sha256": "e854c50d6d8ef9bd70487762e8f211a65a45aa03cb69d13c88bee6bf1d067d18",
       "mode": "100644"
     },
+    "src/app/persistence/options.rs": {
+      "sha256": "69552b9f207ce718a26937ebcabaebabcba878e5b29c9f73e579b77d2fce6094",
+      "mode": "100644"
+    },
     "src/app/persistence/options_profile.rs": {
-      "sha256": "526001c5a914e949cf8d98a5f1ac689c5c193756dc7d43ed09a651349fa2f72c",
+      "sha256": "3678de4c966072d6d4f6e8f629db25a59b791ef1eb72f86f0ced2ae2157950c1",
       "mode": "100644"
     },
     "src/app/persistence/tests/save_browser_tests.rs": {
@@ -380,6 +424,10 @@
       "sha256": "7bc4502e777683801205a698aae799859e5fe84266c49cfd9e8794c607f3fbc2",
       "mode": "100644"
     },
+    "src/app/presentation/render/draw_passes.rs": {
+      "sha256": "f3b14a5d6f674f2e3bde955b4c738ad7e881de19a8a0d8507487c72269fdf382",
+      "mode": "100644"
+    },
     "src/app/presentation/render/mod.rs": {
       "sha256": "ba37492a428f267b1a497d47c3ea49bd2928f7072e65dc6c3a589e9edb6842cb",
       "mode": "100644"
@@ -390,6 +438,14 @@
     },
     "src/app/presentation/render/terrain_ground_gpu_tests.rs": {
       "sha256": "91b776198b8a9cb1285dbdc5b06b2ae7cae99f922c804bec51b2baf48531d3cf",
+      "mode": "100644"
+    },
+    "src/app/presentation/sidebar_build.rs": {
+      "sha256": "35b8ea7a94775f6988305bdd52e856304e48414878b5f051c9e0be9e5811ab62",
+      "mode": "100644"
+    },
+    "src/app/presentation/sidebar_render.rs": {
+      "sha256": "18c1d8feb4e733060e58541d2f9917d38eb8ca4de6ec9a292c28d83a7ae6897f",
       "mode": "100644"
     },
     "src/app/presentation/sidebar_surface.rs": {
@@ -406,6 +462,10 @@
     },
     "src/app/random_map_lifecycle_tests.rs": {
       "sha256": "481f92a5b8407e1c9e8d03e38150ef2adb7d01b329788c06bdae9ce49211fe48",
+      "mode": "100644"
+    },
+    "src/app/renderer_state.rs": {
+      "sha256": "e7573d7e0c2c59ad6e29af3f8d5dc5009ca117248bfe777da055b2bfdc578f89",
       "mode": "100644"
     },
     "src/app/shell_campaign.rs": {
@@ -425,7 +485,7 @@
       "mode": "100644"
     },
     "src/app/shell_movies_credits.rs": {
-      "sha256": "3f6fea7a03dc1d23e54e00dba5ecb04f7f805d7f772d873809958d6a312dce0e",
+      "sha256": "5c96227552921016206d27e52451cfa4d7b6ab41fec5cf09e2a1ca11a49de473",
       "mode": "100644"
     },
     "src/app/shell_network_setup.rs": {
@@ -461,7 +521,7 @@
       "mode": "100644"
     },
     "src/app/shell_skirmish.rs": {
-      "sha256": "024556e59c4bb84264e6efad0da043be64c03b588ae4bdcb93e045cda85695f5",
+      "sha256": "d57d0dac58b7eeecf17a5c71565eaf7347bd6810001bcd89901751b15535307a",
       "mode": "100644"
     },
     "src/app/shell_wol.rs": {
@@ -508,8 +568,12 @@
       "sha256": "bc045245b554ee69881cc629af24241da5ef742b419dae5fe242590bdf542729",
       "mode": "100644"
     },
+    "src/app/state.rs": {
+      "sha256": "98f9f362aa17cb7663db96afc061f319d49abdf73eda927203ae21d7a80434e8",
+      "mode": "100644"
+    },
     "src/app/state/platform.rs": {
-      "sha256": "30a05b12922f89bf32151ec3fbaae33e76ed661366f9dbaa4a3f96f283e308ca",
+      "sha256": "4b0c241adc9085092c373357d3333f9b3e3d54a9d2715195d3c7d6a8f0e3be7a",
       "mode": "100644"
     },
     "src/app/telemetry_capture.rs": {
@@ -697,7 +761,7 @@
       "mode": "100644"
     },
     "src/render/werhd_menu_movie.rs": {
-      "sha256": "a8c11d11d9a7e1abcfba6acdb722c366de24a86a38bdb02ce971034bf8b36f4e",
+      "sha256": "1c7bd198dc1513fa27a7a7489793dbb941ab082fbd9764cb3838a51cdd50b0a6",
       "mode": "100644"
     },
     "src/render/werhd_menu_movie_browser.rs": {
@@ -768,6 +832,18 @@
       "sha256": "47448f2201a1c521a44bb998b3b0cd28b75fdef2d6663d79a41c713d7971ab41",
       "mode": "100644"
     },
+    "src/ui/shell/in_game_options.rs": {
+      "sha256": "b46daac4a545bb6850fcadfc3e920b53b6cb8e8650435bb98296ea79b5201e60",
+      "mode": "100644"
+    },
+    "src/ui/shell/in_game_options_state.rs": {
+      "sha256": "0517b1c45cf843dbb64ba457fe3536e7f98c0edaa44e77dcfe4a86a4ee6f37f7",
+      "mode": "100644"
+    },
+    "src/ui/shell/layout.rs": {
+      "sha256": "7d16cebd1b211a6130b0f212920b2d968ed525ac4e2b6d2127e548ccfee76279",
+      "mode": "100644"
+    },
     "src/ui/shell/list.rs": {
       "sha256": "a2769d7971446328655cd017606d72db3d473d792e4019dd5ccd6319aac5c954",
       "mode": "100644"
@@ -832,6 +908,10 @@
       "sha256": "299c5ca5a585a05614e24a6d5a448376f0e372e4d8ff49cfab41b411046320e7",
       "mode": "100644"
     },
+    "src/util/browser_menu_media.rs": {
+      "sha256": "f17e3aa6fdd6f68b8a474f0c8546a63597d79c5ede0f147c43d5ab1fc3646b11",
+      "mode": "100644"
+    },
     "src/util/case_insensitive_path.rs": {
       "sha256": "2edfddf9e9d7cd3c6b2a628793f8c8d490dc37615a2d1c0ba78779dc8ce7a8c7",
       "mode": "100644"
@@ -849,7 +929,7 @@
       "mode": "100644"
     },
     "src/util/mod.rs": {
-      "sha256": "b65a85c8d57d48261319e6c5a1aa3d25cd0d923014a0e3ea0446882c8e7008fa",
+      "sha256": "b7256663bd17af796304c4231ec65acd2092b1b57ac6761122986b630a003ca1",
       "mode": "100644"
     },
     "src/util/native_file_name.rs": {
@@ -857,7 +937,7 @@
       "mode": "100644"
     },
     "src/web_entry.rs": {
-      "sha256": "3167fe28a7b67fb5f6c2085f15977df8cce8d48feea36aeb63d5ddbda115779d",
+      "sha256": "10f2c2605f8d4bb3ddeb2c39b4f99794108fafed63ac04e5b8c1de33810c6f00",
       "mode": "100644"
     }
   }

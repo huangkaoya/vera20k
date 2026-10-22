@@ -13,7 +13,7 @@ use crate::ui::shell::in_game_options::{
     build_in_game_options_descriptor, control, control_shown, speed_value_label_key,
 };
 use crate::ui::shell::in_game_options_state::{
-    InGameOptionsState, plain_trackbar_thumb_left, speed_slider_pos,
+    InGameOptionsState, mouse_sensitivity_thumb_left, plain_trackbar_thumb_left, speed_slider_pos,
 };
 use crate::ui::shell::layout::{InGameOptionsAnchor, layout_pass_in_game_options};
 
@@ -39,9 +39,16 @@ pub(crate) fn build_in_game_options_instances(
         let rect = l.rect;
         match c.kind {
             ControlKind::Trackbar => {
-                let pos = match c.id {
-                    control::GAME_SPEED => speed_slider_pos(state.game_speed),
-                    control::SCROLL_RATE => speed_slider_pos(state.scroll_rate),
+                let left = match c.id {
+                    control::GAME_SPEED => {
+                        plain_trackbar_thumb_left(speed_slider_pos(state.game_speed), rect)
+                    }
+                    control::SCROLL_RATE => {
+                        plain_trackbar_thumb_left(speed_slider_pos(state.scroll_rate), rect)
+                    }
+                    control::MOUSE_SENSITIVITY => {
+                        mouse_sensitivity_thumb_left(state.mouse_sensitivity_percent, rect)
+                    }
                     _ => continue,
                 };
                 paint_control(
@@ -49,7 +56,7 @@ pub(crate) fn build_in_game_options_instances(
                     chrome,
                     ControlPaint::Trackbar {
                         rect,
-                        thumb_left: plain_trackbar_thumb_left(pos, rect),
+                        thumb_left: left,
                         plaque: false,
                     },
                     ShellScale::RETAIL,
@@ -128,6 +135,17 @@ fn in_game_options_static_draws(
     state: &InGameOptionsState,
 ) -> Vec<OptionsStaticDraw> {
     let desc = build_in_game_options_descriptor();
+    in_game_options_static_draws_with_descriptor(&desc, csf, screen_w, screen_h, anchor, state)
+}
+
+fn in_game_options_static_draws_with_descriptor(
+    desc: &crate::ui::shell::descriptor::DialogDescriptor,
+    csf: Option<&CsfFile>,
+    screen_w: i32,
+    screen_h: i32,
+    anchor: InGameOptionsAnchor,
+    state: &InGameOptionsState,
+) -> Vec<OptionsStaticDraw> {
     let laid = layout_pass_in_game_options(&desc, screen_w, screen_h, anchor);
     let mut out = Vec::new();
     for (c, l) in desc.controls.iter().zip(laid.iter()) {
@@ -141,17 +159,23 @@ fn in_game_options_static_draws(
         }
         // The two value labels (0x671/0x672) show their slider-position CSF key
         // from the open; every other static keeps its template caption key.
-        let key = match c.id {
-            control::GAME_SPEED_VALUE => speed_value_label_key(speed_slider_pos(state.game_speed)),
-            control::SCROLL_RATE_VALUE => {
-                speed_value_label_key(speed_slider_pos(state.scroll_rate))
-            }
-            _ => match c.csf_key {
-                Some(key) => key,
-                None => continue,
-            },
+        let text = if c.id == control::MOUSE_SENSITIVITY_VALUE {
+            format!("{}%", state.mouse_sensitivity_percent)
+        } else {
+            let key = match c.id {
+                control::GAME_SPEED_VALUE => {
+                    speed_value_label_key(speed_slider_pos(state.game_speed))
+                }
+                control::SCROLL_RATE_VALUE => {
+                    speed_value_label_key(speed_slider_pos(state.scroll_rate))
+                }
+                _ => match c.csf_key {
+                    Some(key) => key,
+                    None => continue,
+                },
+            };
+            resolve_static_text(csf, key)
         };
-        let text = resolve_static_text(csf, key);
         if text.is_empty() {
             continue;
         }
@@ -193,6 +217,11 @@ fn in_game_options_static_draws(
 /// label stays visible as retail's `MISSING:'<key>'`; English literals exist
 /// only for assetless operation where no CSF table is available.
 fn resolve_static_text(csf: Option<&CsfFile>, key: &str) -> String {
+    match key {
+        "VERA:MouseSensitivity" => return "鼠标灵敏度".to_string(),
+        "VERA:MouseSensitivityReset" => return "恢复100%".to_string(),
+        _ => {}
+    }
     match csf {
         Some(table) => table.text(key).into_owned(),
         None => options_static_fallback(key).to_string(),
@@ -229,7 +258,9 @@ fn options_static_fallback(key: &str) -> &'static str {
 fn options_static_align(id: u16) -> ShellAlign {
     match id {
         control::TITLE => ShellAlign::H_CENTER,
-        control::GAME_SPEED_CAPTION | control::SCROLL_RATE_CAPTION => ShellAlign::H_RIGHT,
+        control::GAME_SPEED_CAPTION
+        | control::SCROLL_RATE_CAPTION
+        | control::MOUSE_SENSITIVITY_CAPTION => ShellAlign::H_RIGHT,
         _ => ShellAlign::NONE,
     }
 }
@@ -245,6 +276,41 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         CsfFile::from_bytes(&bytes).expect("valid initialized CSF header")
+    }
+
+    #[test]
+    fn web_sensitivity_captions_show_percent_and_reset_on_the_native_page() {
+        let desc =
+            crate::ui::shell::in_game_options::build_in_game_options_descriptor_for_web(true);
+        let csf = initialized_empty_csf();
+        let state = InGameOptionsState {
+            mouse_sensitivity_percent: 175,
+            ..Default::default()
+        };
+        let draws = in_game_options_static_draws_with_descriptor(
+            &desc,
+            Some(&csf),
+            800,
+            600,
+            test_anchor(),
+            &state,
+        );
+        let text = |id| {
+            draws
+                .iter()
+                .find(|draw| draw.id == id)
+                .unwrap()
+                .text
+                .as_str()
+        };
+        assert_eq!(text(control::MOUSE_SENSITIVITY_CAPTION), "鼠标灵敏度");
+        assert_eq!(text(control::MOUSE_SENSITIVITY_VALUE), "175%");
+        assert_eq!(text(control::MOUSE_SENSITIVITY_RESET), "恢复100%");
+        assert!(
+            !draws
+                .iter()
+                .any(|draw| draw.id == control::VISUAL_DETAILS_CAPTION)
+        );
     }
 
     fn entry(w: f32, h: f32) -> SkirmishShellChromeEntry {

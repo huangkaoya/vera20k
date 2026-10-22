@@ -11,7 +11,7 @@ use crate::sim::movement::ground_pose::object_get_coords;
 use crate::util::lepton::absolute_leptons_to_screen;
 
 pub(super) fn build(state: &AppState) -> Vec<SpriteInstance> {
-    if !state.match_state.input.ios_controls.show_tags || !super::ios_controls::enabled(state) {
+    if !state.match_state.input.ios_controls.show_tags || !super::ios_controls::hud_enabled(state) {
         return Vec::new();
     }
     let (Some(runtime), Some(rules), Some(local_owner)) = (

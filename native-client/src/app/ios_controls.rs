@@ -3,7 +3,7 @@
 
 use std::path::Path;
 use web_time::Instant;
-use winit::event::{ElementState, MouseButton, Touch};
+use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
 
 use super::input::{
     camera, dispatch,
@@ -14,6 +14,9 @@ use super::ios_shortcuts::{EditorOutcome, LandscapeLayout, Preferences, Shortcut
 use super::{App, AppState, GameScreen};
 
 const PREFERENCES_FILE: &str = "touch-shortcuts.json";
+
+#[path = "ios_mouse_hud.rs"]
+mod mouse_hud;
 
 #[derive(Default)]
 pub(crate) struct IosControls {
@@ -28,10 +31,16 @@ pub(crate) struct IosControls {
     native_ui_pointer: Option<MouseButton>,
     pub(super) show_tags: bool,
     pub(super) save_failed: bool,
+    mouse_hud: mouse_hud::MouseHudPointer,
+    pub(super) mouse_force_armed: bool,
     last_service: Option<Instant>,
 }
 
 impl IosControls {
+    pub(super) fn mouse_pressed(&self, command: Shortcut) -> bool {
+        self.mouse_hud.is_pressed(command)
+    }
+
     pub(super) fn order_modifiers(&self) -> (bool, bool) {
         // Target-mode fingers only modify battlefield orders. In particular,
         // AttackMove's virtual Shift must not batch-produce sidebar cameos.
@@ -80,7 +89,16 @@ pub(crate) fn initialize(state: &mut AppState) {
 }
 
 pub(crate) fn enabled(state: &AppState) -> bool {
-    state.frontend.screen == GameScreen::InGame
+    #[cfg(target_arch = "wasm32")]
+    if !state.touch_input_mode() {
+        return false;
+    }
+    hud_enabled(state)
+}
+
+pub(crate) fn hud_enabled(state: &AppState) -> bool {
+    (state.branded_hud_mode() || cfg!(any(target_os = "ios", target_os = "android")))
+        && state.frontend.screen == GameScreen::InGame
         && !state.match_state.paused()
         && !state.match_state.match_presentation.in_game_menu.is_open()
         && state.frontend.keyboard_dialog.is_none()
@@ -98,14 +116,189 @@ pub(crate) fn layout(state: &AppState) -> LandscapeLayout {
         zoom.source_to_window(column_left, 0.0).0
     });
     let controls = &state.match_state.input.ios_controls;
-    LandscapeLayout::new(
+    let mut layout = LandscapeLayout::for_input(
         width,
         height,
         state.platform.window.scale_factor() as f32,
         (width - window_left).max(0.0),
         &controls.prefs,
         controls.editor.as_ref(),
-    )
+        state.touch_input_mode() || cfg!(any(target_os = "ios", target_os = "android")),
+    );
+    if !state.touch_input_mode() {
+        for button in &mut layout.buttons {
+            button.selected |= match button.command {
+                Shortcut::ForceAttack => controls.mouse_force_armed,
+                Shortcut::AttackMove => {
+                    state.match_state.input.queued_order_mode == super::types::OrderMode::AttackMove
+                }
+                _ => false,
+            };
+        }
+    }
+    layout
+}
+
+/// The map mouse is unchanged. Only presses belonging to this bar/editor are
+/// captured, and releases outside those buttons cannot leak a world order.
+pub(crate) fn handle_mouse_event(state: &mut AppState, event: &WindowEvent) -> bool {
+    if !state.branded_hud_mode() || state.touch_input_mode() || !hud_enabled(state) {
+        return false;
+    }
+    let layout = layout(state);
+    let point = match event {
+        WindowEvent::CursorMoved { position, .. } => [position.x as f32, position.y as f32],
+        _ => {
+            let (x, y) = state.window_cursor_position();
+            [x, y]
+        }
+    };
+    let editor = state.match_state.input.ios_controls.editor.is_some();
+    let phase = match event {
+        WindowEvent::CursorMoved { .. } => Some(TouchPhase::Moved),
+        WindowEvent::MouseInput {
+            button: MouseButton::Left,
+            state,
+            ..
+        } => Some(if state.is_pressed() {
+            TouchPhase::Started
+        } else {
+            TouchPhase::Ended
+        }),
+        WindowEvent::KeyboardInput { event, .. } if editor => {
+            // Keep the ordinary release owner live: it clears keyboard-scroll
+            // keys (including keypad aliases) and releases an admitted planning
+            // gesture. Consuming those edges here would leave input latched.
+            if !event.state.is_pressed() {
+                return false;
+            }
+            if event.state.is_pressed()
+                && event.logical_key
+                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+            {
+                state.match_state.input.ios_controls.editor = None;
+                reset(state);
+                state.platform.window.request_redraw();
+            }
+            return true;
+        }
+        WindowEvent::MouseInput {
+            button: MouseButton::Right,
+            state: edge,
+            ..
+        } if editor => {
+            if edge.is_pressed() {
+                state.match_state.input.ios_controls.editor = None;
+                reset(state);
+                state.platform.window.request_redraw();
+            }
+            return true;
+        }
+        WindowEvent::MouseInput { .. } => {
+            if mouse_hud::covers(&layout, point) {
+                App::release_in_game_pointer_state(state);
+                return true;
+            }
+            return false;
+        }
+        WindowEvent::MouseWheel { .. } => {
+            return mouse_hud::covers(&layout, point);
+        }
+        _ => None,
+    };
+    let Some(phase) = phase else {
+        return false;
+    };
+    let result = state.match_state.input.ios_controls.mouse_hud.handle(
+        phase,
+        point,
+        Instant::now(),
+        &layout,
+    );
+    if result.consumed && matches!(phase, TouchPhase::Started | TouchPhase::Ended) {
+        App::release_in_game_pointer_state(state);
+    }
+    if let Some((command, held_long)) = result.shortcut {
+        match command {
+            Shortcut::ForceAttack => {
+                state.match_state.input.ios_controls.mouse_force_armed ^= true;
+            }
+            Shortcut::AttackMove => dispatch::dispatch_command_bar(state, 5, false),
+            _ => shortcut(state, command, held_long),
+        }
+    }
+    if result.consumed || editor {
+        if phase == TouchPhase::Moved {
+            state.set_cursor_from_window(point[0], point[1]);
+        }
+        state.platform.window.request_redraw();
+        return true;
+    }
+    false
+}
+
+pub(crate) fn mouse_hud_covers_pointer(state: &AppState) -> bool {
+    if !state.branded_hud_mode() || state.touch_input_mode() || !hud_enabled(state) {
+        return false;
+    }
+    let point = state.window_cursor_position();
+    mouse_hud::covers(&layout(state), [point.0, point.1])
+}
+
+/// Hover is presentation only. All outer edges, including the footer's bottom
+/// edge, keep scrolling until a real bar press or the editor owns the gesture.
+pub(crate) fn mouse_hud_captures_pointer(state: &AppState) -> bool {
+    state.branded_hud_mode()
+        && !state.touch_input_mode()
+        && hud_enabled(state)
+        && (state.match_state.input.ios_controls.editor.is_some()
+            || state.match_state.input.ios_controls.mouse_hud.is_active())
+}
+
+/// Scope the existing Ctrl-click semantics to the next desktop world click.
+/// Neither real modifier keys nor sidebar production state are altered.
+pub(crate) fn begin_mouse_input(
+    state: &mut AppState,
+    button: MouseButton,
+) -> Option<(bool, bool, bool)> {
+    if !state.branded_hud_mode()
+        || state.touch_input_mode()
+        || button != MouseButton::Left
+        || !state.match_state.input.ios_controls.mouse_force_armed
+    {
+        return None;
+    }
+    let point = state.window_cursor_position();
+    if !layout(state).touch.world.contains([point.0, point.1]) {
+        return None;
+    }
+    let controls = &mut state.match_state.input.ios_controls;
+    let previous = (
+        controls.force_click,
+        controls.attack_move_click,
+        controls.click_in_progress,
+    );
+    controls.force_click = true;
+    controls.attack_move_click = false;
+    controls.click_in_progress = true;
+    Some(previous)
+}
+
+pub(crate) fn end_mouse_input(
+    state: &mut AppState,
+    button: MouseButton,
+    edge: ElementState,
+    previous: Option<(bool, bool, bool)>,
+) {
+    let controls = &mut state.match_state.input.ios_controls;
+    if let Some((force, attack, clicking)) = previous {
+        controls.force_click = force;
+        controls.attack_move_click = attack;
+        controls.click_in_progress = clicking;
+    }
+    if !edge.is_pressed() && matches!(button, MouseButton::Left | MouseButton::Right) {
+        controls.mouse_force_armed = false;
+    }
 }
 
 /// A lost gesture is aborted, never released onto the current world target.
@@ -113,6 +306,8 @@ pub(crate) fn reset(state: &mut AppState) {
     let controls = &mut state.match_state.input.ios_controls;
     let captured = controls.touch.is_interacting();
     controls.touch.reset();
+    controls.mouse_hud.reset();
+    controls.mouse_force_armed = false;
     controls.force_click = false;
     controls.attack_move_click = false;
     controls.click_in_progress = false;
@@ -222,8 +417,11 @@ fn pan_delta_to_world(
 /// WERHD's full-stick rate is 30 canvas pixels per 60 Hz frame. Wall-clock
 /// integration here keeps that speed independent of display refresh rate.
 pub(crate) fn service(state: &mut AppState) {
-    if !enabled(state) {
+    if !hud_enabled(state) {
         reset(state);
+        return;
+    }
+    if !state.touch_input_mode() && !cfg!(any(target_os = "ios", target_os = "android")) {
         return;
     }
     let controls = &mut state.match_state.input.ios_controls;
@@ -246,6 +444,8 @@ fn shortcut(state: &mut AppState, command: Shortcut, held_long: bool) {
         let controls = &mut state.match_state.input.ios_controls;
         controls.editor = Some(ShortcutEditor::new(&controls.prefs));
         controls.save_failed = false;
+        state.match_state.input.clear_command_latches();
+        App::release_in_game_pointer_state(state);
         reset(state);
         return;
     }
@@ -317,6 +517,7 @@ fn shortcut(state: &mut AppState, command: Shortcut, held_long: bool) {
             return;
         }
         Shortcut::Cancel => {
+            state.match_state.input.ios_controls.mouse_force_armed = false;
             dispatch::right_click_cancel_ladder(state);
             return;
         }

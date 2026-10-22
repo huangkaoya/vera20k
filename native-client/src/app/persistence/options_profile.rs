@@ -127,6 +127,8 @@ pub(crate) struct RetailOptionsProfile {
     /// default, so new profiles draw the original tick-stepped motion; it never
     /// changes the simulation rate or saves.
     pub(crate) render_interpolation: bool,
+    /// `[VERA] MouseSensitivityPercent=`: Web Pointer Lock delta gain only.
+    pub(crate) mouse_sensitivity_percent: u32,
     /// `[VERA] ShiftQueue=`: whether a Shift-click on a mobile strip queues
     /// [`Self::shift_queue_count`] builds: the Options page's Shift-Click
     /// Batch Queue. Off by default, so Shift + left click queues one copy as
@@ -199,6 +201,8 @@ impl Default for RetailOptionsProfile {
             sidebar: crate::ui::main_menu_dialogs::options::SidebarSize::Normal,
             yr_original_style: false,
             render_interpolation: false,
+            mouse_sensitivity_percent:
+                crate::ui::shell::in_game_options_state::MOUSE_SENSITIVITY_DEFAULT,
             shift_queue: false,
             shift_queue_count: DEFAULT_SHIFT_QUEUE_COUNT,
             wol_test_service: false,
@@ -218,7 +222,7 @@ pub(crate) struct FormattedProfileSections {
     pub(crate) audio: [(&'static str, String); 7],
     pub(crate) network: [(&'static str, String); 4],
     /// VERA's own section, written after the native ones.
-    pub(crate) vera: [(&'static str, String); 9],
+    pub(crate) vera: [(&'static str, String); 10],
 }
 
 impl RetailOptionsLoad {
@@ -417,6 +421,13 @@ impl RetailOptionsProfile {
             self.yr_original_style = vera.read_bool("YROriginalStyle", self.yr_original_style);
             self.render_interpolation =
                 vera.read_bool("RenderInterpolation", self.render_interpolation);
+            self.mouse_sensitivity_percent =
+                crate::ui::shell::in_game_options_state::normalized_mouse_sensitivity(
+                    vera.read_int(
+                        "MouseSensitivityPercent",
+                        self.mouse_sensitivity_percent as i32,
+                    ),
+                );
             self.shift_queue = vera.read_bool("ShiftQueue", self.shift_queue);
             // Absent keeps the current value; present-but-nonnumeric answers 0,
             // which the range lifts to 1 rather than a click that queues nothing.
@@ -518,6 +529,10 @@ impl RetailOptionsProfile {
                 (
                     "RenderInterpolation",
                     format_bool(self.render_interpolation).to_string(),
+                ),
+                (
+                    "MouseSensitivityPercent",
+                    self.mouse_sensitivity_percent.to_string(),
                 ),
             ],
         }
@@ -1360,6 +1375,38 @@ mod tests {
                     .retained_profile
                     .render_interpolation,
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn web_mouse_sensitivity_round_trips_through_the_existing_profile_and_safe_bounds() {
+        for (text, expected) in [
+            ("25", 25),
+            ("100", 100),
+            ("400", 400),
+            ("103", 105),
+            ("-5", 100),
+            ("401", 100),
+            ("garbage", 100),
+        ] {
+            let input = format!(
+                "[VERA]\nMouseSensitivityPercent={text}\n[Options]\nScrollRate=5\nGameSpeed=2\n[Other]\nKeep=unchanged\n"
+            );
+            let load = load_snapshot(&RetailStartupOptions::default(), input.as_bytes());
+            let profile = load.retained_profile;
+            assert_eq!(profile.mouse_sensitivity_percent, expected, "{text}");
+            assert_eq!((profile.scroll_rate, profile.game_speed), (5, 2));
+            let output = profile.transform_ra2md(input.as_bytes());
+            assert!(String::from_utf8_lossy(&output).contains("Keep=unchanged"));
+            let reread = load_snapshot(&RetailStartupOptions::default(), &output);
+            assert_eq!(reread.retained_profile.mouse_sensitivity_percent, expected);
+            assert_eq!(
+                (
+                    reread.retained_profile.scroll_rate,
+                    reread.retained_profile.game_speed
+                ),
+                (5, 2)
             );
         }
     }

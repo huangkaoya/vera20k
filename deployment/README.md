@@ -1,7 +1,7 @@
 # Native WebGPU deployment
 
 This directory packages the complete native client for Workers, R2 and a native
-protocol v2 Durable Object. It does not depend on a running Mac or Node server.
+protocol v3 Durable Object. It does not depend on a running Mac or Node server.
 The Worker imports the same `NativeRoomCoordinator` used by the local adapter.
 
 ## Prepare and validate
@@ -48,14 +48,18 @@ The default profile contains 26 files: 602,239,457 raw bytes and 279,134,944
 download bytes, including all six theaters, skirmish maps, unit art and YR
 audio. Campaign, cinematics, music and branding animation are optional. Campaign
 depends on cinematics. The current branding animation is the approved
-4,110,830-byte compressed MP4; the 73 MB PNG-frame stream is not published by
-this catalog and is not a first-start download. Theater groups currently
+4,110,830-byte compressed MP4. Once the native menu is ready, a background job
+automatically attempts this one verified download and installs it into a
+bounded presentation-only slot for the existing native movie texture. It does
+not delay game startup, reload a match, or enable campaign cinematics. The
+73 MB PNG-frame stream is not published by this catalog. Theater groups currently
 describe bundled content, not runtime hot-mountable packs.
 
 The full profile preserves the original 32 retail files plus that MP4. It is an
 alternative startup set because its language containers differ from the lean
-ones. Optional additions are cached and enabled on reload; caching them alone
-does not change simulation resources or the network identity.
+ones. Optional retail additions are cached and enabled on reload; caching them
+alone does not change simulation resources or the network identity. The small
+menu MP4 is the presentation-only exception described above.
 
 Packaging requires both `build.resourceManifestSha256 === catalog.identity`
 and `build.contentCatalogIdentity === catalog.catalogIdentity`. The former is

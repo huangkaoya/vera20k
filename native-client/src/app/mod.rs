@@ -33,7 +33,6 @@ use crate::util::config::GameConfig;
 
 pub mod app_bundle;
 pub(crate) mod audio_runtime;
-pub(crate) mod browser_shell;
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 #[cfg(target_arch = "wasm32")]
@@ -41,6 +40,7 @@ pub(crate) mod browser_network;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "browser_network/pipeline.rs"]
 mod browser_network_pipeline;
+pub(crate) mod browser_shell;
 pub(crate) mod campaign_defeat;
 pub(crate) mod campaign_victory;
 pub(crate) mod chinese_ui;
@@ -55,24 +55,33 @@ mod handler;
 mod in_game;
 mod initialize;
 pub(crate) mod input;
-#[cfg(any(target_os = "ios", target_os = "android", test))]
-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+#[cfg_attr(
+    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
+    allow(dead_code)
+)]
 mod ios_battle_touch;
-#[cfg(any(target_os = "ios", target_os = "android", test))]
-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+#[cfg_attr(
+    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
+    allow(dead_code)
+)]
 mod ios_controls;
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
 mod ios_hud_render;
 #[cfg(any(target_os = "ios", test))]
 pub mod ios_runtime;
-#[cfg(any(target_os = "ios", target_os = "android", test))]
-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+#[cfg_attr(
+    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
+    allow(dead_code)
+)]
 mod ios_shortcuts;
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
 mod ios_sidebar_art;
-#[cfg(any(target_os = "ios", target_os = "android", test))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
 mod ios_touch;
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
 mod ios_unit_tags;
 pub(crate) mod loading;
 pub(crate) mod match_audio;
@@ -142,7 +151,7 @@ pub struct App {
     startup_options: crate::app::frontend::startup_options::RetailStartupOptions,
     spawn_request: Option<crate::app::frontend::cncnet_spawn::SpawnRequest>,
     startup_failure: Option<String>,
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
     ios_touch: ios_touch::IosTouchPointer,
     #[cfg(any(target_os = "ios", target_os = "android"))]
     ios_suspended: bool,
@@ -197,7 +206,7 @@ impl App {
             startup_options,
             spawn_request: None,
             startup_failure: None,
-            #[cfg(any(target_os = "ios", target_os = "android"))]
+            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
             ios_touch: Default::default(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             ios_suspended: false,
@@ -219,7 +228,7 @@ impl App {
             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
             spawn_request: None,
             startup_failure: None,
-            #[cfg(any(target_os = "ios", target_os = "android"))]
+            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
             ios_touch: Default::default(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             ios_suspended: false,
@@ -243,7 +252,7 @@ impl App {
             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
             spawn_request: None,
             startup_failure: None,
-            #[cfg(any(target_os = "ios", target_os = "android"))]
+            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
             ios_touch: Default::default(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             ios_suspended: false,

@@ -71,7 +71,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
       }
       let directory, relative;
       if (pathname==='/' || pathname==='/index.html') {directory=sourceRoot;relative='index.html';}
-      else if (['/bootstrap.js','/lobby.js','/content-store.js','/content-plan.js','/runtime-adapter.js','/content-controller.js','/shell-bridge.js'].includes(pathname)) {directory=sourceRoot;relative=pathname.slice(1);}
+      else if (['/bootstrap.js','/lobby.js','/content-store.js','/content-plan.js','/runtime-adapter.js','/content-controller.js','/shell-bridge.js','/pointer-capture.js','/menu-animation.js'].includes(pathname)) {directory=sourceRoot;relative=pathname.slice(1);}
       else if (pathname==='/branding/icon.png' || pathname==='/favicon.ico') {directory=path.join(root,'native-client/art/branding');relative='wannafire-app-icon.png';}
       else if (pathname==='/fonts/FiraSansCondensed-Medium.ttf' || pathname==='/fonts/FiraSansCondensed-OFL') {
         directory=path.join(root,'native-client/art/fonts');relative=path.basename(pathname);

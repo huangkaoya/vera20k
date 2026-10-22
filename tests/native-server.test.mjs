@@ -21,6 +21,7 @@ async function setup(t) {
   for (const dir of ['retail','web-native','public/native','native-client/art/fonts','native-client/art/branding']) await fs.mkdir(path.join(root,dir),{recursive:true});
   await fs.writeFile(path.join(root,'web-native/index.html'),'<title>王二火大</title><canvas id="game"></canvas>');
   await fs.writeFile(path.join(root,'web-native/bootstrap.js'),'export const native=true;');
+  for (const name of ['pointer-capture.js','menu-animation.js']) await fs.writeFile(path.join(root,'web-native',name),'export const adapter=true;');
   await fs.writeFile(path.join(root,'public/native/vera20k_bg.wasm'),Buffer.from([0,97,115,109,1,0,0,0]));
   await fs.writeFile(path.join(root,'public/native/vera20k.js'),'export const start_browser=()=>{};');
   await fs.writeFile(path.join(root,'native-client/art/fonts/FiraSansCondensed-Medium.ttf'),'font');
@@ -36,6 +37,10 @@ async function setup(t) {
 test('native shell serves real WASM and native media, preserving private profiles',async t=>{
   const {app}=await setup(t);
   assert.match((await request(app.url,'/')).body.toString(),/canvas/);
+  for (const route of ['/pointer-capture.js','/menu-animation.js']) {
+    const response=await request(app.url,route);
+    assert.equal(response.status,200); assert.match(response.body.toString(),/adapter/);
+  }
   const wasm=await request(app.url,'/native/vera20k_bg.wasm');
   assert.equal(wasm.status,200);assert.equal(wasm.headers['content-type'],'application/wasm');
   const icon=await request(app.url,'/branding/icon.png');

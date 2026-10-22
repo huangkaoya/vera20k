@@ -92,19 +92,21 @@ impl From<BinkMovieSurface> for MenuMovieSurface {
 impl MenuMovieSurface {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn set_playing(&mut self, playing: bool) {
-        if let Self::Branded(movie) = self
-            && let Some(video) = movie.video.as_mut()
-        {
-            video.set_playing(playing);
+        if let Self::Branded(movie) = self {
+            movie.playback_gate.menu_shown = playing;
+            if let Some(video) = movie.video.as_mut() {
+                video.set_playing(playing);
+            }
         }
     }
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn set_window_active(&mut self, active: bool) {
-        if let Self::Branded(movie) = self
-            && let Some(video) = movie.video.as_mut()
-        {
-            video.set_window_active(active);
+        if let Self::Branded(movie) = self {
+            movie.playback_gate.window_active = active;
+            if let Some(video) = movie.video.as_mut() {
+                video.set_window_active(active);
+            }
         }
     }
 
@@ -180,6 +182,10 @@ pub(crate) struct BrandedMenuSurface {
     video: Option<browser_video::BrowserMenuVideo>,
     #[cfg(target_arch = "wasm32")]
     showing_video: bool,
+    #[cfg(target_arch = "wasm32")]
+    video_attempted: bool,
+    #[cfg(target_arch = "wasm32")]
+    playback_gate: VideoPlaybackGate,
 }
 
 #[cfg(any(
@@ -204,30 +210,23 @@ impl BrandedMenuSurface {
             FrameStream::new(POSTER)?
         };
         #[cfg(target_arch = "wasm32")]
-        let video = {
-            if crate::util::browser_content::capabilities().menu_animation {
-                let path = std::path::Path::new(crate::util::browser_io::RETAIL_ROOT)
-                    .join("werhd-menu.mp4");
-                match crate::util::browser_io::read_shared(path) {
-                    Ok(bytes) => match browser_video::BrowserMenuVideo::new(
-                        bytes.as_slice(),
-                        frames.archive.width,
-                        frames.archive.height,
-                    ) {
-                        Ok(video) => Some(video),
-                        Err(error) => {
-                            log::warn!(
-                                "Could not prepare browser menu MP4: {error:?}; keeping poster"
-                            );
-                            None
-                        }
-                    },
-                    Err(_) => None,
+        let bytes = browser_menu_video_bytes();
+        #[cfg(target_arch = "wasm32")]
+        let video_attempted = bytes.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let video = bytes.and_then(|bytes| {
+            match browser_video::BrowserMenuVideo::new(
+                bytes.as_slice(),
+                frames.archive.width,
+                frames.archive.height,
+            ) {
+                Ok(video) => Some(video),
+                Err(error) => {
+                    log::warn!("Could not prepare browser menu MP4: {error:?}; keeping poster");
+                    None
                 }
-            } else {
-                None
             }
-        };
+        });
         #[cfg(target_arch = "wasm32")]
         let source = if video.is_some() {
             "/retail/werhd-menu.mp4 (browser decoder)"
@@ -251,6 +250,10 @@ impl BrandedMenuSurface {
             video,
             #[cfg(target_arch = "wasm32")]
             showing_video: false,
+            #[cfg(target_arch = "wasm32")]
+            video_attempted,
+            #[cfg(target_arch = "wasm32")]
+            playback_gate: VideoPlaybackGate::default(),
         })
     }
 
@@ -258,6 +261,27 @@ impl BrandedMenuSurface {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = elapsed_secs; // The browser's decoder owns MP4 time/looping.
+            if !self.video_attempted
+                && let Some(bytes) = browser_menu_video_bytes()
+            {
+                self.video_attempted = true;
+                match browser_video::BrowserMenuVideo::new(
+                    bytes.as_slice(),
+                    self.frames.archive.width,
+                    self.frames.archive.height,
+                ) {
+                    Ok(mut video) => {
+                        video.set_window_active(self.playback_gate.window_active);
+                        video.set_playing(self.playback_gate.menu_shown);
+                        self.source = "verified menu MP4 (browser decoder)";
+                        self.video = Some(video);
+                        log::info!("Installed downloaded compressed menu MP4 into native menu");
+                    }
+                    Err(error) => log::warn!(
+                        "Could not prepare downloaded menu MP4: {error:?}; keeping poster"
+                    ),
+                }
+            }
             let Some(video) = self.video.as_mut() else {
                 return Ok(BinkMovieStep::Unchanged);
             };
@@ -315,6 +339,18 @@ impl BrandedMenuSurface {
             },
         );
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_menu_video_bytes() -> Option<std::sync::Arc<Vec<u8>>> {
+    crate::util::browser_menu_media::current().or_else(|| {
+        if !crate::util::browser_content::capabilities().menu_animation {
+            return None;
+        }
+        let path =
+            std::path::Path::new(crate::util::browser_io::RETAIL_ROOT).join("werhd-menu.mp4");
+        crate::util::browser_io::read_shared(path).ok()
+    })
 }
 
 #[cfg(any(

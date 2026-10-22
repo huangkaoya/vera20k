@@ -225,7 +225,10 @@ pub(crate) fn render_in_game_options_shell(
     let options = &state.match_state.match_presentation.in_game_options;
     let desc = build_in_game_options_descriptor();
     for child in layout_pass_in_game_options(&desc, width, height, anchor) {
-        if matches!(child.id, control::BACK | control::KEYBOARD | control::SOUND) {
+        if matches!(
+            child.id,
+            control::BACK | control::KEYBOARD | control::SOUND | control::MOUSE_SENSITIVITY_RESET
+        ) {
             let frame = usize::from(options.buttons.is_pressed(child.id));
             if let Some(entry) =
                 atlas.in_game_shell.buttons[frame].or(atlas.in_game_shell.buttons[0])

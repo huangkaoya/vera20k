@@ -13,6 +13,14 @@ pub const OPTIONS_SPEED_MIN: u32 = 0;
 pub const OPTIONS_SPEED_MAX: u32 = 6;
 /// DetailLevel range (0 = low .. 2 = high), direct (not inverted).
 pub const OPTIONS_DETAIL_MAX: u32 = 2;
+/// Web pointer movement gain. Independent of the map's ScrollRate and of
+/// simulation speed; the shared settings profile persists this percentage.
+pub const MOUSE_SENSITIVITY_MIN: u32 = 25;
+pub const MOUSE_SENSITIVITY_MAX: u32 = 400;
+pub const MOUSE_SENSITIVITY_STEP: u32 = 5;
+pub const MOUSE_SENSITIVITY_DEFAULT: u32 = 100;
+pub const MOUSE_SENSITIVITY_STOPS: u32 =
+    (MOUSE_SENSITIVITY_MAX - MOUSE_SENSITIVITY_MIN) / MOUSE_SENSITIVITY_STEP;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InGameOptionsState {
@@ -25,6 +33,7 @@ pub struct InGameOptionsState {
     pub unit_action_lines: bool,
     pub show_hidden: bool,
     pub tooltips: bool,
+    pub mouse_sensitivity_percent: u32,
     /// Transient: which owner-draw button is held (for the pressed frame).
     pub buttons: super::button::ShellButtonInteraction<u16>,
     /// Native4E2201..2229 projects the common audio-device predicate.
@@ -46,6 +55,7 @@ impl Default for InGameOptionsState {
             unit_action_lines: true,
             show_hidden: false,
             tooltips: true,
+            mouse_sensitivity_percent: MOUSE_SENSITIVITY_DEFAULT,
             buttons: Default::default(),
             sound_enabled: true,
             dragging_slider: None,
@@ -55,6 +65,10 @@ impl Default for InGameOptionsState {
 }
 
 impl InGameOptionsState {
+    pub fn reset_mouse_sensitivity(&mut self) {
+        self.mouse_sensitivity_percent = MOUSE_SENSITIVITY_DEFAULT;
+    }
+
     /// Reset the transient interaction state when the overlay (re)opens; gamemd
     /// recreates the dialog each open, and init decides the GameSpeed row.
     pub fn on_open(&mut self, game_speed_hidden: bool) {
@@ -73,6 +87,31 @@ pub fn speed_slider_pos(internal: u32) -> u32 {
 /// Internal speed value from a slider position (0..6): `6 - pos`.
 pub fn speed_from_slider_pos(pos: u32) -> u32 {
     OPTIONS_SPEED_MAX - pos.min(OPTIONS_SPEED_MAX)
+}
+
+pub fn normalized_mouse_sensitivity(value: i32) -> u32 {
+    if !(MOUSE_SENSITIVITY_MIN as i32..=MOUSE_SENSITIVITY_MAX as i32).contains(&value) {
+        return MOUSE_SENSITIVITY_DEFAULT;
+    }
+    ((value as u32 + MOUSE_SENSITIVITY_STEP / 2) / MOUSE_SENSITIVITY_STEP) * MOUSE_SENSITIVITY_STEP
+}
+
+pub fn mouse_sensitivity_slider_pos(percent: u32) -> u32 {
+    (normalized_mouse_sensitivity(i32::try_from(percent).unwrap_or(-1)) - MOUSE_SENSITIVITY_MIN)
+        / MOUSE_SENSITIVITY_STEP
+}
+
+pub fn mouse_sensitivity_from_slider_pos(position: u32) -> u32 {
+    MOUSE_SENSITIVITY_MIN + position.min(MOUSE_SENSITIVITY_STOPS) * MOUSE_SENSITIVITY_STEP
+}
+
+pub fn mouse_sensitivity_thumb_left(percent: u32, rect: RectPx) -> i32 {
+    thumb_left(
+        mouse_sensitivity_slider_pos(percent) as i32,
+        rect.w,
+        0,
+        MOUSE_SENSITIVITY_STOPS as i32,
+    )
 }
 
 /// Control-local thumb left for BBB's plain rail. Active 4E1FE0 sends 4AC=0
@@ -100,6 +139,34 @@ mod tests {
         let s = InGameOptionsState::default();
         assert_eq!((s.game_speed, s.scroll_rate, s.detail_level), (3, 3, 2));
         assert!(s.unit_action_lines && !s.show_hidden && s.tooltips);
+    }
+
+    #[test]
+    fn mouse_gain_range_round_trips_and_reset_keeps_map_and_game_speeds() {
+        let mut state = InGameOptionsState::default();
+        assert_eq!(state.mouse_sensitivity_percent, 100);
+        for position in 0..=MOUSE_SENSITIVITY_STOPS {
+            let percent = mouse_sensitivity_from_slider_pos(position);
+            assert!((25..=400).contains(&percent));
+            assert_eq!(percent % 5, 0);
+            assert_eq!(mouse_sensitivity_slider_pos(percent), position);
+        }
+        for invalid in [-1, 0, 24, 401, i32::MAX] {
+            assert_eq!(normalized_mouse_sensitivity(invalid), 100);
+        }
+        assert_eq!(normalized_mouse_sensitivity(103), 105);
+        state.scroll_rate = 5;
+        state.game_speed = 2;
+        state.mouse_sensitivity_percent = 400;
+        state.reset_mouse_sensitivity();
+        assert_eq!(
+            (
+                state.mouse_sensitivity_percent,
+                state.scroll_rate,
+                state.game_speed
+            ),
+            (100, 5, 2)
+        );
     }
 
     #[test]

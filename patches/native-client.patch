@@ -86790,10 +86790,10 @@ index 312056a1b74195c4d0baf6c848b4606b4b8f65d9..2e17c32972565dd85b608a6e3a31deb0
  
 diff --git a/src/app/browser.rs b/src/app/browser.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267f6a02d2d
+index 0000000000000000000000000000000000000000..3336f444473f9899663c5098bef64bc091f9568a
 --- /dev/null
 +++ b/src/app/browser.rs
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,598 @@
 +//! Browser lifecycle for the ordinary native App, menus and tactical input.
 +//!
 +//! Resource hydration is completed by web_entry before this module starts.
@@ -86820,6 +86820,9 @@ index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267
 +thread_local! {
 +    static STARTED: Cell<bool> = const { Cell::new(false) };
 +    static DIAGNOSTICS_ENABLED: Cell<bool> = const { Cell::new(false) };
++    // Presentation-only derived state for resource activation. Reading it must
++    // not enable full unit/terrain acceptance diagnostics in ordinary play.
++    static MENU_ACTIVE: Cell<bool> = const { Cell::new(false) };
 +    static DIAGNOSTICS: RefCell<Value> = RefCell::new(json!({"stage":"not-started"}));
 +    static NETWORK_START: RefCell<Option<network_launch::NetworkStartConfig>> = const { RefCell::new(None) };
 +    static NETWORK_LEAVE: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -86993,8 +86996,21 @@ index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267
 +/// commands, or writable simulation references are exposed to JavaScript.
 +pub fn diagnostics() -> JsValue {
 +    DIAGNOSTICS_ENABLED.with(|enabled| enabled.set(true));
-+    DIAGNOSTICS
-+        .with(|value| js_sys::JSON::parse(&value.borrow().to_string()).unwrap_or(JsValue::NULL))
++    DIAGNOSTICS.with(|value| {
++        let mut snapshot = value.borrow().clone();
++        // Pointer admission is consumed synchronously by trusted mouse events.
++        // Keep it current even while the heavier acceptance snapshot is throttled.
++        snapshot["pointerCaptureAllowed"] = json!(super::input::cursor::browser::policy());
++        js_sys::JSON::parse(&snapshot.to_string()).unwrap_or(JsValue::NULL)
++    })
++}
++
++pub fn pointer_capture_allowed() -> bool {
++    super::input::cursor::browser::policy()
++}
++
++pub fn menu_active() -> bool {
++    MENU_ACTIVE.with(Cell::get)
 +}
 +
 +fn set_stage(browser: &BrowserState, stage: &str, error: Option<&str>) {
@@ -87203,7 +87219,9 @@ index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267
 +    }
 +
 +    pub(super) fn cancel_browser_initialization(&mut self) {
++        MENU_ACTIVE.with(|active| active.set(false));
 +        if let Some(state) = self.state.as_ref() {
++            super::input::cursor::browser::release(state);
 +            state.platform.window.set_cursor_visible(true);
 +        }
 +        if let Some(browser) = self.browser.as_mut() {
@@ -87219,6 +87237,13 @@ index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267
 +    }
 +
 +    pub(super) fn update_browser_diagnostics(&mut self) {
++        MENU_ACTIVE.with(|active| {
++            active.set(
++                self.state
++                    .as_ref()
++                    .is_some_and(|state| state.frontend.screen == GameScreen::MainMenu),
++            );
++        });
 +        if !DIAGNOSTICS_ENABLED.with(Cell::get) {
 +            return;
 +        }
@@ -87274,6 +87299,7 @@ index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267
 +    let center_base_binding = input
 +        .hotkey_bindings
 +        .first_key(super::input::hotkeys::HotkeyCommand::CenterBase);
++    let loading_paints = super::loading::pump::browser_paint_counts();
 +    let mut result = json!({
 +        "stage":"ready","mode":mode,
 +        "shellRoute":format!("{:?}",state.frontend.shell_route),
@@ -87290,6 +87316,12 @@ index 0000000000000000000000000000000000000000..792f123b632ac4a681c6bcf3c484e267
 +        "camera":{"x":input.camera_x,"y":input.camera_y,"zoom":input.zoom_level},
 +        "cursor":{"x":input.cursor_x,"y":input.cursor_y},
 +        "pointerInClient":state.platform.pointer_in_client,
++        "cursorConfined":state.platform.cursor_confined,
++        "pointerCaptureAllowed":super::input::cursor::browser::eligible(state),
++        "pointerMotion":super::input::cursor::browser::diagnostics(state),
++        "touchInput":state.touch_input_mode(),
++        "brandedHud":state.branded_hud_mode(),
++        "loadingPaints":{"scheduled":loading_paints.0,"completed":loading_paints.1},
 +        "windowActive":state.platform.window_active,
 +        "windowHidden":state.platform.window_hidden,
 +        "tacticalViewport":{"x":viewport.0,"y":viewport.1,"width":viewport.2,"height":viewport.3},
@@ -91329,9 +91361,18 @@ index 66634364f0ea57cb389592e1bae7a658672b3dd5..3200de0e656709ff835587e57883e330
  use anyhow::{Context, Result, bail, ensure};
  use serde_json::{Value, json};
 diff --git a/src/app/frame.rs b/src/app/frame.rs
-index 696eecc0cde1d810c366e78e94f4cdb071fd1bc6..ab2ea490603a95bf02fb6c3621b82d2bae659d36 100644
+index 696eecc0cde1d810c366e78e94f4cdb071fd1bc6..ded62e6359f0d8f370407b01ef8e5788d2c170b7 100644
 --- a/src/app/frame.rs
 +++ b/src/app/frame.rs
+@@ -108,7 +108,7 @@ impl App {
+         // match running behind other windows instead. The gate sits at the
+         // call site, not inside the runtime, so a focus edge never re-anchors
+         // the frame pacer on its own.
+-        #[cfg(any(target_os = "ios", target_os = "android"))]
++        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+         crate::app::ios_controls::service(state);
+         if simulation_allowed
+             && matches!(state.frontend.screen, GameScreen::InGame)
 @@ -437,7 +437,9 @@ impl App {
                  }
              }
@@ -91343,6 +91384,15 @@ index 696eecc0cde1d810c366e78e94f4cdb071fd1bc6..ab2ea490603a95bf02fb6c3621b82d2b
                      main_menu_entry_token,
                  } = crate::app::frontend::shell_transition::render_shell_first_paint_slide(
                      state,
+@@ -708,7 +710,7 @@ impl App {
+                 }
+             }
+         }
+-        #[cfg(any(target_os = "ios", target_os = "android"))]
++        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+         crate::app::ios_hud_render::render(state, &mut encoder, &view);
+         state.renderer.fps_overlay.encode(
+             &state.renderer.gpu,
 diff --git a/src/app/frontend/campaign_score_shell_render.rs b/src/app/frontend/campaign_score_shell_render.rs
 index 312ea3a4814847fab8e0b9e7b322c874da2e8e04..e9aea81ca416b620ee1b928f9395b3bebb182ce2 100644
 --- a/src/app/frontend/campaign_score_shell_render.rs
@@ -91379,7 +91429,7 @@ index 5d9e1108c510c0a8c8a0be0e901cd635d126e0ed..2b7e8154969675f2e544f2a3c693ea32
      );
      let mut labels = campaign_labels(state, &layout, children);
 diff --git a/src/app/frontend/fullscreen_movie.rs b/src/app/frontend/fullscreen_movie.rs
-index 8fe525a3e925b2ad378b7291c2f8aef951bb5887..5b5d0aac9bc024f916e304f53582c6feb813eed3 100644
+index 8fe525a3e925b2ad378b7291c2f8aef951bb5887..932d47f6d89eb20242c5f2ebbb2791c368cfc09f 100644
 --- a/src/app/frontend/fullscreen_movie.rs
 +++ b/src/app/frontend/fullscreen_movie.rs
 @@ -16,7 +16,7 @@
@@ -91391,6 +91441,37 @@ index 8fe525a3e925b2ad378b7291c2f8aef951bb5887..5b5d0aac9bc024f916e304f53582c6fe
  
  use crate::render::batch::SpriteInstance;
  use crate::render::bink_movie::BinkMovieSurface;
+@@ -67,7 +67,10 @@ impl SkipGesture {
+         true
+     }
+ 
+-    #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
++    #[cfg_attr(
++        not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
++        allow(dead_code)
++    )]
+     fn touch(&mut self, touch: &Touch, rect: RectPx, now: Instant) {
+         self.touch_mode = true;
+         self.pointer_down = false;
+@@ -241,7 +244,8 @@ impl FullscreenMovie {
+             && cfg!(any(
+                 target_os = "ios",
+                 target_os = "macos",
+-                target_os = "android"
++                target_os = "android",
++                target_arch = "wasm32"
+             ));
+         self
+     }
+@@ -251,7 +255,7 @@ impl FullscreenMovie {
+     pub(crate) fn cancel_skip_pointer(&mut self) {
+         self.skip.cancel();
+     }
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+     pub(crate) fn skip_touch(&mut self, touch: &Touch, screen: [u32; 2], density: f32) {
+         if self.skip_enabled {
+             self.skip
 diff --git a/src/app/frontend/load_saved_game_render.rs b/src/app/frontend/load_saved_game_render.rs
 index 45bcf5334c976a738e474cec8def54950aac6b31..d7e3a37c6f5119a557d48867984b3fc2a91fbea1 100644
 --- a/src/app/frontend/load_saved_game_render.rs
@@ -91641,6 +91722,181 @@ index 6d1a8724a46cd3c9f4f6d0e66a8f4f13b4161905..b41a41538ebccb9e8eb231ac9b26ee2d
          Ok(bytes) => {
              let snapshot = read_setup_snapshot(&bytes, defaults, SetupProfile::Skirmish)
                  .unwrap_or_else(|err| {
+diff --git a/src/app/frontend/skirmish_shell_render/in_game_options.rs b/src/app/frontend/skirmish_shell_render/in_game_options.rs
+index e3cbfe5e3d0a154319a2003d2a03f9ea3d25ddb4..4f2182158f5f140ce0ead12d6be1faa5ccc08178 100644
+--- a/src/app/frontend/skirmish_shell_render/in_game_options.rs
++++ b/src/app/frontend/skirmish_shell_render/in_game_options.rs
+@@ -13,7 +13,7 @@ use crate::ui::shell::in_game_options::{
+     build_in_game_options_descriptor, control, control_shown, speed_value_label_key,
+ };
+ use crate::ui::shell::in_game_options_state::{
+-    InGameOptionsState, plain_trackbar_thumb_left, speed_slider_pos,
++    InGameOptionsState, mouse_sensitivity_thumb_left, plain_trackbar_thumb_left, speed_slider_pos,
+ };
+ use crate::ui::shell::layout::{InGameOptionsAnchor, layout_pass_in_game_options};
+ 
+@@ -39,9 +39,16 @@ pub(crate) fn build_in_game_options_instances(
+         let rect = l.rect;
+         match c.kind {
+             ControlKind::Trackbar => {
+-                let pos = match c.id {
+-                    control::GAME_SPEED => speed_slider_pos(state.game_speed),
+-                    control::SCROLL_RATE => speed_slider_pos(state.scroll_rate),
++                let left = match c.id {
++                    control::GAME_SPEED => {
++                        plain_trackbar_thumb_left(speed_slider_pos(state.game_speed), rect)
++                    }
++                    control::SCROLL_RATE => {
++                        plain_trackbar_thumb_left(speed_slider_pos(state.scroll_rate), rect)
++                    }
++                    control::MOUSE_SENSITIVITY => {
++                        mouse_sensitivity_thumb_left(state.mouse_sensitivity_percent, rect)
++                    }
+                     _ => continue,
+                 };
+                 paint_control(
+@@ -49,7 +56,7 @@ pub(crate) fn build_in_game_options_instances(
+                     chrome,
+                     ControlPaint::Trackbar {
+                         rect,
+-                        thumb_left: plain_trackbar_thumb_left(pos, rect),
++                        thumb_left: left,
+                         plaque: false,
+                     },
+                     ShellScale::RETAIL,
+@@ -128,6 +135,17 @@ fn in_game_options_static_draws(
+     state: &InGameOptionsState,
+ ) -> Vec<OptionsStaticDraw> {
+     let desc = build_in_game_options_descriptor();
++    in_game_options_static_draws_with_descriptor(&desc, csf, screen_w, screen_h, anchor, state)
++}
++
++fn in_game_options_static_draws_with_descriptor(
++    desc: &crate::ui::shell::descriptor::DialogDescriptor,
++    csf: Option<&CsfFile>,
++    screen_w: i32,
++    screen_h: i32,
++    anchor: InGameOptionsAnchor,
++    state: &InGameOptionsState,
++) -> Vec<OptionsStaticDraw> {
+     let laid = layout_pass_in_game_options(&desc, screen_w, screen_h, anchor);
+     let mut out = Vec::new();
+     for (c, l) in desc.controls.iter().zip(laid.iter()) {
+@@ -141,17 +159,23 @@ fn in_game_options_static_draws(
+         }
+         // The two value labels (0x671/0x672) show their slider-position CSF key
+         // from the open; every other static keeps its template caption key.
+-        let key = match c.id {
+-            control::GAME_SPEED_VALUE => speed_value_label_key(speed_slider_pos(state.game_speed)),
+-            control::SCROLL_RATE_VALUE => {
+-                speed_value_label_key(speed_slider_pos(state.scroll_rate))
+-            }
+-            _ => match c.csf_key {
+-                Some(key) => key,
+-                None => continue,
+-            },
++        let text = if c.id == control::MOUSE_SENSITIVITY_VALUE {
++            format!("{}%", state.mouse_sensitivity_percent)
++        } else {
++            let key = match c.id {
++                control::GAME_SPEED_VALUE => {
++                    speed_value_label_key(speed_slider_pos(state.game_speed))
++                }
++                control::SCROLL_RATE_VALUE => {
++                    speed_value_label_key(speed_slider_pos(state.scroll_rate))
++                }
++                _ => match c.csf_key {
++                    Some(key) => key,
++                    None => continue,
++                },
++            };
++            resolve_static_text(csf, key)
+         };
+-        let text = resolve_static_text(csf, key);
+         if text.is_empty() {
+             continue;
+         }
+@@ -193,6 +217,11 @@ fn in_game_options_static_draws(
+ /// label stays visible as retail's `MISSING:'<key>'`; English literals exist
+ /// only for assetless operation where no CSF table is available.
+ fn resolve_static_text(csf: Option<&CsfFile>, key: &str) -> String {
++    match key {
++        "VERA:MouseSensitivity" => return "鼠标灵敏度".to_string(),
++        "VERA:MouseSensitivityReset" => return "恢复100%".to_string(),
++        _ => {}
++    }
+     match csf {
+         Some(table) => table.text(key).into_owned(),
+         None => options_static_fallback(key).to_string(),
+@@ -229,7 +258,9 @@ fn options_static_fallback(key: &str) -> &'static str {
+ fn options_static_align(id: u16) -> ShellAlign {
+     match id {
+         control::TITLE => ShellAlign::H_CENTER,
+-        control::GAME_SPEED_CAPTION | control::SCROLL_RATE_CAPTION => ShellAlign::H_RIGHT,
++        control::GAME_SPEED_CAPTION
++        | control::SCROLL_RATE_CAPTION
++        | control::MOUSE_SENSITIVITY_CAPTION => ShellAlign::H_RIGHT,
+         _ => ShellAlign::NONE,
+     }
+ }
+@@ -247,6 +278,41 @@ mod tests {
+         CsfFile::from_bytes(&bytes).expect("valid initialized CSF header")
+     }
+ 
++    #[test]
++    fn web_sensitivity_captions_show_percent_and_reset_on_the_native_page() {
++        let desc =
++            crate::ui::shell::in_game_options::build_in_game_options_descriptor_for_web(true);
++        let csf = initialized_empty_csf();
++        let state = InGameOptionsState {
++            mouse_sensitivity_percent: 175,
++            ..Default::default()
++        };
++        let draws = in_game_options_static_draws_with_descriptor(
++            &desc,
++            Some(&csf),
++            800,
++            600,
++            test_anchor(),
++            &state,
++        );
++        let text = |id| {
++            draws
++                .iter()
++                .find(|draw| draw.id == id)
++                .unwrap()
++                .text
++                .as_str()
++        };
++        assert_eq!(text(control::MOUSE_SENSITIVITY_CAPTION), "鼠标灵敏度");
++        assert_eq!(text(control::MOUSE_SENSITIVITY_VALUE), "175%");
++        assert_eq!(text(control::MOUSE_SENSITIVITY_RESET), "恢复100%");
++        assert!(
++            !draws
++                .iter()
++                .any(|draw| draw.id == control::VISUAL_DETAILS_CAPTION)
++        );
++    }
++
+     fn entry(w: f32, h: f32) -> SkirmishShellChromeEntry {
+         SkirmishShellChromeEntry {
+             uv_origin: [0.0, 0.0],
+diff --git a/src/app/frontend/skirmish_shell_render/in_game_shell.rs b/src/app/frontend/skirmish_shell_render/in_game_shell.rs
+index a4b606d1a6ed29f6edf40ffb2415158ae11f4780..f0f56effe616d7388ec908e7db96182d2454bc2e 100644
+--- a/src/app/frontend/skirmish_shell_render/in_game_shell.rs
++++ b/src/app/frontend/skirmish_shell_render/in_game_shell.rs
+@@ -225,7 +225,10 @@ pub(crate) fn render_in_game_options_shell(
+     let options = &state.match_state.match_presentation.in_game_options;
+     let desc = build_in_game_options_descriptor();
+     for child in layout_pass_in_game_options(&desc, width, height, anchor) {
+-        if matches!(child.id, control::BACK | control::KEYBOARD | control::SOUND) {
++        if matches!(
++            child.id,
++            control::BACK | control::KEYBOARD | control::SOUND | control::MOUSE_SENSITIVITY_RESET
++        ) {
+             let frame = usize::from(options.buttons.is_pressed(child.id));
+             if let Some(entry) =
+                 atlas.in_game_shell.buttons[frame].or(atlas.in_game_shell.buttons[0])
 diff --git a/src/app/frontend/skirmish_shell_render/keyboard.rs b/src/app/frontend/skirmish_shell_render/keyboard.rs
 index 48d8bb2f154843dea3e88f8b241baccaf119bcf9..29cca7e5a461de79317a10cd2bc6e3eb8001c045 100644
 --- a/src/app/frontend/skirmish_shell_render/keyboard.rs
@@ -92143,7 +92399,7 @@ index b9a76e103e0c3a6517c593b543ac277d8180c8a4..affd5d2d07fbf2df246d00737c35b3b9
      );
      for (button, pressed, enabled) in &painted_buttons {
 diff --git a/src/app/handler.rs b/src/app/handler.rs
-index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..c276be92dc54cf247f9f26a581fe77d4768bd34f 100644
+index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..fcbc4aa769228f26d3e1c7590e1eb0bb49d288d6 100644
 --- a/src/app/handler.rs
 +++ b/src/app/handler.rs
 @@ -66,7 +66,12 @@ impl App {
@@ -92160,7 +92416,59 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..c276be92dc54cf247f9f26a581fe77d4
          if let Some(splash) = state.frontend.startup_splash.as_mut()
              && let Err(err) = splash.resize(&state.renderer.gpu, &state.renderer.batch_renderer)
          {
-@@ -256,6 +261,71 @@ impl ApplicationHandler for App {
+@@ -223,7 +228,7 @@ fn show_menu_bar_and_dock_after_full_screen() {
+ }
+ 
+ impl ApplicationHandler for App {
+-    #[cfg(target_os = "macos")]
++    #[cfg(any(target_os = "macos", target_arch = "wasm32"))]
+     fn device_event(
+         &mut self,
+         event_loop: &ActiveEventLoop,
+@@ -233,14 +238,30 @@ impl ApplicationHandler for App {
+         let winit::event::DeviceEvent::MouseMotion { delta } = event else {
+             return;
+         };
+-        let Some(state) = self.state.as_ref() else {
++        let Some(state) = self.state.as_mut() else {
+             return;
+         };
++        #[cfg(target_os = "macos")]
+         let Some(position) = crate::app::input::cursor::macos::raw_motion(state, delta) else {
+             return;
+         };
++        #[cfg(target_arch = "wasm32")]
++        let Some(position) = crate::app::input::cursor::browser::raw_motion(state, delta) else {
++            return;
++        };
+         let window_id = state.platform.window.id();
++        #[cfg(target_os = "macos")]
+         state.platform.macos_cursor.from_device.set(true);
++        #[cfg(target_arch = "wasm32")]
++        {
++            state.platform.pointer_in_client = true;
++            // Browser raw_motion already integrated the physical delta into
++            // the visible window cursor. Feeding it through the confined OS
++            // absolute-history reducer again amplifies reversals at letterbox
++            // clamps. Start this synthesized absolute projection afresh.
++            state.match_state.input.reset_window_cursor_motion();
++            crate::app::input::cursor::browser::begin_relative(state.window_cursor_position());
++        }
+         // Reuse every existing splash/capture/modal/drag gate and screen route.
+         self.window_event(
+             event_loop,
+@@ -250,12 +271,82 @@ impl ApplicationHandler for App {
+                 position,
+             },
+         );
++        #[cfg(target_os = "macos")]
+         if let Some(state) = self.state.as_ref() {
+             state.platform.macos_cursor.from_device.set(false);
+         }
++        #[cfg(target_arch = "wasm32")]
++        if let Some(state) = self.state.as_ref() {
++            crate::app::input::cursor::browser::end_relative(state.window_cursor_position());
++        }
      }
  
      fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -92232,31 +92540,86 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..c276be92dc54cf247f9f26a581fe77d4
          #[cfg(any(target_os = "ios", target_os = "android"))]
          {
              let was_suspended = self.ios_suspended;
-@@ -357,7 +427,12 @@ impl ApplicationHandler for App {
+@@ -357,9 +448,15 @@ impl ApplicationHandler for App {
          }
      }
  
 -    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+-        #[cfg(any(target_os = "ios", target_os = "android"))]
 +    fn handle_window_event(
 +        &mut self,
 +        event_loop: &ActiveEventLoop,
 +        _id: WindowId,
 +        event: WindowEvent,
 +    ) {
-         #[cfg(any(target_os = "ios", target_os = "android"))]
++        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
          {
++            #[cfg(any(target_os = "ios", target_os = "android"))]
              if self.ios_suspended && matches!(&event, WindowEvent::RedrawRequested) {
-@@ -629,6 +704,9 @@ impl ApplicationHandler for App {
+                 return;
+             }
+@@ -378,6 +475,12 @@ impl ApplicationHandler for App {
+                     return;
+                 }
+                 if let Some(state) = self.state.as_mut() {
++                    #[cfg(target_arch = "wasm32")]
++                    if !state.platform.browser_touch {
++                        state.platform.browser_touch = true;
++                        crate::app::input::cursor::apply_cursor_confinement(state);
++                        crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
++                    }
+                     if Self::fullscreen_movie_touch(state, touch) {
+                         self.ios_touch.reset();
+                         crate::app::ios_controls::reset(state);
+@@ -422,6 +525,24 @@ impl ApplicationHandler for App {
+         let tactical_capture_active = self.tactical_capture.is_some();
+         let Some(state) = &mut self.state else { return };
+         state.sync_cursor_space();
++        #[cfg(target_arch = "wasm32")]
++        let event = match event {
++            WindowEvent::CursorMoved {
++                device_id,
++                position,
++            } => {
++                let Some(position) =
++                    crate::app::input::cursor::browser::absolute_motion(state, position)
++                else {
++                    return;
++                };
++                WindowEvent::CursorMoved {
++                    device_id,
++                    position,
++                }
++            }
++            event => event,
++        };
+         // Normalize Mac pointer delivery before status cards or any other
+         // early owner can consume a native echo of the relative mouse event.
+         #[cfg(target_os = "macos")]
+@@ -629,6 +750,13 @@ impl ApplicationHandler for App {
          if crate::app::frontend::status_screen::handle_event(state, &event, event_loop) {
              return;
          }
 +        if crate::app::browser_shell::handle_event(state, &event) {
 +            return;
 +        }
++        #[cfg(target_arch = "wasm32")]
++        if crate::app::ios_controls::handle_mouse_event(state, &event) {
++            return;
++        }
  
          match event {
              WindowEvent::CloseRequested => {
-@@ -1463,7 +1541,20 @@ impl ApplicationHandler for App {
+@@ -647,7 +775,7 @@ impl ApplicationHandler for App {
+                 event_loop.exit();
+             }
+             WindowEvent::Resized(size) => {
+-                #[cfg(any(target_os = "ios", target_os = "android"))]
++                #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+                 crate::app::ios_controls::reset(state);
+                 // A zero dimension is how Windows reports a minimise — that
+                 // backend never sends `Occluded` — so the hidden flag is
+@@ -1463,7 +1591,20 @@ impl ApplicationHandler for App {
          }
      }
  
@@ -92278,7 +92641,7 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..c276be92dc54cf247f9f26a581fe77d4
          #[cfg(any(target_os = "ios", target_os = "android"))]
          if self.ios_suspended {
              event_loop.set_control_flow(ControlFlow::Wait);
-@@ -1547,6 +1638,20 @@ impl ApplicationHandler for App {
+@@ -1547,6 +1688,20 @@ impl ApplicationHandler for App {
                      event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                  }
              } else if state.platform.window_hidden {
@@ -92299,7 +92662,7 @@ index 9e00855dac5eacc0bfcb9201ee435fa1e38912b9..c276be92dc54cf247f9f26a581fe77d4
                  if Self::match_runs_while_hidden(state) {
                      // Minimised or fully covered, but the match is not frozen:
                      // keep the world and the audio service advancing without
-@@ -1577,32 +1682,6 @@ impl ApplicationHandler for App {
+@@ -1577,32 +1732,6 @@ impl ApplicationHandler for App {
              }
          }
      }
@@ -92359,7 +92722,7 @@ index 8e2291c31d44870d3ee4edc74be0b56e9930cb18..77ede3a8851ed5f33555e167b8e8414b
              state.platform.window.request_redraw();
          }
 diff --git a/src/app/initialize.rs b/src/app/initialize.rs
-index 7da5e35b9cd34674dc2c01c6d12f4f62b6ec5ab4..10d02ecc098ba54a934fa542dd241ff546435f5f 100644
+index 7da5e35b9cd34674dc2c01c6d12f4f62b6ec5ab4..d5196a82e8433d2b5e11e4ffb73828bfc40859b4 100644
 --- a/src/app/initialize.rs
 +++ b/src/app/initialize.rs
 @@ -152,6 +152,20 @@ fn apply_startup_audio_profile(
@@ -92504,8 +92867,304 @@ index 7da5e35b9cd34674dc2c01c6d12f4f62b6ec5ab4..10d02ecc098ba54a934fa542dd241ff5
                  external_launch: false,
                  external_launch_error: None,
                  screen: GameScreen::default(),
+@@ -834,9 +912,9 @@ impl App {
+             renderer: crate::app::renderer_state::RendererState {
+                 gpu,
+                 batch_renderer,
+-                #[cfg(any(target_os = "ios", target_os = "android"))]
++                #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+                 ios_hud: None,
+-                #[cfg(any(target_os = "ios", target_os = "android"))]
++                #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+                 ios_sidebar_art: None,
+                 fps_overlay,
+                 combat_light_renderer,
+@@ -879,7 +957,7 @@ impl App {
+         // even without a music device. The profile keeps native negative values
+         // for round-trip; physical output owners provide the safe gain clamp.
+         apply_startup_audio_profile(&state.persistence.options_profile, &mut state.audio);
+-        #[cfg(any(target_os = "ios", target_os = "android"))]
++        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+         crate::app::ios_controls::initialize(&mut state);
+         Self::sync_zoom_pass(&mut state);
+         #[cfg(feature = "telemetry-dashboard")]
+diff --git a/src/app/input/browser_cursor.rs b/src/app/input/browser_cursor.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ead05c25fd143697e0f98d44103d4b0e83315d8
+--- /dev/null
++++ b/src/app/input/browser_cursor.rs
+@@ -0,0 +1,269 @@
++//! Pointer Lock keeps the OS pointer inside the browser while VERA retains its
++//! ordinary software cursor and edge-scroll hit tests. Winit already converts
++//! web movement deltas to physical pixels, so do not multiply them by DPR again.
++//! https://www.w3.org/TR/pointerlock-2/ (locked absolute coordinates are frozen).
++
++fn moved_position(
++    position: (f64, f64),
++    physical_delta: (f64, f64),
++    size: (u32, u32),
++) -> Option<(f64, f64)> {
++    if size.0 == 0
++        || size.1 == 0
++        || !position.0.is_finite()
++        || !position.1.is_finite()
++        || !physical_delta.0.is_finite()
++        || !physical_delta.1.is_finite()
++    {
++        return None;
++    }
++    Some((
++        (position.0 + physical_delta.0).clamp(0.0, f64::from(size.0 - 1)),
++        (position.1 + physical_delta.1).clamp(0.0, f64::from(size.1 - 1)),
++    ))
++}
++
++pub(crate) fn sensitivity_gain(percent: u32) -> Option<f64> {
++    (25..=400)
++        .contains(&percent)
++        .then_some(f64::from(percent) / 100.0)
++}
++
++#[cfg(target_arch = "wasm32")]
++mod web {
++    use std::cell::Cell;
++
++    use winit::dpi::PhysicalPosition;
++    use winit::platform::web::WindowExtWebSys;
++
++    use crate::app::{AppState, GameScreen};
++
++    thread_local! {
++        static FROM_RELATIVE: Cell<bool> = const { Cell::new(false) };
++        static CAPTURE_ALLOWED: Cell<bool> = const { Cell::new(false) };
++        static MOTION: Cell<MotionTotals> = const { Cell::new(MotionTotals::EMPTY) };
++        static RELATIVE_START: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
++    }
++
++    #[derive(Clone, Copy)]
++    struct MotionTotals {
++        samples: u64,
++        physical: (f64, f64),
++        applied: (f64, f64),
++    }
++
++    impl MotionTotals {
++        const EMPTY: Self = Self {
++            samples: 0,
++            physical: (0.0, 0.0),
++            applied: (0.0, 0.0),
++        };
++    }
++
++    fn accumulated(current: f64, delta: f64) -> f64 {
++        (current + delta).clamp(-1.0e12, 1.0e12)
++    }
++
++    pub(crate) fn gain(state: &AppState) -> f64 {
++        super::sensitivity_gain(state.persistence.options_profile.mouse_sensitivity_percent)
++            .unwrap_or(1.0)
++    }
++
++    /// Derived by the same app pass that owns menu transitions. The browser's
++    /// diagnostics getter can read it immediately without a second AppState
++    /// borrow or waiting for the low-frequency full diagnostic snapshot.
++    pub(crate) fn policy() -> bool {
++        CAPTURE_ALLOWED.with(Cell::get)
++    }
++
++    pub(crate) fn diagnostics(state: &AppState) -> serde_json::Value {
++        let totals = MOTION.with(Cell::get);
++        serde_json::json!({"gain": gain(state), "samples": totals.samples,
++            "physicalInput": {"x": totals.physical.0, "y": totals.physical.1},
++            "appliedWindowDelta": {"x": totals.applied.0, "y": totals.applied.1},
++            "windowScale": state.platform.window.scale_factor(),
++            "zoomScale": state.tactical_zoom().map_or(1.0, |zoom| zoom.scale())})
++    }
++
++    /// One gameplay-context owner for native input and the browser adapter.
++    /// Menus retain ordinary absolute input and must never trap the OS pointer.
++    pub(crate) fn eligible(state: &AppState) -> bool {
++        state.platform.cursor_confined
++            && !state.touch_input_mode()
++            && state.frontend.screen == GameScreen::InGame
++            && state.match_state.sim_runtime.is_some()
++            && !state.match_state.paused()
++            && !state.match_state.match_presentation.in_game_menu.is_open()
++            && !state.match_state.network_wait.dialog_open()
++            && !state.main_menu_dialog_open()
++            && !crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(state)
++            && state.match_state.input.ios_controls.editor.is_none()
++            && state.match_state.scenario_outcome.is_none()
++            && state.match_state.scenario_exit.is_none()
++            && state.platform.window_active
++            && !state.platform.window_hidden
++            && state.platform.capture_client_size.is_none()
++    }
++
++    fn locked(state: &AppState) -> bool {
++        let Some(document) = web_sys::window().and_then(|window| window.document()) else {
++            return false;
++        };
++        let Some(element) = document.pointer_lock_element() else {
++            return false;
++        };
++        state
++            .platform
++            .window
++            .canvas()
++            .is_some_and(|canvas| element.is_same_node(Some(canvas.as_ref())))
++    }
++
++    pub(crate) fn apply(state: &AppState) {
++        // The invisible JS adapter owns requests from trusted mouse gestures.
++        // Native policy releases on menu transitions; browser focus handling
++        // also releases. Observe actual ownership, never infer request success.
++        let allowed = eligible(state);
++        CAPTURE_ALLOWED.with(|policy| policy.set(allowed));
++        // Native menu changes precede the diagnostic snapshot consumed by JS.
++        // Release at this owner's next app pass instead of waiting for the
++        // browser's 250 ms diagnostic/100 ms adapter polling cadence.
++        if !allowed {
++            release(state);
++        } else {
++            state.platform.pointer_held.set(locked(state));
++        }
++    }
++
++    pub(crate) fn release(state: &AppState) {
++        CAPTURE_ALLOWED.with(|policy| policy.set(false));
++        state.platform.pointer_held.set(false);
++        if locked(state)
++            && let Some(document) = web_sys::window().and_then(|window| window.document())
++        {
++            document.exit_pointer_lock();
++        }
++    }
++
++    pub(crate) fn begin_relative(position: (f32, f32)) {
++        FROM_RELATIVE.with(|active| active.set(true));
++        RELATIVE_START
++            .with(|start| start.set(Some((f64::from(position.0), f64::from(position.1)))));
++    }
++
++    pub(crate) fn end_relative(position: (f32, f32)) {
++        FROM_RELATIVE.with(|active| active.set(false));
++        if let Some(start) = RELATIVE_START.with(|start| start.take()) {
++            let delta = (
++                f64::from(position.0) - start.0,
++                f64::from(position.1) - start.1,
++            );
++            if delta.0.is_finite() && delta.1.is_finite() {
++                MOTION.with(|motion| {
++                    let mut totals = motion.get();
++                    totals.applied.0 = accumulated(totals.applied.0, delta.0);
++                    totals.applied.1 = accumulated(totals.applied.1, delta.1);
++                    motion.set(totals);
++                });
++            }
++        }
++    }
++
++    pub(crate) fn raw_motion(state: &AppState, delta: (f64, f64)) -> Option<PhysicalPosition<f64>> {
++        apply(state);
++        if !state.platform.pointer_held.get() {
++            return None;
++        }
++        let (x, y) = state.window_cursor_position();
++        let size = state.platform.window.inner_size();
++        let gain = gain(state);
++        let point = super::moved_position(
++            (f64::from(x), f64::from(y)),
++            (delta.0 * gain, delta.1 * gain),
++            (size.width, size.height),
++        )?;
++        MOTION.with(|motion| {
++            let mut totals = motion.get();
++            totals.samples = totals.samples.saturating_add(1);
++            totals.physical.0 = accumulated(totals.physical.0, delta.0);
++            totals.physical.1 = accumulated(totals.physical.1, delta.1);
++            motion.set(totals);
++        });
++        Some(PhysicalPosition::new(point.0, point.1))
++    }
++
++    pub(crate) fn absolute_motion(
++        state: &AppState,
++        position: PhysicalPosition<f64>,
++    ) -> Option<PhysicalPosition<f64>> {
++        // Browser offsetX/Y remain at the lock anchor. Only our integrated
++        // relative event may update the existing window-pointer owner.
++        if !eligible(state) || !locked(state) || FROM_RELATIVE.with(Cell::get) {
++            Some(position)
++        } else {
++            None
++        }
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++pub(crate) use web::{
++    absolute_motion, apply, begin_relative, diagnostics, eligible, end_relative, gain, policy,
++    raw_motion, release,
++};
++
++#[cfg(test)]
++mod tests {
++    use super::moved_position;
++
++    #[test]
++    fn physical_web_delta_is_applied_once() {
++        assert_eq!(
++            moved_position((400.0, 300.0), (20.0, -10.0), (1600, 1200)),
++            Some((420.0, 290.0))
++        );
++    }
++
++    #[test]
++    fn pointer_reaches_exact_edge_pixels_and_can_move_back_inward() {
++        assert_eq!(
++            moved_position((400.0, 300.0), (-10000.0, -10000.0), (800, 600)),
++            Some((0.0, 0.0))
++        );
++        assert_eq!(
++            moved_position((0.0, 0.0), (1.0, 1.0), (800, 600)),
++            Some((1.0, 1.0))
++        );
++        assert_eq!(
++            moved_position((1.0, 1.0), (10000.0, 10000.0), (800, 600)),
++            Some((799.0, 599.0))
++        );
++    }
++
++    #[test]
++    fn unavailable_or_invalid_motion_never_poisons_cursor_state() {
++        for (position, delta, size) in [
++            ((0.0, 0.0), (1.0, 1.0), (0, 600)),
++            ((0.0, 0.0), (1.0, 1.0), (800, 0)),
++            ((f64::NAN, 0.0), (1.0, 1.0), (800, 600)),
++            ((0.0, 0.0), (f64::INFINITY, 1.0), (800, 600)),
++        ] {
++            assert_eq!(moved_position(position, delta, size), None);
++        }
++    }
++
++    #[test]
++    fn bounded_sensitivity_has_one_linear_factor_and_rejects_invalid_settings() {
++        for (percent, expected) in [(25, 0.25), (100, 1.0), (200, 2.0), (400, 4.0)] {
++            let gain = super::sensitivity_gain(percent).unwrap();
++            assert_eq!(gain, expected);
++            assert_eq!(
++                moved_position((500.0, 500.0), (20.0 * gain, -10.0 * gain), (1600, 1200)),
++                Some((500.0 + 20.0 * expected, 500.0 - 10.0 * expected))
++            );
++        }
++        for invalid in [0, 24, 401, u32::MAX] {
++            assert_eq!(super::sensitivity_gain(invalid), None);
++        }
++    }
++}
 diff --git a/src/app/input/camera.rs b/src/app/input/camera.rs
-index 0427397d8be9f3311efd5d3faabc508b92eedb17..73af7d4f081ea6e1f3cf532d90cb22df479bb113 100644
+index 0427397d8be9f3311efd5d3faabc508b92eedb17..05d300358ef5da79a4f1702e56fe31fa51ec8b31 100644
 --- a/src/app/input/camera.rs
 +++ b/src/app/input/camera.rs
 @@ -419,7 +419,7 @@ const OCTANT_DELTA: [(f32, f32); 8] = [
@@ -92526,6 +93185,44 @@ index 0427397d8be9f3311efd5d3faabc508b92eedb17..73af7d4f081ea6e1f3cf532d90cb22df
              coast_level: 0,
              octant: 0,
              last_coast_change: None,
+@@ -1204,6 +1204,10 @@ fn keyboard_scroll_distance(state: &AppState) -> f32 {
+ /// Main_Tick's keyboard requests run after logic (0x55DD42..0x55DD96), and
+ /// remain pending until the next Tactical__AI commit with that frame's mouse.
+ pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
++    #[cfg(target_arch = "wasm32")]
++    if crate::app::ios_controls::mouse_hud_captures_pointer(state) {
++        return;
++    }
+     if state
+         .match_state
+         .sim_runtime
+@@ -1260,7 +1264,11 @@ pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
+ pub(crate) fn poll_mouse_scroll(state: &mut AppState) -> (f32, f32) {
+     // A touch cursor stays at its last position after lifting. It must never
+     // keep mouse edge/coast scrolling alive behind the joystick/pan owner.
+-    if cfg!(any(target_os = "ios", target_os = "android")) {
++    if cfg!(any(target_os = "ios", target_os = "android")) || state.touch_input_mode() {
++        return (0.0, 0.0);
++    }
++    #[cfg(target_arch = "wasm32")]
++    if crate::app::ios_controls::mouse_hud_captures_pointer(state) {
+         return (0.0, 0.0);
+     }
+     if state
+@@ -1327,8 +1335,11 @@ pub(crate) fn poll_mouse_scroll(state: &mut AppState) -> (f32, f32) {
+     right_drag
+ }
+ 
+-#[cfg(any(target_os = "ios", target_os = "android", test))]
+-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
++#[cfg_attr(
++    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
++    allow(dead_code)
++)]
+ pub(crate) fn request_touch_scroll(state: &mut AppState, world_delta: (f32, f32)) {
+     if state
+         .match_state
 diff --git a/src/app/input/campaign_input.rs b/src/app/input/campaign_input.rs
 index c79fe918a7d770cf0e5b9e2465ddc6c802899390..6256a6087acb7b99d3251d6b7d993dfc725f5827 100644
 --- a/src/app/input/campaign_input.rs
@@ -92539,6 +93236,23 @@ index c79fe918a7d770cf0e5b9e2465ddc6c802899390..6256a6087acb7b99d3251d6b7d993dfc
              input.queued_order_mode = OrderMode::AttackMove;
  
              input.cancel_tactical_gesture_and_targeting();
+diff --git a/src/app/input/command_bar_input.rs b/src/app/input/command_bar_input.rs
+index 72d25cd62931099079afe823f26f5edb5c2c94df..f67df45f8b965af45996d925cfb5a227c9aee719 100644
+--- a/src/app/input/command_bar_input.rs
++++ b/src/app/input/command_bar_input.rs
+@@ -3,7 +3,11 @@
+ use super::*;
+ 
+ pub(super) fn sync(state: &mut AppState) {
+-    let layout = crate::app::presentation::sidebar_build::command_bar::layout_and_slots(state);
++    // The shared branded bar owns its own visible buttons. Retiring the old
++    // gadget rectangles also prevents clicks reaching controls behind it.
++    let layout = (!state.branded_hud_mode())
++        .then(|| crate::app::presentation::sidebar_build::command_bar::layout_and_slots(state))
++        .flatten();
+     let closed = state
+         .match_state
+         .match_presentation
 diff --git a/src/app/input/commands.rs b/src/app/input/commands.rs
 index 8c75a367cea90fd183ac209f3ebbb2a8fe433314..8c944166efecac419427fa34354a9b22511bd260 100644
 --- a/src/app/input/commands.rs
@@ -92632,7 +93346,7 @@ index 1b11634adf5fbedc6df2dbd52e4f942aeee331c2..ed26a44273bad5d27e023ca029e7f8db
          true
      };
 diff --git a/src/app/input/cursor.rs b/src/app/input/cursor.rs
-index 95a5114252a8b7f75dddc4ac5014969b204c09ae..b2bdfa8fb51d57980ca89fe2dbf61f08eac780e2 100644
+index 95a5114252a8b7f75dddc4ac5014969b204c09ae..b12567cad70c3d66c0c922f1085e6342638a6f13 100644
 --- a/src/app/input/cursor.rs
 +++ b/src/app/input/cursor.rs
 @@ -3,7 +3,7 @@
@@ -92644,18 +93358,25 @@ index 95a5114252a8b7f75dddc4ac5014969b204c09ae..b2bdfa8fb51d57980ca89fe2dbf61f08
  
  use crate::app::AppState;
  use crate::app::input::commands::preferred_local_owner_name;
-@@ -1830,6 +1830,15 @@ fn current_cursor_clip() -> Option<(i32, i32, i32, i32)> {
+@@ -19,6 +19,10 @@ use crate::sim::combat;
+ #[path = "macos_cursor.rs"]
+ pub(crate) mod macos;
+ 
++#[cfg(any(target_arch = "wasm32", test))]
++#[path = "browser_cursor.rs"]
++pub(crate) mod browser;
++
+ /// WWMouse's display depth, separate from Scenario's authoritative input
+ /// lock. Lock684240 hides only at depth0; Unlock684290 unwinds negative
+ /// depth only when the previous Scenario byte is1. Software presentation
+@@ -1830,6 +1834,11 @@ fn current_cursor_clip() -> Option<(i32, i32, i32, i32)> {
  }
  
  fn apply_cursor_confinement_impl(state: &AppState, verbose: bool) {
 +    #[cfg(target_arch = "wasm32")]
 +    {
-+        // Browser Pointer Lock is relative mouse input, not a Confined grab,
-+        // and needs an explicit user gesture. Keep the native absolute cursor
-+        // and the player's retained preference without retrying an unsupported
-+        // Confined request on every presentation frame.
 +        let _ = verbose;
-+        state.platform.pointer_held.set(false);
++        browser::apply(state);
 +    }
      #[cfg(target_os = "macos")]
      macos::apply(state, verbose);
@@ -92669,7 +93390,16 @@ index 95a5114252a8b7f75dddc4ac5014969b204c09ae..b2bdfa8fb51d57980ca89fe2dbf61f08
      {
          use winit::window::CursorGrabMode;
          let mode = if state.platform.cursor_confined {
-@@ -2000,7 +2009,7 @@ pub(crate) fn release_cursor_confinement(state: &AppState) {
+@@ -1990,6 +1999,8 @@ fn apply_cursor_confinement_impl(state: &AppState, verbose: bool) {
+ /// behaviour). Presentation-only.
+ pub(crate) fn release_cursor_confinement(state: &AppState) {
+     state.platform.pointer_held.set(false);
++    #[cfg(target_arch = "wasm32")]
++    browser::release(state);
+     #[cfg(target_os = "macos")]
+     macos::release(state);
+ 
+@@ -2000,7 +2011,7 @@ pub(crate) fn release_cursor_confinement(state: &AppState) {
              ClipCursor(std::ptr::null());
          }
      }
@@ -92694,10 +93424,22 @@ index e85879270cabc024993385a9fad540ca06001ca2..c60b4c104690f326aba2a333e18c2d43
          crate::sim::command::Command::Ally {
              house_index: index as i32,
 diff --git a/src/app/input/dispatch.rs b/src/app/input/dispatch.rs
-index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d83523581268 100644
+index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..a61211926bb2bdd5100a9e4805782bc364c66ae0 100644
 --- a/src/app/input/dispatch.rs
 +++ b/src/app/input/dispatch.rs
-@@ -1490,7 +1490,7 @@ pub(crate) fn handle_type_select_key_edge(
+@@ -63,7 +63,11 @@ pub(crate) fn handle_mouse_input(
+     button: MouseButton,
+     btn_state: ElementState,
+ ) {
++    #[cfg(target_arch = "wasm32")]
++    let mouse_force = crate::app::ios_controls::begin_mouse_input(state, button);
+     handle_mouse_input_inner(state, button, btn_state);
++    #[cfg(target_arch = "wasm32")]
++    crate::app::ios_controls::end_mouse_input(state, button, btn_state, mouse_force);
+     super::commands::reconcile_paid_super_weapon_cursor(state);
+ }
+ 
+@@ -1490,7 +1494,7 @@ pub(crate) fn handle_type_select_key_edge(
              .match_state
              .input
              .type_select
@@ -92706,7 +93448,7 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
          return true;
      }
      if !is_type_select && !state.match_state.input.type_select.owns_key(physical_code) {
-@@ -1500,7 +1500,7 @@ pub(crate) fn handle_type_select_key_edge(
+@@ -1500,7 +1504,7 @@ pub(crate) fn handle_type_select_key_edge(
          .match_state
          .input
          .type_select
@@ -92715,7 +93457,7 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
      if execute_tap {
          execute_type_select_tap(state);
      }
-@@ -1737,7 +1737,7 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
+@@ -1737,7 +1741,7 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
                  .match_presentation
                  .minimap
                  .as_mut()
@@ -92724,7 +93466,22 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
              if let Some((rx, ry)) = event {
                  crate::app::input::camera::center_camera_on_cell(state, rx, ry);
              }
-@@ -3123,7 +3123,7 @@ fn control_group_press_action(
+@@ -2043,12 +2047,12 @@ pub(crate) fn is_ctrl_held(state: &AppState) -> bool {
+ }
+ 
+ fn touch_order_modifiers(state: &AppState) -> (bool, bool) {
+-    #[cfg(any(target_os = "ios", target_os = "android", test))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+     {
+         let controls = &state.match_state.input.ios_controls;
+         controls.order_modifiers()
+     }
+-    #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
++    #[cfg(not(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test)))]
+     {
+         let _ = state;
+         (false, false)
+@@ -3123,7 +3127,7 @@ fn control_group_press_action(
      slot: usize,
      group: &[u64],
      selected: &[u64],
@@ -92733,7 +93490,7 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
  ) -> Option<GroupPressAction> {
      if modifiers.only_ctrl() {
          return Some(GroupPressAction::Assign);
-@@ -3155,7 +3155,7 @@ fn control_group_action_for_input(
+@@ -3155,7 +3159,7 @@ fn control_group_action_for_input(
      slot: usize,
      group: &[u64],
      selected: &[u64],
@@ -92742,7 +93499,7 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
      sim: Option<&crate::sim::world::Simulation>,
  ) -> Option<GroupPressAction> {
      let eligible_selected = live_group_members(sim, selected);
-@@ -3382,7 +3382,7 @@ fn handle_control_group_command(
+@@ -3382,7 +3386,7 @@ fn handle_control_group_command(
              // A recall on an empty group still clears the selection: the
              // deselect-all runs before the select loop, unconditionally.
              state.match_state.input.last_control_group_press =
@@ -92751,7 +93508,7 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
              queue_selection_snapshot_command(state, live_group, false);
              apply_selection_action_line_policy(state, ORDINARY_SELECTION_ACTION_LINE_POLICY);
          }
-@@ -3866,7 +3866,7 @@ mod control_group_tests {
+@@ -3866,7 +3870,7 @@ mod control_group_tests {
          clear_control_group, control_group_action_for_input, control_group_press_action,
          live_group_members, reassign_control_group, trimmed_centroid_leptons,
      };
@@ -92760,6 +93517,207 @@ index 6b12ca47ddae33071d9401ff5c8ac1d98e4f6d8a..e91cff4d83751d8f3d858aab6a78d835
  
      fn mods(shift: bool, ctrl: bool, alt: bool) -> KeyModifiers {
          KeyModifiers { shift, ctrl, alt }
+diff --git a/src/app/input/in_game_options.rs b/src/app/input/in_game_options.rs
+index 096c7c87064db8141300487d94426e27d1f3b64f..892bbcebe9b64c5f27550e4e5c44047e1c11a085 100644
+--- a/src/app/input/in_game_options.rs
++++ b/src/app/input/in_game_options.rs
+@@ -19,8 +19,9 @@ use crate::app::AppState;
+ use crate::ui::shell::descriptor::ControlKind;
+ use crate::ui::shell::in_game_options::{build_in_game_options_descriptor, control, control_shown};
+ use crate::ui::shell::in_game_options_state::{
+-    InGameOptionsState, OPTIONS_SPEED_MAX, OPTIONS_SPEED_MIN, plain_trackbar_thumb_left,
+-    speed_from_slider_pos, speed_slider_pos, trackbar_pos_from_mouse_x,
++    InGameOptionsState, MOUSE_SENSITIVITY_STOPS, OPTIONS_SPEED_MAX, OPTIONS_SPEED_MIN,
++    mouse_sensitivity_from_slider_pos, mouse_sensitivity_slider_pos, mouse_sensitivity_thumb_left,
++    plain_trackbar_thumb_left, speed_from_slider_pos, speed_slider_pos, trackbar_pos_from_mouse_x,
+ };
+ use crate::ui::shell::layout::{LaidOutControl, layout_pass_in_game_options};
+ use crate::ui::shell::trackbar::admits_press_y;
+@@ -46,8 +47,17 @@ pub(crate) fn in_game_options_hit(
+     cursor: (i32, i32),
+     game_speed_hidden: bool,
+ ) -> OptionsHit {
+-    let (cx, cy) = cursor;
+     let desc = build_in_game_options_descriptor();
++    in_game_options_hit_with_descriptor(&desc, laid, cursor, game_speed_hidden)
++}
++
++fn in_game_options_hit_with_descriptor(
++    desc: &crate::ui::shell::descriptor::DialogDescriptor,
++    laid: &[LaidOutControl],
++    cursor: (i32, i32),
++    game_speed_hidden: bool,
++) -> OptionsHit {
++    let (cx, cy) = cursor;
+     for (c, l) in desc.controls.iter().zip(laid.iter()) {
+         if !control_shown(c, game_speed_hidden) || !l.rect.contains(cx, cy) {
+             continue;
+@@ -62,7 +72,7 @@ pub(crate) fn in_game_options_hit(
+                 let pos = trackbar_pos_from_mouse_x(
+                     cx,
+                     OPTIONS_SPEED_MIN as i32,
+-                    OPTIONS_SPEED_MAX as i32,
++                    slider_max(c.id),
+                     l.rect,
+                 );
+                 return OptionsHit::Slider(c.id, pos);
+@@ -199,6 +209,14 @@ pub(crate) fn in_game_options_mouse(state: &mut AppState, button: MouseButton, p
+                 crate::ui::shell::keyboard::KeyboardParent::GameControls,
+             ),
+             Some(control::BACK) => crate::app::App::route_in_game_menu_escape(state),
++            Some(control::MOUSE_SENSITIVITY_RESET) => {
++                state
++                    .match_state
++                    .match_presentation
++                    .in_game_options
++                    .reset_mouse_sensitivity();
++                state.platform.window.request_redraw();
++            }
+             _ => {}
+         }
+     }
+@@ -235,8 +253,7 @@ pub(crate) fn in_game_options_drag(state: &mut AppState) {
+     let Some(rect) = laid.iter().find(|l| l.id == id).map(|l| l.rect) else {
+         return;
+     };
+-    let pos =
+-        trackbar_pos_from_mouse_x(x, OPTIONS_SPEED_MIN as i32, OPTIONS_SPEED_MAX as i32, rect);
++    let pos = trackbar_pos_from_mouse_x(x, OPTIONS_SPEED_MIN as i32, slider_max(id), rect);
+     if store_slider_value(
+         &mut state.match_state.match_presentation.in_game_options,
+         id,
+@@ -253,24 +270,35 @@ fn begin_slider_press(opts: &mut InGameOptionsState, id: u16, rect: RectPx, cx:
+     let internal = match id {
+         control::GAME_SPEED => opts.game_speed,
+         control::SCROLL_RATE => opts.scroll_rate,
++        control::MOUSE_SENSITIVITY => mouse_sensitivity_slider_pos(opts.mouse_sensitivity_percent),
+         _ => return false,
+     };
+-    let left = rect.x + plain_trackbar_thumb_left(speed_slider_pos(internal), rect);
++    let left = rect.x
++        + if id == control::MOUSE_SENSITIVITY {
++            mouse_sensitivity_thumb_left(opts.mouse_sensitivity_percent, rect)
++        } else {
++            plain_trackbar_thumb_left(speed_slider_pos(internal), rect)
++        };
+     if (left..left + 12).contains(&cx) {
+         opts.dragging_slider = Some(id);
+         return false;
+     }
+-    let pos = trackbar_pos_from_mouse_x(cx, 0, OPTIONS_SPEED_MAX as i32, rect);
++    let pos = trackbar_pos_from_mouse_x(cx, 0, slider_max(id), rect);
+     store_slider_value(opts, id, pos)
+ }
+ 
+ /// Store a slider's new internal value from a slider position (`6 - pos`). Render
+ /// reads the stored value to draw the thumb + value label; no effect applies here.
+ fn store_slider_value(opts: &mut InGameOptionsState, id: u16, pos: i32) -> bool {
+-    let value = speed_from_slider_pos(pos.max(0) as u32);
++    let value = if id == control::MOUSE_SENSITIVITY {
++        mouse_sensitivity_from_slider_pos(pos.max(0) as u32)
++    } else {
++        speed_from_slider_pos(pos.max(0) as u32)
++    };
+     let stored = match id {
+         control::GAME_SPEED => &mut opts.game_speed,
+         control::SCROLL_RATE => &mut opts.scroll_rate,
++        control::MOUSE_SENSITIVITY => &mut opts.mouse_sensitivity_percent,
+         _ => return false,
+     };
+     if *stored == value {
+@@ -280,6 +308,14 @@ fn store_slider_value(opts: &mut InGameOptionsState, id: u16, pos: i32) -> bool
+     true
+ }
+ 
++fn slider_max(id: u16) -> i32 {
++    if id == control::MOUSE_SENSITIVITY {
++        MOUSE_SENSITIVITY_STOPS as i32
++    } else {
++        OPTIONS_SPEED_MAX as i32
++    }
++}
++
+ /// Toggle a checkbox's stored bool (the rendered check state only — the downstream
+ /// effect applies on close, KD-8).
+ fn toggle_checkbox(opts: &mut InGameOptionsState, id: u16) {
+@@ -294,6 +330,77 @@ fn toggle_checkbox(opts: &mut InGameOptionsState, id: u16) {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn web_sensitivity_hit_drag_and_reset_never_change_scroll_or_game_speed() {
++        let desc =
++            crate::ui::shell::in_game_options::build_in_game_options_descriptor_for_web(true);
++        let anchor = crate::ui::shell::layout::InGameOptionsAnchor {
++            button_canvas_w: 125,
++            button_canvas_h: 25,
++            button_stack_top_y: 200,
++            back_button_y: 540,
++        };
++        let laid = layout_pass_in_game_options(&desc, 800, 600, anchor);
++        let rail = laid
++            .iter()
++            .find(|control| control.id == control::MOUSE_SENSITIVITY)
++            .unwrap()
++            .rect;
++        let mut options = InGameOptionsState {
++            scroll_rate: 5,
++            game_speed: 2,
++            ..Default::default()
++        };
++        assert_eq!(
++            in_game_options_hit_with_descriptor(
++                &desc,
++                &laid,
++                (rail.x + rail.w - 1, rail.y + rail.h - 1),
++                true
++            ),
++            OptionsHit::Slider(control::MOUSE_SENSITIVITY, MOUSE_SENSITIVITY_STOPS as i32)
++        );
++        let thumb = rail.x + mouse_sensitivity_thumb_left(100, rail);
++        assert!(!begin_slider_press(
++            &mut options,
++            control::MOUSE_SENSITIVITY,
++            rail,
++            thumb + 1
++        ));
++        assert_eq!(options.dragging_slider, Some(control::MOUSE_SENSITIVITY));
++        assert!(store_slider_value(
++            &mut options,
++            control::MOUSE_SENSITIVITY,
++            75
++        ));
++        assert_eq!(options.mouse_sensitivity_percent, 400);
++        assert!(store_slider_value(
++            &mut options,
++            control::MOUSE_SENSITIVITY,
++            0
++        ));
++        assert_eq!(options.mouse_sensitivity_percent, 25);
++        options.reset_mouse_sensitivity();
++        assert_eq!(
++            (
++                options.mouse_sensitivity_percent,
++                options.scroll_rate,
++                options.game_speed
++            ),
++            (100, 5, 2)
++        );
++        let reset = laid
++            .iter()
++            .find(|control| control.id == control::MOUSE_SENSITIVITY_RESET)
++            .unwrap()
++            .rect;
++        assert!(reset.y >= rail.y + rail.h);
++        assert_eq!(
++            in_game_options_hit_with_descriptor(&desc, &laid, (reset.x + 2, reset.y + 2), false),
++            OptionsHit::Button(control::MOUSE_SENSITIVITY_RESET)
++        );
++    }
+     use crate::ui::shell::layout::InGameOptionsAnchor;
+ 
+     fn test_laid() -> Vec<LaidOutControl> {
 diff --git a/src/app/input/keyboard.rs b/src/app/input/keyboard.rs
 index 309df5797c2fa350e81fd03283528f19a4256fd8..9dcbed05ea956cc1a0f591434b0797393f3a2ab4 100644
 --- a/src/app/input/keyboard.rs
@@ -92897,6 +93855,86 @@ index 8dc7fec5291d92aa4a3926d2f2d22578bde54a10..45cdd5356cbee6edc2c39d5c890d5a2d
      }
  }
  
+diff --git a/src/app/input/pointer_resolution_tests.rs b/src/app/input/pointer_resolution_tests.rs
+index 90b307e59b6feafcf15540f9f9d1f3d2db744458..78b55360ad5c484d065847e3cee41ab74cd610ae 100644
+--- a/src/app/input/pointer_resolution_tests.rs
++++ b/src/app/input/pointer_resolution_tests.rs
+@@ -130,3 +130,75 @@ fn capture_only_source_input_keeps_the_rendered_transition_fallback() {
+     input.sync_cursor_space(None);
+     assert_eq!((input.cursor_x, input.cursor_y), (400.0, 300.0));
+ }
++
++#[test]
++fn browser_integrated_motion_starts_a_fresh_projection_after_letterbox_clamps() {
++    for (width, height, percent, axis) in [
++        (1600, 900, 100, 0),
++        (3200, 1800, 200, 0),
++        (4800, 2700, 300, 0),
++        (600, 1000, 100, 1),
++        (1200, 2000, 200, 1),
++    ] {
++        let zoom = ZoomGeometry::new(width, height, percent, FrameShape::Original);
++        let mut input = input();
++        let start = if axis == 0 {
++            (0.0, 100.0)
++        } else {
++            (100.0, 0.0)
++        };
++        let physical = zoom.source_to_window(start.0, start.1);
++        input.set_cursor_from_window(physical, Some(zoom), true);
++        // This is the WASM DeviceEvent route: the visible window cursor has
++        // already integrated the physical movement. It must not be reduced a
++        // second time against the previous off-frame candidate.
++        for (source_delta, expected) in [(-10.0, 0.0), (1.0, 1.0), (1.0, 2.0)] {
++            let visible = zoom.source_to_window(input.cursor_x, input.cursor_y);
++            let delta = source_delta * zoom.scale();
++            let candidate = if axis == 0 {
++                (visible.0 + delta, visible.1)
++            } else {
++                (visible.0, visible.1 + delta)
++            };
++            input.reset_window_cursor_motion();
++            input.set_cursor_from_window(candidate, Some(zoom), true);
++            let actual = if axis == 0 {
++                input.cursor_x
++            } else {
++                input.cursor_y
++            };
++            assert_eq!(
++                actual, expected,
++                "{width}x{height}, zoom {percent}%, axis {axis}"
++            );
++        }
++    }
++}
++
++#[test]
++fn browser_physical_delta_gain_and_tactical_zoom_are_each_applied_once() {
++    for dpr in [1, 2, 3] {
++        let zoom = ZoomGeometry::new(1600 * dpr, 900 * dpr, 100 * dpr, FrameShape::Original);
++        for percent in [25, 100, 200, 400] {
++            let gain =
++                crate::app::input::cursor::browser::sensitivity_gain(percent).unwrap() as f32;
++            let mut input = input();
++            let start = zoom.source_to_window(100.0, 100.0);
++            input.set_cursor_from_window(start, Some(zoom), true);
++            // Winit already normalized this device motion to window pixels.
++            // One DPI-scaled physical move appears as 30/20 source pixels at
++            // a matching tactical zoom; no extra DPI factor belongs here.
++            let candidate = (
++                start.0 + 30.0 * dpr as f32 * gain,
++                start.1 + 20.0 * dpr as f32 * gain,
++            );
++            input.reset_window_cursor_motion();
++            input.set_cursor_from_window(candidate, Some(zoom), true);
++            assert_eq!(
++                (input.cursor_x, input.cursor_y),
++                (100.0 + 30.0 * gain, 100.0 + 20.0 * gain),
++                "DPR {dpr}, sensitivity {percent}%"
++            );
++        }
++    }
++}
 diff --git a/src/app/input/saved_local_view_tests.rs b/src/app/input/saved_local_view_tests.rs
 index 0e19ffd52b26305d3b552915c847f8a7265fa554..1951afd8d9fe5ad25c15ada07e899cf4a404ce58 100644
 --- a/src/app/input/saved_local_view_tests.rs
@@ -92937,9 +93975,18 @@ index bda0253dcb7f7a04d443a3959e1e86c9dc368c66..675eece863646356c5183959d8df7046
  
  fn channel(id: SoundSlider) -> AudioVolume {
 diff --git a/src/app/input/state.rs b/src/app/input/state.rs
-index fe9cb3d8c784091e99bbc474316d351c6050b220..3b0c63390ed221ef2ffc196b07462fa80882df49 100644
+index fe9cb3d8c784091e99bbc474316d351c6050b220..58001c52783b10d3169a09d3f5d1dd94bffe2f58 100644
 --- a/src/app/input/state.rs
 +++ b/src/app/input/state.rs
+@@ -216,7 +216,7 @@ pub(crate) struct MatchInputState {
+     pub(crate) keys_held: HashSet<KeyCode>,
+     pub(crate) hotkey_bindings: crate::app::input::hotkeys::HotkeyBindings,
+     pub(crate) hotkey_modifiers: ModifiersState,
+-    #[cfg(any(target_os = "ios", target_os = "android", test))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+     pub(crate) ios_controls: crate::app::ios_controls::IosControls,
+     /// Local AllToCheer730F30 admission scalar84555C. The simulation owns
+     /// queued events; this frame only throttles their local input producer.
 @@ -250,7 +250,7 @@ pub(crate) struct MatchInputState {
      /// the 800 ms double-tap that centres the camera. Wall clock, never sim
      /// state: the original stamps `timeGetTime()` here and only a recall writes
@@ -92949,6 +93996,15 @@ index fe9cb3d8c784091e99bbc474316d351c6050b220..3b0c63390ed221ef2ffc196b07462fa8
      /// The object the camera is following, i.e. `DisplayClass +0x11A0` behind
      /// its valid byte `+0x119C`. `None` is the cleared pair.
      pub(crate) follow_target: Option<u64>,
+@@ -356,7 +356,7 @@ impl MatchInputState {
+             keys_held: HashSet::new(),
+             hotkey_bindings,
+             hotkey_modifiers: ModifiersState::empty(),
+-            #[cfg(any(target_os = "ios", target_os = "android", test))]
++            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+             ios_controls: Default::default(),
+             last_cheer_frame: -100,
+             type_select: crate::app::types::TypeSelectInputState::default(),
 diff --git a/src/app/ios_battle_touch.rs b/src/app/ios_battle_touch.rs
 index 56bf08b22bb03d2b0fc6443b9a6d920c5ce6ce98..de2b86774062ee319bba699754a25b70128e17f1 100644
 --- a/src/app/ios_battle_touch.rs
@@ -92963,18 +94019,658 @@ index 56bf08b22bb03d2b0fc6443b9a6d920c5ce6ce98..de2b86774062ee319bba699754a25b70
  use winit::event::{DeviceId, Touch, TouchPhase};
  
 diff --git a/src/app/ios_controls.rs b/src/app/ios_controls.rs
-index 4b7f8b1038e23aaba115822c011ab1184d5ab573..b6bf86556c68b7483b8ed90185e4da13deba95c6 100644
+index 4b7f8b1038e23aaba115822c011ab1184d5ab573..734a76f7367228f5e77e5d307a00dc562699e373 100644
 --- a/src/app/ios_controls.rs
 +++ b/src/app/ios_controls.rs
-@@ -2,7 +2,7 @@
+@@ -2,8 +2,8 @@
  //! gameplay remains owned by the existing pointer, hotkey and camera dispatch.
  
  use std::path::Path;
 -use std::time::Instant;
+-use winit::event::{ElementState, MouseButton, Touch};
 +use web_time::Instant;
- use winit::event::{ElementState, MouseButton, Touch};
++use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
  
  use super::input::{
+     camera, dispatch,
+@@ -15,6 +15,9 @@ use super::{App, AppState, GameScreen};
+ 
+ const PREFERENCES_FILE: &str = "touch-shortcuts.json";
+ 
++#[path = "ios_mouse_hud.rs"]
++mod mouse_hud;
++
+ #[derive(Default)]
+ pub(crate) struct IosControls {
+     pub(super) touch: BattleTouch,
+@@ -28,10 +31,16 @@ pub(crate) struct IosControls {
+     native_ui_pointer: Option<MouseButton>,
+     pub(super) show_tags: bool,
+     pub(super) save_failed: bool,
++    mouse_hud: mouse_hud::MouseHudPointer,
++    pub(super) mouse_force_armed: bool,
+     last_service: Option<Instant>,
+ }
+ 
+ impl IosControls {
++    pub(super) fn mouse_pressed(&self, command: Shortcut) -> bool {
++        self.mouse_hud.is_pressed(command)
++    }
++
+     pub(super) fn order_modifiers(&self) -> (bool, bool) {
+         // Target-mode fingers only modify battlefield orders. In particular,
+         // AttackMove's virtual Shift must not batch-produce sidebar cameos.
+@@ -80,7 +89,16 @@ pub(crate) fn initialize(state: &mut AppState) {
+ }
+ 
+ pub(crate) fn enabled(state: &AppState) -> bool {
+-    state.frontend.screen == GameScreen::InGame
++    #[cfg(target_arch = "wasm32")]
++    if !state.touch_input_mode() {
++        return false;
++    }
++    hud_enabled(state)
++}
++
++pub(crate) fn hud_enabled(state: &AppState) -> bool {
++    (state.branded_hud_mode() || cfg!(any(target_os = "ios", target_os = "android")))
++        && state.frontend.screen == GameScreen::InGame
+         && !state.match_state.paused()
+         && !state.match_state.match_presentation.in_game_menu.is_open()
+         && state.frontend.keyboard_dialog.is_none()
+@@ -98,14 +116,189 @@ pub(crate) fn layout(state: &AppState) -> LandscapeLayout {
+         zoom.source_to_window(column_left, 0.0).0
+     });
+     let controls = &state.match_state.input.ios_controls;
+-    LandscapeLayout::new(
++    let mut layout = LandscapeLayout::for_input(
+         width,
+         height,
+         state.platform.window.scale_factor() as f32,
+         (width - window_left).max(0.0),
+         &controls.prefs,
+         controls.editor.as_ref(),
+-    )
++        state.touch_input_mode() || cfg!(any(target_os = "ios", target_os = "android")),
++    );
++    if !state.touch_input_mode() {
++        for button in &mut layout.buttons {
++            button.selected |= match button.command {
++                Shortcut::ForceAttack => controls.mouse_force_armed,
++                Shortcut::AttackMove => {
++                    state.match_state.input.queued_order_mode == super::types::OrderMode::AttackMove
++                }
++                _ => false,
++            };
++        }
++    }
++    layout
++}
++
++/// The map mouse is unchanged. Only presses belonging to this bar/editor are
++/// captured, and releases outside those buttons cannot leak a world order.
++pub(crate) fn handle_mouse_event(state: &mut AppState, event: &WindowEvent) -> bool {
++    if !state.branded_hud_mode() || state.touch_input_mode() || !hud_enabled(state) {
++        return false;
++    }
++    let layout = layout(state);
++    let point = match event {
++        WindowEvent::CursorMoved { position, .. } => [position.x as f32, position.y as f32],
++        _ => {
++            let (x, y) = state.window_cursor_position();
++            [x, y]
++        }
++    };
++    let editor = state.match_state.input.ios_controls.editor.is_some();
++    let phase = match event {
++        WindowEvent::CursorMoved { .. } => Some(TouchPhase::Moved),
++        WindowEvent::MouseInput {
++            button: MouseButton::Left,
++            state,
++            ..
++        } => Some(if state.is_pressed() {
++            TouchPhase::Started
++        } else {
++            TouchPhase::Ended
++        }),
++        WindowEvent::KeyboardInput { event, .. } if editor => {
++            // Keep the ordinary release owner live: it clears keyboard-scroll
++            // keys (including keypad aliases) and releases an admitted planning
++            // gesture. Consuming those edges here would leave input latched.
++            if !event.state.is_pressed() {
++                return false;
++            }
++            if event.state.is_pressed()
++                && event.logical_key
++                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
++            {
++                state.match_state.input.ios_controls.editor = None;
++                reset(state);
++                state.platform.window.request_redraw();
++            }
++            return true;
++        }
++        WindowEvent::MouseInput {
++            button: MouseButton::Right,
++            state: edge,
++            ..
++        } if editor => {
++            if edge.is_pressed() {
++                state.match_state.input.ios_controls.editor = None;
++                reset(state);
++                state.platform.window.request_redraw();
++            }
++            return true;
++        }
++        WindowEvent::MouseInput { .. } => {
++            if mouse_hud::covers(&layout, point) {
++                App::release_in_game_pointer_state(state);
++                return true;
++            }
++            return false;
++        }
++        WindowEvent::MouseWheel { .. } => {
++            return mouse_hud::covers(&layout, point);
++        }
++        _ => None,
++    };
++    let Some(phase) = phase else {
++        return false;
++    };
++    let result = state.match_state.input.ios_controls.mouse_hud.handle(
++        phase,
++        point,
++        Instant::now(),
++        &layout,
++    );
++    if result.consumed && matches!(phase, TouchPhase::Started | TouchPhase::Ended) {
++        App::release_in_game_pointer_state(state);
++    }
++    if let Some((command, held_long)) = result.shortcut {
++        match command {
++            Shortcut::ForceAttack => {
++                state.match_state.input.ios_controls.mouse_force_armed ^= true;
++            }
++            Shortcut::AttackMove => dispatch::dispatch_command_bar(state, 5, false),
++            _ => shortcut(state, command, held_long),
++        }
++    }
++    if result.consumed || editor {
++        if phase == TouchPhase::Moved {
++            state.set_cursor_from_window(point[0], point[1]);
++        }
++        state.platform.window.request_redraw();
++        return true;
++    }
++    false
++}
++
++pub(crate) fn mouse_hud_covers_pointer(state: &AppState) -> bool {
++    if !state.branded_hud_mode() || state.touch_input_mode() || !hud_enabled(state) {
++        return false;
++    }
++    let point = state.window_cursor_position();
++    mouse_hud::covers(&layout(state), [point.0, point.1])
++}
++
++/// Hover is presentation only. All outer edges, including the footer's bottom
++/// edge, keep scrolling until a real bar press or the editor owns the gesture.
++pub(crate) fn mouse_hud_captures_pointer(state: &AppState) -> bool {
++    state.branded_hud_mode()
++        && !state.touch_input_mode()
++        && hud_enabled(state)
++        && (state.match_state.input.ios_controls.editor.is_some()
++            || state.match_state.input.ios_controls.mouse_hud.is_active())
++}
++
++/// Scope the existing Ctrl-click semantics to the next desktop world click.
++/// Neither real modifier keys nor sidebar production state are altered.
++pub(crate) fn begin_mouse_input(
++    state: &mut AppState,
++    button: MouseButton,
++) -> Option<(bool, bool, bool)> {
++    if !state.branded_hud_mode()
++        || state.touch_input_mode()
++        || button != MouseButton::Left
++        || !state.match_state.input.ios_controls.mouse_force_armed
++    {
++        return None;
++    }
++    let point = state.window_cursor_position();
++    if !layout(state).touch.world.contains([point.0, point.1]) {
++        return None;
++    }
++    let controls = &mut state.match_state.input.ios_controls;
++    let previous = (
++        controls.force_click,
++        controls.attack_move_click,
++        controls.click_in_progress,
++    );
++    controls.force_click = true;
++    controls.attack_move_click = false;
++    controls.click_in_progress = true;
++    Some(previous)
++}
++
++pub(crate) fn end_mouse_input(
++    state: &mut AppState,
++    button: MouseButton,
++    edge: ElementState,
++    previous: Option<(bool, bool, bool)>,
++) {
++    let controls = &mut state.match_state.input.ios_controls;
++    if let Some((force, attack, clicking)) = previous {
++        controls.force_click = force;
++        controls.attack_move_click = attack;
++        controls.click_in_progress = clicking;
++    }
++    if !edge.is_pressed() && matches!(button, MouseButton::Left | MouseButton::Right) {
++        controls.mouse_force_armed = false;
++    }
+ }
+ 
+ /// A lost gesture is aborted, never released onto the current world target.
+@@ -113,6 +306,8 @@ pub(crate) fn reset(state: &mut AppState) {
+     let controls = &mut state.match_state.input.ios_controls;
+     let captured = controls.touch.is_interacting();
+     controls.touch.reset();
++    controls.mouse_hud.reset();
++    controls.mouse_force_armed = false;
+     controls.force_click = false;
+     controls.attack_move_click = false;
+     controls.click_in_progress = false;
+@@ -222,10 +417,13 @@ fn pan_delta_to_world(
+ /// WERHD's full-stick rate is 30 canvas pixels per 60 Hz frame. Wall-clock
+ /// integration here keeps that speed independent of display refresh rate.
+ pub(crate) fn service(state: &mut AppState) {
+-    if !enabled(state) {
++    if !hud_enabled(state) {
+         reset(state);
+         return;
+     }
++    if !state.touch_input_mode() && !cfg!(any(target_os = "ios", target_os = "android")) {
++        return;
++    }
+     let controls = &mut state.match_state.input.ios_controls;
+     let now = Instant::now();
+     let dt = controls
+@@ -246,6 +444,8 @@ fn shortcut(state: &mut AppState, command: Shortcut, held_long: bool) {
+         let controls = &mut state.match_state.input.ios_controls;
+         controls.editor = Some(ShortcutEditor::new(&controls.prefs));
+         controls.save_failed = false;
++        state.match_state.input.clear_command_latches();
++        App::release_in_game_pointer_state(state);
+         reset(state);
+         return;
+     }
+@@ -317,6 +517,7 @@ fn shortcut(state: &mut AppState, command: Shortcut, held_long: bool) {
+             return;
+         }
+         Shortcut::Cancel => {
++            state.match_state.input.ios_controls.mouse_force_armed = false;
+             dispatch::right_click_cancel_ladder(state);
+             return;
+         }
+diff --git a/src/app/ios_hud_render.rs b/src/app/ios_hud_render.rs
+index fd05a58e03c5859ab446709d6ba0df7d634f53bf..b5180b21276b7ee219e8bc4b1ef8581f6550a962 100644
+--- a/src/app/ios_hud_render.rs
++++ b/src/app/ios_hud_render.rs
+@@ -53,7 +53,7 @@ pub(super) fn render(
+     encoder: &mut wgpu::CommandEncoder,
+     view: &wgpu::TextureView,
+ ) {
+-    if !super::ios_controls::enabled(state) {
++    if !super::ios_controls::hud_enabled(state) {
+         return;
+     }
+     let layout = super::ios_controls::layout(state);
+@@ -63,8 +63,27 @@ pub(super) fn render(
+         state.renderer.gpu.config.width as f32,
+         state.renderer.gpu.config.height as f32,
+     ];
+-    let sprites = prepare(&layout, size, &controls.touch, controls.save_failed, theme);
++    let sprites = prepare(&layout, size, controls, controls.save_failed, theme);
+     let tags = super::ios_unit_tags::build(state);
++    // The bar is composed after the zoomed match. Reuse the existing cursor
++    // instances above this final layer so desktop clicks retain a visible
++    // pointer even while Pointer Lock hides the operating-system cursor.
++    let mut cursor = if super::ios_controls::mouse_hud_covers_pointer(state) {
++        super::presentation::ui_overlays::build_software_cursor_instances(state)
++    } else {
++        Vec::new()
++    };
++    for instance in &mut cursor {
++        let source = (
++            instance.position[0] - state.match_state.input.camera_x,
++            instance.position[1] - state.match_state.input.camera_y,
++        );
++        let zoom = state.tactical_zoom();
++        let position = zoom.map_or(source, |zoom| zoom.source_to_window(source.0, source.1));
++        instance.position = [position.0, position.1];
++        let scale = zoom.map_or(1.0, |zoom| zoom.scale());
++        instance.size = [instance.size[0] * scale, instance.size[1] * scale];
++    }
+     let renderer = &mut state.renderer;
+     let faction = renderer.ios_sidebar_art.get_or_insert_with(|| {
+         super::ios_sidebar_art::IosSidebarArt::new(&renderer.gpu, &renderer.batch_renderer)
+@@ -92,6 +111,7 @@ pub(super) fn render(
+         ("ios_touch_strip", &sprites.strip),
+         ("ios_touch_art", &sprites.art),
+         ("ios_touch_foreground", &sprites.foreground),
++        ("ios_hud_cursor", &cursor),
+     ] {
+         renderer.instance_pool.upload(&renderer.gpu, key, instances);
+     }
+@@ -134,6 +154,27 @@ pub(super) fn render(
+             );
+         }
+     }
++    drop(pass);
++    if let Some(texture) = super::presentation::ui_overlays::current_software_cursor_texture(state)
++        && let Some((buffer, count)) = state.renderer.instance_pool.get("ios_hud_cursor")
++        && count > 0
++    {
++        let renderer = &state.renderer;
++        let art = renderer.ios_hud.as_ref().expect("HUD art was initialized");
++        let mut pass = super::presentation::sidebar_render::begin_main_load_pass(
++            encoder,
++            view,
++            &renderer.depth_view,
++        );
++        renderer.batch_renderer.draw_passthrough_range_bound(
++            &mut pass,
++            texture,
++            buffer,
++            &art.camera,
++            0,
++            count,
++        );
++    }
+ }
+ 
+ #[derive(Default)]
+@@ -147,11 +188,12 @@ struct Sprites {
+ fn prepare(
+     layout: &LandscapeLayout,
+     size: [f32; 2],
+-    touch: &super::ios_battle_touch::BattleTouch,
++    controls: &super::ios_controls::IosControls,
+     save_failed: bool,
+     theme: crate::ui::sidebar::SidebarTheme,
+ ) -> Sprites {
+     let mut result = Sprites::default();
++    let touch = &controls.touch;
+     let scale = layout.touch.scale_factor;
+     if let Some(panel) = layout.editor_panel {
+         result.background.push(glyph(
+@@ -239,7 +281,7 @@ fn prepare(
+         ));
+     }
+     for button in &layout.buttons {
+-        let pressed = touch.is_pressed(button.command);
++        let pressed = touch.is_pressed(button.command) || controls.mouse_pressed(button.command);
+         let selected = button.selected || pressed;
+         let color = match button.icon {
+             Shortcut::Save if save_failed => [1.0, 0.25, 0.18],
+diff --git a/src/app/ios_mouse_hud.rs b/src/app/ios_mouse_hud.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e10e63449803170c69468952a41976d6acfc7726
+--- /dev/null
++++ b/src/app/ios_mouse_hud.rs
+@@ -0,0 +1,253 @@
++//! Mouse ownership for the shared editable bar. Only its own panel can capture
++//! a press; world and sidebar input continue through their ordinary owners.
++
++use web_time::{Duration, Instant};
++use winit::event::TouchPhase;
++
++use super::super::ios_battle_touch::TouchRect;
++use super::super::ios_shortcuts::{LandscapeLayout, Shortcut};
++
++struct Press {
++    command: Option<Shortcut>,
++    rect: TouchRect,
++    start: [f32; 2],
++    position: [f32; 2],
++    moved: bool,
++    started: Instant,
++}
++
++#[derive(Default)]
++pub(super) struct MouseHudPointer {
++    press: Option<Press>,
++}
++
++#[derive(Default, Debug, PartialEq)]
++pub(super) struct MouseHudResult {
++    pub consumed: bool,
++    pub shortcut: Option<(Shortcut, bool)>,
++}
++
++pub(super) fn covers(layout: &LandscapeLayout, point: [f32; 2]) -> bool {
++    layout.editor_panel.is_some() || layout.bar_background().contains(point)
++}
++
++impl MouseHudPointer {
++    pub fn is_active(&self) -> bool {
++        self.press.is_some()
++    }
++
++    pub fn reset(&mut self) {
++        self.press = None;
++    }
++
++    pub fn is_pressed(&self, command: Shortcut) -> bool {
++        self.press.as_ref().is_some_and(|press| {
++            press.command == Some(command) && press.rect.contains(press.position)
++        })
++    }
++
++    pub fn handle(
++        &mut self,
++        phase: TouchPhase,
++        point: [f32; 2],
++        now: Instant,
++        layout: &LandscapeLayout,
++    ) -> MouseHudResult {
++        if phase == TouchPhase::Started {
++            if !covers(layout, point) {
++                return MouseHudResult::default();
++            }
++            let button = layout
++                .buttons
++                .iter()
++                .find(|button| button.enabled && button.rect.contains(point));
++            self.press = Some(Press {
++                command: button.map(|button| button.command),
++                rect: button.map_or(layout.bar_background(), |button| button.rect),
++                start: point,
++                position: point,
++                moved: false,
++                started: now,
++            });
++            return MouseHudResult {
++                consumed: true,
++                shortcut: None,
++            };
++        }
++        let Some(press) = self.press.as_mut() else {
++            // A map drag may end over this opaque bar. Consume that release
++            // without inventing a button click or targeting the covered map.
++            return MouseHudResult {
++                consumed: phase == TouchPhase::Ended && covers(layout, point),
++                shortcut: None,
++            };
++        };
++        press.position = point;
++        press.moved |= point
++            .iter()
++            .zip(press.start)
++            .any(|(next, start)| (next - start).abs() > 7.0 * layout.touch.scale_factor);
++        let shortcut = (phase == TouchPhase::Ended && press.rect.contains(point))
++            .then(|| {
++                press.command.map(|command| {
++                    (
++                        command,
++                        !press.moved
++                            && now.saturating_duration_since(press.started)
++                                >= Duration::from_millis(500),
++                    )
++                })
++            })
++            .flatten();
++        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
++            self.press = None;
++        }
++        MouseHudResult {
++            consumed: true,
++            shortcut,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::super::ios_shortcuts::{Preferences, ShortcutEditor};
++    use super::*;
++
++    fn layout(scale: f32, editor: Option<&ShortcutEditor>) -> LandscapeLayout {
++        LandscapeLayout::for_input(
++            1280.0 * scale,
++            720.0 * scale,
++            scale,
++            180.0 * scale,
++            &Preferences::default(),
++            editor,
++            false,
++        )
++    }
++
++    #[test]
++    fn mouse_world_has_no_hidden_touch_targets_and_bar_matches_its_art() {
++        for scale in [1.0, 3.0] {
++            let layout = layout(scale, None);
++            assert!(layout.touch.joystick.is_none());
++            assert!(
++                layout
++                    .buttons
++                    .iter()
++                    .all(|button| { (button.rect.y - layout.bar_button_y()).abs() < 0.001 })
++            );
++            let mut pointer = MouseHudPointer::default();
++            let world = [200.0 * scale, 300.0 * scale];
++            assert!(
++                !pointer
++                    .handle(TouchPhase::Started, world, Instant::now(), &layout)
++                    .consumed
++            );
++            assert!(
++                !pointer
++                    .handle(TouchPhase::Ended, world, Instant::now(), &layout)
++                    .consumed
++            );
++            let blank = [1.0, layout.bar_background().y + scale];
++            let world_release = pointer.handle(TouchPhase::Ended, blank, Instant::now(), &layout);
++            assert!(world_release.consumed);
++            assert_eq!(world_release.shortcut, None);
++            assert!(
++                pointer
++                    .handle(TouchPhase::Started, blank, Instant::now(), &layout)
++                    .consumed
++            );
++            let release = pointer.handle(TouchPhase::Ended, world, Instant::now(), &layout);
++            assert!(release.consumed);
++            assert_eq!(release.shortcut, None);
++        }
++    }
++
++    #[test]
++    fn team_button_uses_500ms_hold_and_release_outside_never_activates() {
++        let layout = layout(1.0, None);
++        let button = layout
++            .buttons
++            .iter()
++            .find(|button| button.command == Shortcut::Team1)
++            .unwrap();
++        let point = button.rect.center();
++        let now = Instant::now();
++        let mut pointer = MouseHudPointer::default();
++        pointer.handle(TouchPhase::Started, point, now, &layout);
++        assert!(pointer.is_pressed(Shortcut::Team1));
++        assert_eq!(
++            pointer
++                .handle(
++                    TouchPhase::Ended,
++                    point,
++                    now + Duration::from_millis(500),
++                    &layout
++                )
++                .shortcut,
++            Some((Shortcut::Team1, true))
++        );
++        pointer.handle(TouchPhase::Started, point, now, &layout);
++        assert_eq!(
++            pointer
++                .handle(TouchPhase::Ended, [point[0], 100.0], now, &layout)
++                .shortcut,
++            None
++        );
++        assert!(!pointer.is_pressed(Shortcut::Team1));
++        pointer.handle(TouchPhase::Started, point, now, &layout);
++        pointer.handle(TouchPhase::Moved, [point[0] + 20.0, point[1]], now, &layout);
++        assert_eq!(
++            pointer
++                .handle(
++                    TouchPhase::Ended,
++                    point,
++                    now + Duration::from_millis(600),
++                    &layout
++                )
++                .shortcut,
++            Some((Shortcut::Team1, false))
++        );
++    }
++
++    #[test]
++    fn editor_blocks_world_and_reuses_the_same_save_and_cancel_targets() {
++        let editor = ShortcutEditor::new(&Preferences::default());
++        let layout = layout(1.0, Some(&editor));
++        assert!(covers(&layout, [900.0, 100.0]));
++        let now = Instant::now();
++        let mut pointer = MouseHudPointer::default();
++        for command in [Shortcut::Save, Shortcut::Discard] {
++            let point = layout
++                .buttons
++                .iter()
++                .find(|button| button.command == command)
++                .unwrap()
++                .rect
++                .center();
++            pointer.handle(TouchPhase::Started, point, now, &layout);
++            assert_eq!(
++                pointer
++                    .handle(TouchPhase::Ended, point, now, &layout)
++                    .shortcut,
++                Some((command, false))
++            );
++        }
++    }
++
++    #[test]
++    fn mere_footer_hover_keeps_edge_scroll_available_but_a_press_owns_it() {
++        let layout = layout(1.0, None);
++        let point = [300.0, 719.0];
++        let now = Instant::now();
++        let mut pointer = MouseHudPointer::default();
++        assert!(covers(&layout, point));
++        pointer.handle(TouchPhase::Moved, point, now, &layout);
++        assert!(!pointer.is_active());
++        pointer.handle(TouchPhase::Started, point, now, &layout);
++        assert!(pointer.is_active());
++        pointer.handle(TouchPhase::Ended, point, now, &layout);
++        assert!(!pointer.is_active());
++    }
++}
 diff --git a/src/app/ios_runtime.rs b/src/app/ios_runtime.rs
 index f507078ea394b7a6b6e9af39c727788e410a2e6a..ae049611ec88d668583edebc06cb98b942914641 100644
 --- a/src/app/ios_runtime.rs
@@ -92991,7 +94687,7 @@ index f507078ea394b7a6b6e9af39c727788e410a2e6a..ae049611ec88d668583edebc06cb98b9
                  .as_nanos()
          ));
 diff --git a/src/app/ios_shortcuts.rs b/src/app/ios_shortcuts.rs
-index 8be4401e36462d76c5864d8a6393803f1622b89e..791c3c6d4eaf497bd4b88008f63b5650a4806c90 100644
+index 8be4401e36462d76c5864d8a6393803f1622b89e..67017c9ef11fb0be1f3f265156672b58a7c2c85a 100644
 --- a/src/app/ios_shortcuts.rs
 +++ b/src/app/ios_shortcuts.rs
 @@ -4,8 +4,10 @@
@@ -93087,7 +94783,47 @@ index 8be4401e36462d76c5864d8a6393803f1622b89e..791c3c6d4eaf497bd4b88008f63b5650
      }
  }
  
-@@ -798,8 +807,8 @@ mod tests {
+@@ -431,6 +440,29 @@ impl LandscapeLayout {
+         sidebar_width: f32,
+         preferences: &Preferences,
+         editor: Option<&ShortcutEditor>,
++    ) -> Self {
++        Self::for_input(
++            width,
++            height,
++            scale,
++            sidebar_width,
++            preferences,
++            editor,
++            true,
++        )
++    }
++
++    /// One geometry owner for both input devices. Mouse users get the same
++    /// editable bar and center alignment, while map space has no hidden stick
++    /// or ring-button hit targets.
++    pub(super) fn for_input(
++        width: f32,
++        height: f32,
++        scale: f32,
++        sidebar_width: f32,
++        preferences: &Preferences,
++        editor: Option<&ShortcutEditor>,
++        direct_touch: bool,
+     ) -> Self {
+         let width = finite_positive(width, 1.0);
+         let height = finite_positive(height, 1.0);
+@@ -523,6 +555,9 @@ impl LandscapeLayout {
+                 true,
+             );
+         }
++        if !direct_touch {
++            return result;
++        }
+         let radius = (48.0 * scale).min(available * 0.18).min(height * 0.18);
+         let ring_size = size;
+         let orbit = radius + ring_size * 0.65;
+@@ -798,8 +833,8 @@ mod tests {
          let directory = std::env::temp_dir().join(format!(
              "vera20k-ios-shortcuts-{}-{}",
              std::process::id(),
@@ -93098,7 +94834,7 @@ index 8be4401e36462d76c5864d8a6393803f1622b89e..791c3c6d4eaf497bd4b88008f63b5650
                  .unwrap()
                  .as_nanos()
          ));
-@@ -994,7 +1003,7 @@ mod tests {
+@@ -994,7 +1029,7 @@ mod tests {
      #[test]
      fn widened_sidebar_keeps_short_landscape_hud_and_world_gestures_disjoint() {
          use super::super::ios_battle_touch::{BattleTouch, TouchAction};
@@ -93107,6 +94843,19 @@ index 8be4401e36462d76c5864d8a6393803f1622b89e..791c3c6d4eaf497bd4b88008f63b5650
          use winit::dpi::PhysicalPosition;
          use winit::event::{DeviceId, Touch, TouchPhase};
          for (width, height, density) in [(568, 320, 2), (844, 390, 3)] {
+diff --git a/src/app/ios_unit_tags.rs b/src/app/ios_unit_tags.rs
+index e04d05eabe382599915b45e9dbcd268dec93af53..f49fb86a70b18451cad42d3bec3af15623d85764 100644
+--- a/src/app/ios_unit_tags.rs
++++ b/src/app/ios_unit_tags.rs
+@@ -11,7 +11,7 @@ use crate::sim::movement::ground_pose::object_get_coords;
+ use crate::util::lepton::absolute_leptons_to_screen;
+ 
+ pub(super) fn build(state: &AppState) -> Vec<SpriteInstance> {
+-    if !state.match_state.input.ios_controls.show_tags || !super::ios_controls::enabled(state) {
++    if !state.match_state.input.ios_controls.show_tags || !super::ios_controls::hud_enabled(state) {
+         return Vec::new();
+     }
+     let (Some(runtime), Some(rules), Some(local_owner)) = (
 diff --git a/src/app/loading/init.rs b/src/app/loading/init.rs
 index 938ace3a6f7f6c294d133932c1d49e2220c36d50..73804d105cf6a4447708fe9b9cf8d42fac0db122 100644
 --- a/src/app/loading/init.rs
@@ -93121,10 +94870,110 @@ index 938ace3a6f7f6c294d133932c1d49e2220c36d50..73804d105cf6a4447708fe9b9cf8d42f
                  seed_source = Some(
                      crate::map::source::GeneratedSeedSource::from_consumed_bytes(seed_path, &bytes),
 diff --git a/src/app/loading/pump.rs b/src/app/loading/pump.rs
-index f2840329ea5986f77005a8d5347d76a34fc43cdf..4bd245da09f16109002f0dd6577281dfeb3d4b0a 100644
+index f2840329ea5986f77005a8d5347d76a34fc43cdf..e0e222a5cdf86eee5e880f1ba1199deccd15911c 100644
 --- a/src/app/loading/pump.rs
 +++ b/src/app/loading/pump.rs
-@@ -1537,7 +1537,7 @@ fn prepare_scenario_initial_before_first_frame(state: &mut AppState) -> anyhow::
+@@ -11,6 +11,11 @@
+ mod render;
+ pub(crate) use render::transfer_progress_draws;
+ 
++#[cfg(any(target_arch = "wasm32", test))]
++mod browser_paint;
++#[cfg(target_arch = "wasm32")]
++pub(crate) use browser_paint::counts as browser_paint_counts;
++
+ #[cfg(test)]
+ mod tests;
+ 
+@@ -567,6 +572,8 @@ pub(crate) struct NativeLoadingScreenState {
+     /// entry. Capture that pre-load count before the later rules reset.
+     runtime_color_scheme_count: usize,
+     progress_cadence: NativeLoadingProgressCadence,
++    #[cfg(target_arch = "wasm32")]
++    browser_backdrop_only: bool,
+ }
+ 
+ impl NativeLoadingScreenState {
+@@ -592,6 +599,8 @@ impl NativeLoadingScreenState {
+             campaign_presentation: None,
+             runtime_color_scheme_count: 0,
+             progress_cadence,
++            #[cfg(target_arch = "wasm32")]
++            browser_backdrop_only: false,
+         }
+     }
+ 
+@@ -613,6 +622,8 @@ impl NativeLoadingScreenState {
+             campaign_presentation: None,
+             runtime_color_scheme_count: 0,
+             progress_cadence: NativeLoadingProgressCadence::SelectedMap,
++            #[cfg(target_arch = "wasm32")]
++            browser_backdrop_only: false,
+         }
+     }
+ 
+@@ -668,6 +679,8 @@ pub(crate) struct LoadingSession {
+     /// nothing else reaches the screen until the loading screen's first
+     /// repaint. Generic sessions start at their first frame.
+     next_frame: NextLoadingFrame,
++    #[cfg(target_arch = "wasm32")]
++    browser_paint: browser_paint::BrowserPaintGate,
+ }
+ 
+ impl LoadingSession {
+@@ -722,13 +735,15 @@ impl LoadingSession {
+         };
+         Self {
+             stage: LoadingStage::Selected(request),
+-            next_frame: if native.is_some() {
++            next_frame: if native.is_some() && !cfg!(target_arch = "wasm32") {
+                 NextLoadingFrame::Blank
+             } else {
+                 NextLoadingFrame::First
+             },
+             native,
+             job: LoadingJob::new(),
++            #[cfg(target_arch = "wasm32")]
++            browser_paint: browser_paint::BrowserPaintGate::default(),
+         }
+     }
+ }
+@@ -851,6 +866,7 @@ pub(crate) fn begin_loading(state: &mut AppState, request: LoadingRequest) {
+         now_ms,
+     );
+     state.frontend.screen = GameScreen::Loading;
++    state.platform.window.request_redraw();
+ }
+ 
+ /// Establish replacement admission before retiring the previous attempt's
+@@ -1270,6 +1286,8 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
+                         native: Some(native),
+                         job,
+                         next_frame: NextLoadingFrame::Later,
++                        #[cfg(target_arch = "wasm32")]
++                        browser_paint: browser_paint::BrowserPaintGate::default(),
+                     },
+                 )
+             } else {
+@@ -1421,6 +1439,8 @@ fn prepare_loading_session(
+         mut native,
+         mut job,
+         next_frame,
++        #[cfg(target_arch = "wasm32")]
++        browser_paint,
+     } = session;
+     let stage = match stage {
+         stage @ LoadingStage::AwaitingPeers { .. } => stage,
+@@ -1478,6 +1498,8 @@ fn prepare_loading_session(
+         native,
+         job,
+         next_frame,
++        #[cfg(target_arch = "wasm32")]
++        browser_paint,
+     })
+ }
+ 
+@@ -1537,7 +1559,7 @@ fn prepare_scenario_initial_before_first_frame(state: &mut AppState) -> anyhow::
  /// file omits the preview layer; every other layer still draws.
  fn decode_random_map_loading_preview(ra2_dir: &Path) -> Option<DecodedPreview> {
      let path = ra2_dir.join(RANDOM_MAP_PREVIEW_FILE);
@@ -93133,6 +94982,283 @@ index f2840329ea5986f77005a8d5347d76a34fc43cdf..4bd245da09f16109002f0dd6577281df
          Ok(bytes) => bytes,
          Err(err) => {
              log::warn!(
+@@ -1714,7 +1736,18 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
+         .loading_session
+         .as_ref()
+         .and_then(|session| session.native.as_ref())
+-        .is_some_and(|native| native.atlas.is_some() || native.suppresses_chrome())
++        .is_some_and(|native| {
++            let ready = native.atlas.is_some() || native.suppresses_chrome();
++            #[cfg(target_arch = "wasm32")]
++            let ready = ready
++                && (!native.browser_backdrop_only
++                    || state
++                        .frontend
++                        .loading_session
++                        .as_ref()
++                        .is_some_and(|session| matches!(session.stage, LoadingStage::Selected(_))));
++            ready
++        })
+     {
+         return Ok(());
+     }
+@@ -1741,6 +1774,31 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
+             "native loading archives LOADMD.MIX and LOAD.MIX are unavailable"
+         ));
+     }
++    #[cfg(target_arch = "wasm32")]
++    if state
++        .frontend
++        .loading_session
++        .as_ref()
++        .is_some_and(|session| {
++            matches!(session.stage, LoadingStage::Selected(_))
++                && session.native.as_ref().is_some_and(|native| {
++                    matches!(native.variant, NativeLoadingArt::StockOffline(_))
++                })
++        })
++    {
++        // Paint existing country art before parsing/generating the map. Preview
++        // and markers are added from the same authoritative prepared map later.
++        build_standard_loading_atlas(state, false)?;
++        if let Some(native) = state
++            .frontend
++            .loading_session
++            .as_mut()
++            .and_then(|session| session.native.as_mut())
++        {
++            native.browser_backdrop_only = true;
++        }
++        return Ok(());
++    }
+     prepare_scenario_initial_before_first_frame(state)?;
+     if state
+         .frontend
+@@ -1810,8 +1868,27 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
+         log::info!("Native campaign loading atlas ready");
+         return Ok(());
+     }
++    build_standard_loading_atlas(state, true)?;
++    #[cfg(target_arch = "wasm32")]
++    if let Some(session) = state.frontend.loading_session.as_mut()
++        && let Some(native) = session.native.as_mut()
++        && native.browser_backdrop_only
++    {
++        native.browser_backdrop_only = false;
++        session.next_frame = NextLoadingFrame::First;
++        session.browser_paint = browser_paint::BrowserPaintGate::default();
++    }
++    Ok(())
++}
++
++fn build_standard_loading_atlas(
++    state: &mut AppState,
++    include_composition: bool,
++) -> anyhow::Result<()> {
+     let variant = selected_loading_art_variant(state);
+-    ensure_loading_composition_snapshot(state);
++    if include_composition {
++        ensure_loading_composition_snapshot(state);
++    }
+     let Some(assets) = state
+         .frontend
+         .loading_session
+@@ -2012,6 +2089,23 @@ pub(crate) fn after_loading_frame_presented(state: &mut AppState) {
+         state.platform.window.request_redraw();
+         return;
+     }
++    #[cfg(target_arch = "wasm32")]
++    if let Some(session) = state.frontend.loading_session.as_mut()
++        && session.next_frame == NextLoadingFrame::First
++    {
++        match session.browser_paint.pending(&state.renderer.gpu.queue) {
++            Ok(true) => {
++                state.platform.window.request_redraw();
++                return;
++            }
++            Ok(false) => {}
++            Err(error) => {
++                let policy = loading_failure_policy(state);
++                fail_loading(state, policy, anyhow::anyhow!(error));
++                return;
++            }
++        }
++    }
+     loading_screen_presented(state);
+     let policy = loading_failure_policy(state);
+     match pump_loading_after_present(state) {
+@@ -2167,6 +2261,13 @@ pub(crate) fn present_saved_game_loading(state: &mut AppState) {
+ /// the first game frame (`0x00683E07..0x00683E1C`, again at
+ /// `0x0052EAA1..0x0052EAEB`); the tactical install runs under it.
+ pub(crate) fn present_game_mode_blank(state: &AppState) {
++    // The browser keeps the last fully rendered loading image while the world
++    // and tactical GPU objects are installed. The next canvas presentation is
++    // the first battle frame; presenting black here exposes a browser frame
++    // without contributing to either loading or gameplay.
++    if cfg!(target_arch = "wasm32") {
++        return;
++    }
+     if let Err(err) = render::present_blank(
+         &state.renderer.gpu,
+         &state.renderer.shell_surface_presenter,
+diff --git a/src/app/loading/pump/browser_paint.rs b/src/app/loading/pump/browser_paint.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8e91e9d8b13af801255d1736f1a0c3ef9c9a60d
+--- /dev/null
++++ b/src/app/loading/pump/browser_paint.rs
+@@ -0,0 +1,152 @@
++//! Let a submitted native loading frame reach a browser rendering opportunity.
++//!
++//! SurfaceTexture::present does not yield the JS task. Loading the rest of the
++//! map synchronously and presenting black in that same task hides the loading
++//! artwork. Two animation callbacks cross an actual rendering boundary before
++//! admitting that work, without a fixed wall-clock delay or a second UI layer.
++//! https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
++
++#[cfg(target_arch = "wasm32")]
++use std::cell::Cell;
++use std::sync::{
++    Arc,
++    atomic::{AtomicU8, Ordering},
++};
++
++const PENDING: u8 = 0;
++const READY: u8 = 1;
++const FAILED: u8 = 2;
++
++pub(super) struct BrowserPaintGate {
++    state: Arc<AtomicU8>,
++    scheduled: bool,
++}
++
++impl Default for BrowserPaintGate {
++    fn default() -> Self {
++        Self {
++            state: Arc::new(AtomicU8::new(PENDING)),
++            scheduled: false,
++        }
++    }
++}
++
++impl BrowserPaintGate {
++    fn pending_with(
++        &mut self,
++        schedule: impl FnOnce(Arc<AtomicU8>) -> Result<(), String>,
++    ) -> Result<bool, String> {
++        if !self.scheduled {
++            schedule(Arc::clone(&self.state))?;
++            self.scheduled = true;
++        }
++        match self.state.load(Ordering::Acquire) {
++            PENDING => Ok(true),
++            READY => Ok(false),
++            _ => Err("browser loading-frame presentation failed".into()),
++        }
++    }
++
++    #[cfg(target_arch = "wasm32")]
++    pub(super) fn pending(&mut self, queue: &wgpu::Queue) -> Result<bool, String> {
++        self.pending_with(|state| {
++            // GPU submission is asynchronous on WebGPU. A rendering boundary
++            // before the submitted image completes can still expose only the
++            // preceding black canvas, so fence this image before yielding.
++            SCHEDULED.with(|count| count.set(count.get().saturating_add(1)));
++            queue.on_submitted_work_done(move || {
++                if schedule_paint(Arc::clone(&state)).is_err() {
++                    state.store(FAILED, Ordering::Release);
++                    crate::app::browser::wake();
++                }
++            });
++            Ok(())
++        })
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++thread_local! {
++    static SCHEDULED: Cell<u32> = const { Cell::new(0) };
++    static COMPLETED: Cell<u32> = const { Cell::new(0) };
++}
++
++#[cfg(target_arch = "wasm32")]
++pub(crate) fn counts() -> (u32, u32) {
++    (SCHEDULED.with(Cell::get), COMPLETED.with(Cell::get))
++}
++
++#[cfg(target_arch = "wasm32")]
++fn schedule_paint(state: Arc<AtomicU8>) -> Result<(), String> {
++    use wasm_bindgen::{JsCast, closure::Closure};
++    let window = web_sys::window().ok_or("loading presentation requires a Window")?;
++    let state = Arc::downgrade(&state);
++    let next_window = window.clone();
++    let first = Closure::once_into_js(move |_now: f64| {
++        if state.upgrade().is_none() {
++            return;
++        }
++        let failed = state.clone();
++        let second = Closure::once_into_js(move |_now: f64| {
++            if let Some(state) = state.upgrade() {
++                state.store(READY, Ordering::Release);
++                COMPLETED.with(|count| count.set(count.get().saturating_add(1)));
++                crate::app::browser::wake();
++            }
++        });
++        if next_window
++            .request_animation_frame(second.unchecked_ref())
++            .is_err()
++        {
++            if let Some(state) = failed.upgrade() {
++                state.store(FAILED, Ordering::Release);
++            }
++            crate::app::browser::wake();
++        }
++    });
++    window
++        .request_animation_frame(first.unchecked_ref())
++        .map_err(|_| "could not schedule the browser loading frame".to_owned())?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn no_loading_work_is_admitted_until_the_scheduled_render_boundary() {
++        let mut gate = BrowserPaintGate::default();
++        let mut completion = None;
++        assert!(
++            gate.pending_with(|state| {
++                completion = Some(state);
++                Ok(())
++            })
++            .unwrap()
++        );
++        assert!(
++            gate.pending_with(|_| panic!("duplicate scheduling"))
++                .unwrap()
++        );
++        completion.unwrap().store(READY, Ordering::Release);
++        assert!(
++            !gate
++                .pending_with(|_| panic!("duplicate scheduling"))
++                .unwrap()
++        );
++    }
++
++    #[test]
++    fn failed_schedule_or_callback_never_admits_work() {
++        let mut gate = BrowserPaintGate::default();
++        assert!(gate.pending_with(|_| Err("no browser".into())).is_err());
++        assert!(
++            gate.pending_with(|state| {
++                state.store(FAILED, Ordering::Release);
++                Ok(())
++            })
++            .is_err()
++        );
++    }
++}
 diff --git a/src/app/match_bootstrap.rs b/src/app/match_bootstrap.rs
 index b0f03928a04e14df3f23d63ff8f22ed72419efee..c09ef17d1e626087cfebf57b1fd8ca6032ddc08b 100644
 --- a/src/app/match_bootstrap.rs
@@ -93339,7 +95465,7 @@ index 9a397690e7cf41d01aee73ea976f504ac07ca2f6..86e52d6acb244d44d6a367425fc71c2f
  use crate::sim::telemetry::TimingSample;
  
 diff --git a/src/app/mod.rs b/src/app/mod.rs
-index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a30778835d7d 100644
+index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..1ba0aba7038d2fb79d1b7250c7865e66e2680526 100644
 --- a/src/app/mod.rs
 +++ b/src/app/mod.rs
 @@ -3,7 +3,7 @@
@@ -93355,7 +95481,6 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a307
  
  pub mod app_bundle;
  pub(crate) mod audio_runtime;
-+pub(crate) mod browser_shell;
 +#[cfg(target_arch = "wasm32")]
 +pub mod browser;
 +#[cfg(target_arch = "wasm32")]
@@ -93363,10 +95488,63 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a307
 +#[cfg(all(test, not(target_arch = "wasm32")))]
 +#[path = "browser_network/pipeline.rs"]
 +mod browser_network_pipeline;
++pub(crate) mod browser_shell;
  pub(crate) mod campaign_defeat;
  pub(crate) mod campaign_victory;
  pub(crate) mod chinese_ui;
-@@ -141,6 +149,8 @@ pub struct App {
+@@ -47,24 +55,33 @@ mod handler;
+ mod in_game;
+ mod initialize;
+ pub(crate) mod input;
+-#[cfg(any(target_os = "ios", target_os = "android", test))]
+-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
++#[cfg_attr(
++    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
++    allow(dead_code)
++)]
+ mod ios_battle_touch;
+-#[cfg(any(target_os = "ios", target_os = "android", test))]
+-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
++#[cfg_attr(
++    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
++    allow(dead_code)
++)]
+ mod ios_controls;
+-#[cfg(any(target_os = "ios", target_os = "android"))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+ mod ios_hud_render;
+ #[cfg(any(target_os = "ios", test))]
+ pub mod ios_runtime;
+-#[cfg(any(target_os = "ios", target_os = "android", test))]
+-#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
++#[cfg_attr(
++    not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")),
++    allow(dead_code)
++)]
+ mod ios_shortcuts;
+-#[cfg(any(target_os = "ios", target_os = "android"))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+ mod ios_sidebar_art;
+-#[cfg(any(target_os = "ios", target_os = "android", test))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32", test))]
+ mod ios_touch;
+-#[cfg(any(target_os = "ios", target_os = "android"))]
++#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+ mod ios_unit_tags;
+ pub(crate) mod loading;
+ pub(crate) mod match_audio;
+@@ -134,13 +151,15 @@ pub struct App {
+     startup_options: crate::app::frontend::startup_options::RetailStartupOptions,
+     spawn_request: Option<crate::app::frontend::cncnet_spawn::SpawnRequest>,
+     startup_failure: Option<String>,
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+     ios_touch: ios_touch::IosTouchPointer,
+     #[cfg(any(target_os = "ios", target_os = "android"))]
+     ios_suspended: bool,
      /// Make sure config.toml names a game folder before the window opens
      /// ([`app_bundle`]).
      ask_for_game_folder: bool,
@@ -93375,7 +95553,13 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a307
  }
  
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -192,6 +202,8 @@ impl App {
+@@ -187,11 +206,13 @@ impl App {
+             startup_options,
+             spawn_request: None,
+             startup_failure: None,
+-            #[cfg(any(target_os = "ios", target_os = "android"))]
++            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+             ios_touch: Default::default(),
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -93384,7 +95568,13 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a307
          }
      }
  
-@@ -212,6 +224,8 @@ impl App {
+@@ -207,11 +228,13 @@ impl App {
+             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
+             spawn_request: None,
+             startup_failure: None,
+-            #[cfg(any(target_os = "ios", target_os = "android"))]
++            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+             ios_touch: Default::default(),
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -93393,7 +95583,13 @@ index 7b20a82cc291737ea7702ccd6bdafdb5a2ca3f88..6595509cea3630ec405d3f8051f9a307
          }
      }
  
-@@ -234,6 +248,8 @@ impl App {
+@@ -229,11 +252,13 @@ impl App {
+             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
+             spawn_request: None,
+             startup_failure: None,
+-            #[cfg(any(target_os = "ios", target_os = "android"))]
++            #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+             ios_touch: Default::default(),
              #[cfg(any(target_os = "ios", target_os = "android"))]
              ios_suspended: false,
              ask_for_game_folder: false,
@@ -93817,11 +96013,101 @@ index 353f12ae886c154245da1efe4fc77a82ed9b2261..6c01abb456189f57a86bdba14382ab36
      }
  }
  
+diff --git a/src/app/persistence/options.rs b/src/app/persistence/options.rs
+index 76cb29db6e7a49f57315d7934e8608b21565ce89..3e751dbe2e1d366e48b3e84607371511fd826d1f 100644
+--- a/src/app/persistence/options.rs
++++ b/src/app/persistence/options.rs
+@@ -34,6 +34,10 @@ pub(crate) fn in_game_options_from_profile(profile: &RetailOptionsProfile) -> In
+         unit_action_lines: profile.unit_action_lines,
+         show_hidden: profile.show_hidden,
+         tooltips: profile.tooltips,
++        mouse_sensitivity_percent:
++            crate::ui::shell::in_game_options_state::normalized_mouse_sensitivity(
++                i32::try_from(profile.mouse_sensitivity_percent).unwrap_or(-1),
++            ),
+         ..Default::default()
+     }
+ }
+@@ -53,6 +57,10 @@ fn update_profile_from_in_game_options(
+     profile.unit_action_lines = options.unit_action_lines;
+     profile.show_hidden = options.show_hidden;
+     profile.tooltips = options.tooltips;
++    profile.mouse_sensitivity_percent =
++        crate::ui::shell::in_game_options_state::normalized_mouse_sensitivity(
++            i32::try_from(options.mouse_sensitivity_percent).unwrap_or(-1),
++        );
+ }
+ 
+ fn apply_target_lines(target_lines: &mut TargetLineState, options: &InGameOptionsState) {
+@@ -207,6 +215,36 @@ pub(crate) fn accept_in_game_options(state: &mut AppState) {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn mouse_sensitivity_uses_the_accepted_profile_transaction_only() {
++        let profile = RetailOptionsProfile {
++            scroll_rate: 5,
++            game_speed: 2,
++            ..Default::default()
++        };
++        let options = InGameOptionsState {
++            mouse_sensitivity_percent: 250,
++            scroll_rate: 5,
++            game_speed: 2,
++            ..Default::default()
++        };
++        let mut rejected = recording_transaction(profile.clone(), options.clone());
++        assert!(!dispatch_in_game_options_transaction(&mut rejected, 2));
++        assert_eq!(rejected.profile.mouse_sensitivity_percent, 100);
++        assert_eq!(rejected.writes, 0);
++        let mut accepted = recording_transaction(profile, options);
++        assert!(dispatch_in_game_options_transaction(
++            &mut accepted,
++            IN_GAME_OPTIONS_RESULT_BACK
++        ));
++        assert_eq!(accepted.profile.mouse_sensitivity_percent, 250);
++        assert_eq!(
++            (accepted.profile.scroll_rate, accepted.profile.game_speed),
++            (5, 2)
++        );
++        assert_eq!(accepted.writes, 1);
++    }
++
+     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     enum TransactionEvent {
+         Profile,
 diff --git a/src/app/persistence/options_profile.rs b/src/app/persistence/options_profile.rs
-index 60ecd2ebdcddda3aeaaa53087f05cee9c817e110..18ccf7af005c215b7cfeb314c0ddd05483307934 100644
+index 60ecd2ebdcddda3aeaaa53087f05cee9c817e110..d97b8535ceb68ef678a9b7581d8e9fba05c8a73e 100644
 --- a/src/app/persistence/options_profile.rs
 +++ b/src/app/persistence/options_profile.rs
-@@ -238,7 +238,7 @@ impl RetailOptionsLoad {
+@@ -127,6 +127,8 @@ pub(crate) struct RetailOptionsProfile {
+     /// default, so new profiles draw the original tick-stepped motion; it never
+     /// changes the simulation rate or saves.
+     pub(crate) render_interpolation: bool,
++    /// `[VERA] MouseSensitivityPercent=`: Web Pointer Lock delta gain only.
++    pub(crate) mouse_sensitivity_percent: u32,
+     /// `[VERA] ShiftQueue=`: whether a Shift-click on a mobile strip queues
+     /// [`Self::shift_queue_count`] builds: the Options page's Shift-Click
+     /// Batch Queue. Off by default, so Shift + left click queues one copy as
+@@ -199,6 +201,8 @@ impl Default for RetailOptionsProfile {
+             sidebar: crate::ui::main_menu_dialogs::options::SidebarSize::Normal,
+             yr_original_style: false,
+             render_interpolation: false,
++            mouse_sensitivity_percent:
++                crate::ui::shell::in_game_options_state::MOUSE_SENSITIVITY_DEFAULT,
+             shift_queue: false,
+             shift_queue_count: DEFAULT_SHIFT_QUEUE_COUNT,
+             wol_test_service: false,
+@@ -218,7 +222,7 @@ pub(crate) struct FormattedProfileSections {
+     pub(crate) audio: [(&'static str, String); 7],
+     pub(crate) network: [(&'static str, String); 4],
+     /// VERA's own section, written after the native ones.
+-    pub(crate) vera: [(&'static str, String); 9],
++    pub(crate) vera: [(&'static str, String); 10],
+ }
+ 
+ impl RetailOptionsLoad {
+@@ -238,7 +242,7 @@ impl RetailOptionsLoad {
      /// [`Self::without_ra2md`] so user profile state cannot contaminate sealed
      /// capture output.
      pub(crate) fn from_ra2md(ra2_dir: &Path, startup: &RetailStartupOptions) -> Self {
@@ -93830,7 +96116,32 @@ index 60ecd2ebdcddda3aeaaa53087f05cee9c817e110..18ccf7af005c215b7cfeb314c0ddd054
      }
  
      /// Injectable form of [`Self::from_ra2md`] used to prove that both
-@@ -562,8 +562,8 @@ impl RetailOptionsProfile {
+@@ -417,6 +421,13 @@ impl RetailOptionsProfile {
+             self.yr_original_style = vera.read_bool("YROriginalStyle", self.yr_original_style);
+             self.render_interpolation =
+                 vera.read_bool("RenderInterpolation", self.render_interpolation);
++            self.mouse_sensitivity_percent =
++                crate::ui::shell::in_game_options_state::normalized_mouse_sensitivity(
++                    vera.read_int(
++                        "MouseSensitivityPercent",
++                        self.mouse_sensitivity_percent as i32,
++                    ),
++                );
+             self.shift_queue = vera.read_bool("ShiftQueue", self.shift_queue);
+             // Absent keeps the current value; present-but-nonnumeric answers 0,
+             // which the range lifts to 1 rather than a click that queues nothing.
+@@ -519,6 +530,10 @@ impl RetailOptionsProfile {
+                     "RenderInterpolation",
+                     format_bool(self.render_interpolation).to_string(),
+                 ),
++                (
++                    "MouseSensitivityPercent",
++                    self.mouse_sensitivity_percent.to_string(),
++                ),
+             ],
+         }
+     }
+@@ -562,8 +577,8 @@ impl RetailOptionsProfile {
      pub(crate) fn commit_ra2md(&self, ra2_dir: &Path) -> io::Result<()> {
          self.commit_ra2md_with(
              ra2_dir,
@@ -93841,7 +96152,7 @@ index 60ecd2ebdcddda3aeaaa53087f05cee9c817e110..18ccf7af005c215b7cfeb314c0ddd054
          )
      }
  
-@@ -573,8 +573,8 @@ impl RetailOptionsProfile {
+@@ -573,8 +588,8 @@ impl RetailOptionsProfile {
      pub(crate) fn commit_network_options(&self, ra2_dir: &Path) -> io::Result<()> {
          commit_transformed_profile(
              ra2_dir,
@@ -93852,7 +96163,7 @@ index 60ecd2ebdcddda3aeaaa53087f05cee9c817e110..18ccf7af005c215b7cfeb314c0ddd054
              |input| self.transform_network_options(input),
          )
      }
-@@ -585,8 +585,8 @@ impl RetailOptionsProfile {
+@@ -585,8 +600,8 @@ impl RetailOptionsProfile {
      pub(crate) fn commit_wol_preferences(&self, ra2_dir: &Path) -> io::Result<()> {
          commit_transformed_profile(
              ra2_dir,
@@ -93863,6 +96174,45 @@ index 60ecd2ebdcddda3aeaaa53087f05cee9c817e110..18ccf7af005c215b7cfeb314c0ddd054
              |input| self.transform_wol_preferences(input),
          )
      }
+@@ -1364,6 +1379,38 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn web_mouse_sensitivity_round_trips_through_the_existing_profile_and_safe_bounds() {
++        for (text, expected) in [
++            ("25", 25),
++            ("100", 100),
++            ("400", 400),
++            ("103", 105),
++            ("-5", 100),
++            ("401", 100),
++            ("garbage", 100),
++        ] {
++            let input = format!(
++                "[VERA]\nMouseSensitivityPercent={text}\n[Options]\nScrollRate=5\nGameSpeed=2\n[Other]\nKeep=unchanged\n"
++            );
++            let load = load_snapshot(&RetailStartupOptions::default(), input.as_bytes());
++            let profile = load.retained_profile;
++            assert_eq!(profile.mouse_sensitivity_percent, expected, "{text}");
++            assert_eq!((profile.scroll_rate, profile.game_speed), (5, 2));
++            let output = profile.transform_ra2md(input.as_bytes());
++            assert!(String::from_utf8_lossy(&output).contains("Keep=unchanged"));
++            let reread = load_snapshot(&RetailStartupOptions::default(), &output);
++            assert_eq!(reread.retained_profile.mouse_sensitivity_percent, expected);
++            assert_eq!(
++                (
++                    reread.retained_profile.scroll_rate,
++                    reread.retained_profile.game_speed
++                ),
++                (5, 2)
++            );
++        }
++    }
++
+     #[test]
+     fn original_yr_style_and_render_interpolation_round_trip_independently() {
+         let startup = RetailStartupOptions::default();
 diff --git a/src/app/persistence/tests/save_browser_tests.rs b/src/app/persistence/tests/save_browser_tests.rs
 index c1f1214ace49fc947de9bc799b291f69c21d4d29..3166dd2e8ad532d25a031a7c5df163a7ba8f19ed 100644
 --- a/src/app/persistence/tests/save_browser_tests.rs
@@ -94023,6 +96373,83 @@ index db067aa46d92141de7d5485def20d89f84dd14d1..ef092063cf11226614ba3c77f40d9562
      let packet = native_bridge_packet();
      let fixture = RetailBridgeFixture::load(&packet);
      let gpu = Gpu::with_features(
+diff --git a/src/app/presentation/render/draw_passes.rs b/src/app/presentation/render/draw_passes.rs
+index 54af66cc2d6a23b3714d784e8ffd708df125db9c..9902899e249aeb81d3ec64621cc63ceca613a929 100644
+--- a/src/app/presentation/render/draw_passes.rs
++++ b/src/app/presentation/render/draw_passes.rs
+@@ -53,9 +53,13 @@ fn draw_sidebar_surface(
+     encoder: &mut wgpu::CommandEncoder,
+     data: &DrawPassData<'_>,
+ ) {
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
+-    crate::app::ios_sidebar_art::prepare(state);
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
++    let touch_input =
++        cfg!(any(target_os = "ios", target_os = "android")) || state.branded_hud_mode();
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
++    if touch_input {
++        crate::app::ios_sidebar_art::prepare(state);
++    }
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+     let theme = crate::app::presentation::sidebar_render::current_sidebar_theme(state);
+     let side_index = crate::app::presentation::sidebar_render::current_sidebar_side(state);
+     let presentation = &state.match_state.match_presentation;
+@@ -75,20 +79,24 @@ fn draw_sidebar_surface(
+     let mut draw = |tex: Option<&BatchTexture>, key: &'static str| {
+         draw_pooled_with_camera(&mut pass, batch, camera, pool, tex, key);
+     };
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
+-    draw(
+-        renderer
+-            .ios_sidebar_art
+-            .as_ref()
+-            .map(|art| art.texture(theme)),
+-        "ios_sidebar_background",
+-    );
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
++    if touch_input {
++        draw(
++            renderer
++                .ios_sidebar_art
++                .as_ref()
++                .map(|art| art.texture(theme)),
++            "ios_sidebar_background",
++        );
++    }
+     draw(chrome.map(|atlas| &atlas.texture), "sidebar_chrome");
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
+-    draw(
+-        renderer.ios_sidebar_art.as_ref().map(|art| art.glyphs()),
+-        "ios_sidebar_controls",
+-    );
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
++    if touch_input {
++        draw(
++            renderer.ios_sidebar_art.as_ref().map(|art| art.glyphs()),
++            "ios_sidebar_controls",
++        );
++    }
+     draw(
+         presentation
+             .sidebar_cameo_atlas
+@@ -196,11 +204,12 @@ fn draw_sidebar_surface(
+     };
+     draw(cameo_overlay_tex, "sidebar_cameo_overlay");
+     draw(Some(renderer.bit_font.atlas()), "sidebar_text");
+-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+-    draw(
+-        presentation.radar_anim.as_ref().map(|ra| ra.texture()),
+-        "radar_anim",
+-    );
++    if !touch_input {
++        draw(
++            presentation.radar_anim.as_ref().map(|ra| ra.texture()),
++            "radar_anim",
++        );
++    }
+     let minimap = presentation.minimap.as_ref();
+     draw(minimap.map(|m| m.map_texture()), "minimap");
+     draw(minimap.map(|m| m.white_texture()), "viewport_rect");
 diff --git a/src/app/presentation/render/mod.rs b/src/app/presentation/render/mod.rs
 index cb6f6a97be829e5313e96e2656c7b5d9d5634d5c..c990606d7e72b8606fc353aa54ddbdb391c4ba44 100644
 --- a/src/app/presentation/render/mod.rs
@@ -94071,6 +96498,66 @@ index 0cef036f2e3658a3e17ed3f11554c6a858ca4311..020b1cd9e6c07ab979f3b3760ee48ba8
                  let stats = draw_native_object_pass(
                      &mut encoder,
                      crate::app::render::merge_passes::ObjectDrawPhase::Display,
+diff --git a/src/app/presentation/sidebar_build.rs b/src/app/presentation/sidebar_build.rs
+index fa47dc9bb3252923b7f942efb66871ebcca1448f..d46ea8daa17edda9f7499725d04ceda0b792d267 100644
+--- a/src/app/presentation/sidebar_build.rs
++++ b/src/app/presentation/sidebar_build.rs
+@@ -31,8 +31,7 @@ pub(crate) fn build_sidebar_chrome_instances(
+     let Some(atlas) = current_sidebar_chrome(state) else {
+         return Vec::new();
+     };
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
+-    {
++    if cfg!(any(target_os = "ios", target_os = "android")) || state.branded_hud_mode() {
+         // The touch sidebar paints its own faction background and controls.
+         // Keep the original animated power meter with the production state
+         // that already owns its segment count and deficit blink.
+@@ -49,9 +48,8 @@ pub(crate) fn build_sidebar_chrome_instances(
+             ],
+             0.00048,
+         );
+-        instances
++        return instances;
+     }
+-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+     build_sidebar_chrome_instances_for_layout(
+         atlas,
+         state.match_state.match_presentation.sidebar_layout_spec,
+@@ -71,6 +69,9 @@ pub(crate) fn build_sidebar_chrome_instances(
+ /// The bottom command bar, which shares the chrome atlas but draws into a
+ /// surface of its own (`presentation::sidebar_surface`).
+ pub(crate) fn build_command_bar_instances(state: &AppState) -> Vec<SpriteInstance> {
++    if state.branded_hud_mode() {
++        return Vec::new();
++    }
+     let mut instances = Vec::new();
+     if let Some(atlas) = current_sidebar_chrome(state) {
+         command_bar::append(state, atlas, &mut instances);
+diff --git a/src/app/presentation/sidebar_render.rs b/src/app/presentation/sidebar_render.rs
+index bd65309773c32f1642347379518a87873bf707dd..7824498c6e09c1f8258428ebb336b8d0e9b5cec5 100644
+--- a/src/app/presentation/sidebar_render.rs
++++ b/src/app/presentation/sidebar_render.rs
+@@ -119,10 +119,8 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
+     refresh_radar_animation_source(state);
+     let mut spec =
+         crate::ui::sidebar::SidebarChromeLayoutSpec::for_theme(current_sidebar_theme(state));
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
+-    {
+-        spec.touch_controls = true;
+-    }
++    spec.touch_controls =
++        cfg!(any(target_os = "ios", target_os = "android")) || state.branded_hud_mode();
+     if let Some(atlas) = current_sidebar_chrome(state) {
+         spec.side2_height = atlas.side2.pixel_size[1];
+         spec.side3_height = atlas.side3.pixel_size[1];
+@@ -650,6 +648,7 @@ pub(crate) fn active_minimap_screen_rect(state: &AppState) -> crate::ui::sidebar
+     // right-column aperture. A bottom-left fallback would otherwise receive
+     // the enlarged sidebar transform and draw/hit-test outside its column.
+     if cfg!(any(target_os = "ios", target_os = "android"))
++        || state.branded_hud_mode()
+         || current_sidebar_chrome(state).is_some()
+     {
+         crate::ui::sidebar::radar_minimap_rect_with_spec(
 diff --git a/src/app/presentation/sidebar_surface.rs b/src/app/presentation/sidebar_surface.rs
 index aced6516817d7ac0f539a2bfe058c5ebc854a235..53e5b91503729eaa42047afac5e38cd1a014a523 100644
 --- a/src/app/presentation/sidebar_surface.rs
@@ -94148,6 +96635,22 @@ index 50bd28fa2fb05aadd67e6bade3d9d3a8397c2ff7..b371eeddb1be6636f2b9168a70a0d93c
          .expect("clock after epoch")
          .as_nanos();
      let seed_dir = std::env::temp_dir().join(format!(
+diff --git a/src/app/renderer_state.rs b/src/app/renderer_state.rs
+index 03a8ad60a6bc40e3b7b36d2a1d7949ea50f35e5a..f77e2ad8b09d4cbc2f51fae5aa35438ad9791549 100644
+--- a/src/app/renderer_state.rs
++++ b/src/app/renderer_state.rs
+@@ -12,9 +12,9 @@ use crate::render::gpu::GpuContext;
+ pub(crate) struct RendererState {
+     pub(crate) gpu: GpuContext,
+     pub(crate) batch_renderer: BatchRenderer,
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+     pub(super) ios_hud: Option<crate::app::ios_hud_render::IosHudArt>,
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+     pub(super) ios_sidebar_art: Option<crate::app::ios_sidebar_art::IosSidebarArt>,
+     pub(crate) fps_overlay: crate::app::diagnostics::fps_overlay::FpsOverlay,
+     pub(crate) terrain_draw_renderer: crate::render::terrain_draw::TerrainDrawRenderer,
 diff --git a/src/app/shell_campaign.rs b/src/app/shell_campaign.rs
 index 183fd74ae20cd8f4ed355ef4117327b6f2add5d7..97ea1dd9f9a3eafa6d028247952eab232ec96626 100644
 --- a/src/app/shell_campaign.rs
@@ -94298,7 +96801,7 @@ index 0ca77b8002995e0a95f854c82f7b4cc051e7939a..b926399d79da36024cad2544231f8b77
          }
      }
 diff --git a/src/app/shell_movies_credits.rs b/src/app/shell_movies_credits.rs
-index d6d7057a0ddc460be098f4948c19e337e46455e1..5a7bdab3451ea83dba9ddee682623231f633f2da 100644
+index d6d7057a0ddc460be098f4948c19e337e46455e1..dc7984319fe0c5daedbf38bfd030c8c913a86ec4 100644
 --- a/src/app/shell_movies_credits.rs
 +++ b/src/app/shell_movies_credits.rs
 @@ -6,7 +6,7 @@
@@ -94310,6 +96813,15 @@ index d6d7057a0ddc460be098f4948c19e337e46455e1..5a7bdab3451ea83dba9ddee682623231
  
  use super::{App, AppState};
  use crate::app::frontend::credits_roll::{
+@@ -405,7 +405,7 @@ impl App {
+ 
+     /// Direct touch ownership runs before any generic pointer translation.
+     /// Other movie-area touches are consumed but never arm a skip action.
+-    #[cfg(any(target_os = "ios", target_os = "android"))]
++    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+     pub(crate) fn fullscreen_movie_touch(
+         state: &mut AppState,
+         touch: &winit::event::Touch,
 diff --git a/src/app/shell_network_setup.rs b/src/app/shell_network_setup.rs
 index 026dcff5116a62796096a0563185bae81aa52112..f5dd60ebd651c7233a1f9f405eae75667804f0b0 100644
 --- a/src/app/shell_network_setup.rs
@@ -94713,10 +97225,26 @@ index 5e40a5f5a49710634e689e4ee8b952f30a559df0..30dee7e8b3fa5281ea8fd148688bf9fa
          );
          Self::apply_saved_seed_input(state, result);
 diff --git a/src/app/shell_skirmish.rs b/src/app/shell_skirmish.rs
-index 1f056836e67f75f3b94a44e8b1280560a8176135..a411eaa7cd29b2d96d14d9369d1366fa97f5c850 100644
+index 1f056836e67f75f3b94a44e8b1280560a8176135..b340159169421e67042f2e0eeaaa5f1e46c28ff5 100644
 --- a/src/app/shell_skirmish.rs
 +++ b/src/app/shell_skirmish.rs
-@@ -964,7 +964,7 @@ impl App {
+@@ -264,9 +264,15 @@ impl App {
+                         &raw_session,
+                     ) {
+                     Ok(resolved_session) => {
++                        // A web Start action hands the canvas straight to its
++                        // native loading painter. A teardown slide would leave
++                        // the old menu visible before that first loading frame.
++                        #[cfg(target_arch = "wasm32")]
++                        Self::commit_skirmish_start(state, resolved_session);
+                         // 0x006ACEE0 packs the session and writes
+                         // result 0x617; the runner (0x006AE2C0) then
+                         // slides the dialog out before the launch.
++                        #[cfg(not(target_arch = "wasm32"))]
+                         Self::leave_shell_dialog(
+                             state,
+                             crate::app::frontend::shell_transition::ShellExitThen::SkirmishStart(
+@@ -964,7 +970,7 @@ impl App {
              .skirmish_shell_state
              .choose_map_modal
              .as_mut()
@@ -94879,30 +97407,82 @@ index b4e76623abbde41f5696b32a5b771dbe0a28491a..832e426c859c6e6956d1918c6ff47aa8
  
  /// Event 9's status that completes the server-list wait.
  const SERVER_STATUS_READY: u32 = 0x0004_012F;
+diff --git a/src/app/state.rs b/src/app/state.rs
+index 2d66b7dcb915cf95231a23896eda14a18be46dc5..96712148f37e93f8f3fbc6a245a2eaec67b93492 100644
+--- a/src/app/state.rs
++++ b/src/app/state.rs
+@@ -84,8 +84,8 @@ impl AppState {
+         width: u32,
+         height: u32,
+     ) -> crate::ui::sidebar::SidebarFrame {
+-        #[cfg(any(target_os = "ios", target_os = "android"))]
+-        if self.platform.capture_client_size.is_none() {
++        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
++        if self.branded_hud_mode() {
+             let window_zoom = self.tactical_zoom().map_or(1.0, |zoom| zoom.scale());
+             return crate::ui::sidebar::SidebarFrame::for_ios(
+                 width,
+@@ -158,10 +158,26 @@ impl AppState {
+             .map_or((x, y), |zoom| zoom.source_to_window(x, y))
+     }
+ 
+-    /// Ordinary iOS uses direct touch targets, never a visible mouse pointer.
++    /// The Web client shares the generated faction chrome and editable bar
++    /// with native mobile. Input-device selection remains independent.
++    pub(crate) fn branded_hud_mode(&self) -> bool {
++        cfg!(any(
++            target_os = "ios",
++            target_os = "android",
++            target_arch = "wasm32"
++        )) && self.platform.capture_client_size.is_none()
++    }
++
++    /// Direct-touch input is independent of the shared branded HUD. Desktop
++    /// Web keeps its mouse cursor, edge scrolling and ordinary world controls.
+     pub(crate) fn touch_input_mode(&self) -> bool {
++        if self.platform.capture_client_size.is_some() {
++            return false;
++        }
++        #[cfg(target_arch = "wasm32")]
++        return self.platform.browser_touch;
++        #[cfg(not(target_arch = "wasm32"))]
+         cfg!(any(target_os = "ios", target_os = "android"))
+-            && self.platform.capture_client_size.is_none()
+     }
+ 
+     /// Whether the software cursor (mouse.shp) should be active this frame.
 diff --git a/src/app/state/platform.rs b/src/app/state/platform.rs
-index e7e30113de8bb9249abe3cb8c86f7d008f39dd0a..a302fdff5ed0bd496a4d61bad1043f0c42cce143 100644
+index e7e30113de8bb9249abe3cb8c86f7d008f39dd0a..dcc25acc4dbdc56e93a1651a81e1a8e0d06e5623 100644
 --- a/src/app/state/platform.rs
 +++ b/src/app/state/platform.rs
-@@ -80,6 +80,9 @@ pub(crate) struct PlatformState {
+@@ -80,6 +80,14 @@ pub(crate) struct PlatformState {
      /// `[gameplay] pause_on_focus_loss`: whether a deactivated window freezes
      /// the match the way native does. Off, the match runs on in the background.
      pub(crate) pause_on_focus_loss: bool,
 +    /// Browser transport lifecycle only; never simulation authority.
 +    #[cfg(target_arch = "wasm32")]
 +    pub(crate) browser_online: bool,
++    /// Browser touch presentation/input selection, separate from simulation.
++    /// Capability detection enables mobile chrome before the first frame; a
++    /// genuine winit touch also enables it for devices hiding that capability.
++    #[cfg(target_arch = "wasm32")]
++    pub(crate) browser_touch: bool,
      /// Whether the window has no visible surface — minimised, or occluded on
      /// the platforms that report occlusion.
      ///
-@@ -121,6 +124,8 @@ impl PlatformState {
+@@ -121,6 +129,11 @@ impl PlatformState {
              held_modifier_keys: Default::default(),
              window_active: true,
              pause_on_focus_loss,
 +            #[cfg(target_arch = "wasm32")]
 +            browser_online: false,
++            #[cfg(target_arch = "wasm32")]
++            browser_touch: web_sys::window()
++                .is_some_and(|window| window.navigator().max_touch_points() > 0),
              window_hidden: false,
              frame_pacer: LocalFramePacer::new(),
              game_config,
-@@ -136,6 +141,10 @@ impl PlatformState {
+@@ -136,6 +149,10 @@ impl PlatformState {
      /// output on the activation edge itself, so that gate follows
      /// [`Self::window_active`] alone.
      pub(crate) fn focus_freeze_active(&self) -> bool {
@@ -97300,7 +99880,7 @@ index 0000000000000000000000000000000000000000..d77e1cba6759329aa6e6a594744b88a8
 +    return textureLoad(encoded_frame, vec2i(position.xy), 0);
 +}
 diff --git a/src/render/werhd_menu_movie.rs b/src/render/werhd_menu_movie.rs
-index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb117ee6f4eb 100644
+index a85e7378fdd9cee8afe75195fa618ca57afb49d7..7fb9377936b1a3a12ac30c32b329fbda2825d84d 100644
 --- a/src/render/werhd_menu_movie.rs
 +++ b/src/render/werhd_menu_movie.rs
 @@ -1,16 +1,85 @@
@@ -97393,26 +99973,28 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
      Branded(BrandedMenuSurface),
  }
  
-@@ -21,7 +90,30 @@ impl From<BinkMovieSurface> for MenuMovieSurface {
+@@ -21,7 +90,32 @@ impl From<BinkMovieSurface> for MenuMovieSurface {
  }
  
  impl MenuMovieSurface {
 -    #[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 +    #[cfg(target_arch = "wasm32")]
 +    pub(crate) fn set_playing(&mut self, playing: bool) {
-+        if let Self::Branded(movie) = self
-+            && let Some(video) = movie.video.as_mut()
-+        {
-+            video.set_playing(playing);
++        if let Self::Branded(movie) = self {
++            movie.playback_gate.menu_shown = playing;
++            if let Some(video) = movie.video.as_mut() {
++                video.set_playing(playing);
++            }
 +        }
 +    }
 +
 +    #[cfg(target_arch = "wasm32")]
 +    pub(crate) fn set_window_active(&mut self, active: bool) {
-+        if let Self::Branded(movie) = self
-+            && let Some(video) = movie.video.as_mut()
-+        {
-+            video.set_window_active(active);
++        if let Self::Branded(movie) = self {
++            movie.playback_gate.window_active = active;
++            if let Some(video) = movie.video.as_mut() {
++                video.set_window_active(active);
++            }
 +        }
 +    }
 +
@@ -97425,7 +100007,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
      pub(crate) fn branded(
          gpu: &GpuContext,
          batch: &crate::render::batch::BatchRenderer,
-@@ -32,7 +124,12 @@ impl MenuMovieSurface {
+@@ -32,7 +126,12 @@ impl MenuMovieSurface {
      pub(crate) fn batch_texture(&self) -> &BatchTexture {
          match self {
              Self::Retail(movie) => movie.batch_texture(),
@@ -97439,7 +100021,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
              Self::Branded(movie) => &movie.batch_texture,
          }
      }
-@@ -40,8 +137,13 @@ impl MenuMovieSurface {
+@@ -40,8 +139,13 @@ impl MenuMovieSurface {
      pub(crate) fn source_archive(&self) -> &str {
          match self {
              Self::Retail(movie) => movie.source_archive(),
@@ -97455,7 +100037,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
          }
      }
  
-@@ -52,26 +154,86 @@ impl MenuMovieSurface {
+@@ -52,26 +156,83 @@ impl MenuMovieSurface {
      ) -> Result<BinkMovieStep, AssetError> {
          match self {
              Self::Retail(movie) => movie.step(gpu, elapsed_secs),
@@ -97487,6 +100069,10 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
 +    video: Option<browser_video::BrowserMenuVideo>,
 +    #[cfg(target_arch = "wasm32")]
 +    showing_video: bool,
++    #[cfg(target_arch = "wasm32")]
++    video_attempted: bool,
++    #[cfg(target_arch = "wasm32")]
++    playback_gate: VideoPlaybackGate,
  }
  
 -#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
@@ -97513,30 +100099,23 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
 +            FrameStream::new(POSTER)?
 +        };
 +        #[cfg(target_arch = "wasm32")]
-+        let video = {
-+            if crate::util::browser_content::capabilities().menu_animation {
-+                let path = std::path::Path::new(crate::util::browser_io::RETAIL_ROOT)
-+                    .join("werhd-menu.mp4");
-+                match crate::util::browser_io::read_shared(path) {
-+                    Ok(bytes) => match browser_video::BrowserMenuVideo::new(
-+                        bytes.as_slice(),
-+                        frames.archive.width,
-+                        frames.archive.height,
-+                    ) {
-+                        Ok(video) => Some(video),
-+                        Err(error) => {
-+                            log::warn!(
-+                                "Could not prepare browser menu MP4: {error:?}; keeping poster"
-+                            );
-+                            None
-+                        }
-+                    },
-+                    Err(_) => None,
++        let bytes = browser_menu_video_bytes();
++        #[cfg(target_arch = "wasm32")]
++        let video_attempted = bytes.is_some();
++        #[cfg(target_arch = "wasm32")]
++        let video = bytes.and_then(|bytes| {
++            match browser_video::BrowserMenuVideo::new(
++                bytes.as_slice(),
++                frames.archive.width,
++                frames.archive.height,
++            ) {
++                Ok(video) => Some(video),
++                Err(error) => {
++                    log::warn!("Could not prepare browser menu MP4: {error:?}; keeping poster");
++                    None
 +                }
-+            } else {
-+                None
 +            }
-+        };
++        });
 +        #[cfg(target_arch = "wasm32")]
 +        let source = if video.is_some() {
 +            "/retail/werhd-menu.mp4 (browser decoder)"
@@ -97546,7 +100125,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
          let (texture, batch_texture) = batch.create_updatable_texture(
              &gpu.device,
              &gpu.queue,
-@@ -82,15 +244,57 @@ impl BrandedMenuSurface {
+@@ -82,15 +243,82 @@ impl BrandedMenuSurface {
          );
          Ok(Self {
              frames,
@@ -97557,6 +100136,10 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
 +            video,
 +            #[cfg(target_arch = "wasm32")]
 +            showing_video: false,
++            #[cfg(target_arch = "wasm32")]
++            video_attempted,
++            #[cfg(target_arch = "wasm32")]
++            playback_gate: VideoPlaybackGate::default(),
          })
      }
  
@@ -97565,6 +100148,27 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
 +        #[cfg(target_arch = "wasm32")]
 +        {
 +            let _ = elapsed_secs; // The browser's decoder owns MP4 time/looping.
++            if !self.video_attempted
++                && let Some(bytes) = browser_menu_video_bytes()
++            {
++                self.video_attempted = true;
++                match browser_video::BrowserMenuVideo::new(
++                    bytes.as_slice(),
++                    self.frames.archive.width,
++                    self.frames.archive.height,
++                ) {
++                    Ok(mut video) => {
++                        video.set_window_active(self.playback_gate.window_active);
++                        video.set_playing(self.playback_gate.menu_shown);
++                        self.source = "verified menu MP4 (browser decoder)";
++                        self.video = Some(video);
++                        log::info!("Installed downloaded compressed menu MP4 into native menu");
++                    }
++                    Err(error) => log::warn!(
++                        "Could not prepare downloaded menu MP4: {error:?}; keeping poster"
++                    ),
++                }
++            }
 +            let Some(video) = self.video.as_mut() else {
 +                return Ok(BinkMovieStep::Unchanged);
 +            };
@@ -97605,7 +100209,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
          gpu.queue.write_texture(
              wgpu::TexelCopyTextureInfo {
                  texture: &self.texture,
-@@ -98,7 +302,7 @@ impl BrandedMenuSurface {
+@@ -98,7 +326,7 @@ impl BrandedMenuSurface {
                  origin: wgpu::Origin3d::ZERO,
                  aspect: wgpu::TextureAspect::All,
              },
@@ -97614,7 +100218,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
              wgpu::TexelCopyBufferLayout {
                  offset: 0,
                  bytes_per_row: Some(self.frames.archive.width * 4),
-@@ -110,13 +314,49 @@ impl BrandedMenuSurface {
+@@ -110,13 +338,61 @@ impl BrandedMenuSurface {
                  depth_or_array_layers: 1,
              },
          );
@@ -97623,6 +100227,18 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
  }
  
 -#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android", test))]
++#[cfg(target_arch = "wasm32")]
++fn browser_menu_video_bytes() -> Option<std::sync::Arc<Vec<u8>>> {
++    crate::util::browser_menu_media::current().or_else(|| {
++        if !crate::util::browser_content::capabilities().menu_animation {
++            return None;
++        }
++        let path =
++            std::path::Path::new(crate::util::browser_io::RETAIL_ROOT).join("werhd-menu.mp4");
++        crate::util::browser_io::read_shared(path).ok()
++    })
++}
++
 +#[cfg(any(
 +    target_os = "ios",
 +    target_os = "macos",
@@ -97667,7 +100283,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
      offsets: Vec<usize>,
      width: u32,
      height: u32,
-@@ -124,9 +364,20 @@ struct FrameArchive<'a> {
+@@ -124,9 +400,20 @@ struct FrameArchive<'a> {
      key_interval: usize,
  }
  
@@ -97689,7 +100305,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
          const HEADER_SIZE: usize = 8 + 6 * 4;
          if bytes.len() < HEADER_SIZE || &bytes[..8] != b"VWMV0001" {
              return Err(invalid("unrecognized or truncated header"));
-@@ -174,7 +425,8 @@ impl<'a> FrameArchive<'a> {
+@@ -174,7 +461,8 @@ impl<'a> FrameArchive<'a> {
              return Err(invalid("frame index does not cover the payload"));
          }
          Ok(Self {
@@ -97699,7 +100315,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
              offsets,
              width,
              height,
-@@ -191,8 +443,9 @@ impl<'a> FrameArchive<'a> {
+@@ -191,8 +479,9 @@ impl<'a> FrameArchive<'a> {
          let Some((&start, &end)) = self.offsets.get(index).zip(self.offsets.get(index + 1)) else {
              return Err(invalid("frame index is out of range"));
          };
@@ -97710,7 +100326,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
                  .map_err(|error| invalid(format!("frame {index} PNG: {error}")))?
                  .into_rgba8();
          if png.width() != self.width || png.height() != self.height {
-@@ -215,20 +468,42 @@ impl<'a> FrameArchive<'a> {
+@@ -215,20 +504,42 @@ impl<'a> FrameArchive<'a> {
      }
  }
  
@@ -97756,7 +100372,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
          let mut rgba = Vec::new();
          archive.decode(0, &mut rgba)?;
          Ok(Self {
-@@ -240,6 +515,11 @@ impl<'a> FrameStream<'a> {
+@@ -240,6 +551,11 @@ impl<'a> FrameStream<'a> {
      }
  
      fn advance(&mut self, elapsed_secs: f64) -> Result<bool, AssetError> {
@@ -97768,7 +100384,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
          if elapsed_secs.is_finite() {
              self.accumulator_secs += elapsed_secs.max(0.0);
          }
-@@ -266,7 +546,13 @@ impl<'a> FrameStream<'a> {
+@@ -266,7 +582,13 @@ impl<'a> FrameStream<'a> {
      }
  }
  
@@ -97783,7 +100399,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
  fn invalid(detail: impl Into<String>) -> AssetError {
      AssetError::ParseError {
          format: "WERHD menu frames".to_string(),
-@@ -279,6 +565,60 @@ mod tests {
+@@ -279,6 +601,60 @@ mod tests {
      use super::*;
      use image::ImageEncoder;
  
@@ -97844,7 +100460,7 @@ index a85e7378fdd9cee8afe75195fa618ca57afb49d7..b8dfc96dc33470f765e0320f7d7ceb11
      fn fixture(frames: &[Vec<u8>], width: u32, height: u32, interval: usize) -> Vec<u8> {
          let mut payload = Vec::new();
          let mut offsets = vec![0_u64];
-@@ -357,4 +697,76 @@ mod tests {
+@@ -357,4 +733,76 @@ mod tests {
          wrong_size[8..12].copy_from_slice(&2_u32.to_le_bytes());
          assert!(FrameStream::new(&wrong_size).is_err());
      }
@@ -98638,6 +101254,262 @@ index eb7405b0f010878a8262c3dd3ddc262acae0f624..bff7cf3fd7df2b5db424e712645c9c8a
  
  use super::descriptor::DialogId;
  use super::layout::LaidOutControl;
+diff --git a/src/ui/shell/in_game_options.rs b/src/ui/shell/in_game_options.rs
+index 09753e238725fb6a1bdb9b0bab81f21971f6dbee..d46b7960377cb6100dad93672ecd5f87d54331ff 100644
+--- a/src/ui/shell/in_game_options.rs
++++ b/src/ui/shell/in_game_options.rs
+@@ -58,6 +58,11 @@ pub mod control {
+     pub const VISUAL_DETAILS_VALUE: u16 = 0x0673;
+     /// Blank footer / status-line static; `GUI:Blank` (resolves empty), SS_LEFT.
+     pub const FOOTER: u16 = 0x0695;
++    // VERA Web-local controls; none replace a retail template control.
++    pub const MOUSE_SENSITIVITY: u16 = 0x7F60;
++    pub const MOUSE_SENSITIVITY_CAPTION: u16 = 0x7F61;
++    pub const MOUSE_SENSITIVITY_VALUE: u16 = 0x7F62;
++    pub const MOUSE_SENSITIVITY_RESET: u16 = 0x7F63;
+ }
+ 
+ /// GameSpeed/ScrollRate value-label CSF keys, indexed by SLIDER POSITION (0..6).
+@@ -107,7 +112,12 @@ const DIALOG_0BBB: u16 = 0x0BBB;
+ /// so it is stored `enabled: false`. The Sound button is template-enabled here
+ /// (its runtime no-device disable layers over this in the controller, 5a-iii).
+ pub fn build_in_game_options_descriptor() -> DialogDescriptor {
+-    DialogDescriptor {
++    build_in_game_options_descriptor_for_web(cfg!(target_arch = "wasm32"))
++}
++
++/// Add the Web pointer preference without changing any retail descriptor.
++pub fn build_in_game_options_descriptor_for_web(web_controls: bool) -> DialogDescriptor {
++    let mut descriptor = DialogDescriptor {
+         id: DialogId(DIALOG_0BBB),
+         controls: vec![
+             options_control(
+@@ -231,7 +241,40 @@ pub fn build_in_game_options_descriptor() -> DialogDescriptor {
+         bg_kind: BgKind::InGameOptions,
+         slide_eligible: false,
+         reposition_policy: RepositionPolicy::InGameOptions,
++    };
++    if web_controls {
++        // The retail VisualDetails triplet remains hidden and unchanged. Its
++        // unused third row hosts this independent pointer control on Web.
++        descriptor.controls.extend([
++            options_control(
++                control::MOUSE_SENSITIVITY,
++                ControlKind::Trackbar,
++                RectPx::new(144, 162, 128, 13),
++                true,
++                true,
++            ),
++            options_static(
++                control::MOUSE_SENSITIVITY_CAPTION,
++                RectPx::new(61, 161, 78, 15),
++                "VERA:MouseSensitivity",
++                true,
++            ),
++            options_static(
++                control::MOUSE_SENSITIVITY_VALUE,
++                RectPx::new(278, 161, 92, 15),
++                "GUI:Blank",
++                true,
++            ),
++            options_control(
++                control::MOUSE_SENSITIVITY_RESET,
++                ControlKind::Button,
++                RectPx::new(278, 181, 92, 16),
++                true,
++                true,
++            ),
++        ]);
+     }
++    descriptor
+ }
+ 
+ /// One Options control descriptor. The `anchor` field is unused under
+@@ -260,6 +303,7 @@ fn options_control(
+             control::TARGET_LINES => Some("GUI:TargetLines"),
+             control::SHOW_HIDDEN => Some("GUI:ShowHidden"),
+             control::TOOLTIPS => Some("GUI:Tooltips"),
++            control::MOUSE_SENSITIVITY_RESET => Some("VERA:MouseSensitivityReset"),
+             _ => None,
+         },
+         tooltip_key: None,
+@@ -297,6 +341,49 @@ fn options_static(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn web_mouse_controls_extend_but_do_not_replace_the_retail_template() {
++        let retail = build_in_game_options_descriptor_for_web(false);
++        let web = build_in_game_options_descriptor_for_web(true);
++        assert_eq!(retail.controls.len(), 17);
++        assert_eq!(web.controls.len(), 21);
++        for (before, after) in retail.controls.iter().zip(web.controls.iter()) {
++            assert_eq!(
++                (
++                    before.id,
++                    before.kind,
++                    before.dlu_rect,
++                    before.visible,
++                    before.enabled
++                ),
++                (
++                    after.id,
++                    after.kind,
++                    after.dlu_rect,
++                    after.visible,
++                    after.enabled
++                )
++            );
++        }
++        assert!(
++            web.controls
++                .iter()
++                .filter(|control| matches!(
++                    control.id,
++                    control::VISUAL_DETAILS
++                        | control::VISUAL_DETAILS_CAPTION
++                        | control::VISUAL_DETAILS_VALUE
++                ))
++                .all(|control| !control.visible)
++        );
++        assert!(
++            web.controls
++                .iter()
++                .filter(|control| control.id >= control::MOUSE_SENSITIVITY)
++                .all(|control| control.visible && control.enabled)
++        );
++    }
+     use crate::ui::shell::geom;
+     use crate::ui::shell::layout::layout_pass;
+ 
+diff --git a/src/ui/shell/in_game_options_state.rs b/src/ui/shell/in_game_options_state.rs
+index d0a09a887b15710289bbb45e6b7d0b6fba67a999..c57cdb84213de972fede79ebd4e8976e78cda392 100644
+--- a/src/ui/shell/in_game_options_state.rs
++++ b/src/ui/shell/in_game_options_state.rs
+@@ -13,6 +13,14 @@ pub const OPTIONS_SPEED_MIN: u32 = 0;
+ pub const OPTIONS_SPEED_MAX: u32 = 6;
+ /// DetailLevel range (0 = low .. 2 = high), direct (not inverted).
+ pub const OPTIONS_DETAIL_MAX: u32 = 2;
++/// Web pointer movement gain. Independent of the map's ScrollRate and of
++/// simulation speed; the shared settings profile persists this percentage.
++pub const MOUSE_SENSITIVITY_MIN: u32 = 25;
++pub const MOUSE_SENSITIVITY_MAX: u32 = 400;
++pub const MOUSE_SENSITIVITY_STEP: u32 = 5;
++pub const MOUSE_SENSITIVITY_DEFAULT: u32 = 100;
++pub const MOUSE_SENSITIVITY_STOPS: u32 =
++    (MOUSE_SENSITIVITY_MAX - MOUSE_SENSITIVITY_MIN) / MOUSE_SENSITIVITY_STEP;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct InGameOptionsState {
+@@ -25,6 +33,7 @@ pub struct InGameOptionsState {
+     pub unit_action_lines: bool,
+     pub show_hidden: bool,
+     pub tooltips: bool,
++    pub mouse_sensitivity_percent: u32,
+     /// Transient: which owner-draw button is held (for the pressed frame).
+     pub buttons: super::button::ShellButtonInteraction<u16>,
+     /// Native4E2201..2229 projects the common audio-device predicate.
+@@ -46,6 +55,7 @@ impl Default for InGameOptionsState {
+             unit_action_lines: true,
+             show_hidden: false,
+             tooltips: true,
++            mouse_sensitivity_percent: MOUSE_SENSITIVITY_DEFAULT,
+             buttons: Default::default(),
+             sound_enabled: true,
+             dragging_slider: None,
+@@ -55,6 +65,10 @@ impl Default for InGameOptionsState {
+ }
+ 
+ impl InGameOptionsState {
++    pub fn reset_mouse_sensitivity(&mut self) {
++        self.mouse_sensitivity_percent = MOUSE_SENSITIVITY_DEFAULT;
++    }
++
+     /// Reset the transient interaction state when the overlay (re)opens; gamemd
+     /// recreates the dialog each open, and init decides the GameSpeed row.
+     pub fn on_open(&mut self, game_speed_hidden: bool) {
+@@ -75,6 +89,31 @@ pub fn speed_from_slider_pos(pos: u32) -> u32 {
+     OPTIONS_SPEED_MAX - pos.min(OPTIONS_SPEED_MAX)
+ }
+ 
++pub fn normalized_mouse_sensitivity(value: i32) -> u32 {
++    if !(MOUSE_SENSITIVITY_MIN as i32..=MOUSE_SENSITIVITY_MAX as i32).contains(&value) {
++        return MOUSE_SENSITIVITY_DEFAULT;
++    }
++    ((value as u32 + MOUSE_SENSITIVITY_STEP / 2) / MOUSE_SENSITIVITY_STEP) * MOUSE_SENSITIVITY_STEP
++}
++
++pub fn mouse_sensitivity_slider_pos(percent: u32) -> u32 {
++    (normalized_mouse_sensitivity(i32::try_from(percent).unwrap_or(-1)) - MOUSE_SENSITIVITY_MIN)
++        / MOUSE_SENSITIVITY_STEP
++}
++
++pub fn mouse_sensitivity_from_slider_pos(position: u32) -> u32 {
++    MOUSE_SENSITIVITY_MIN + position.min(MOUSE_SENSITIVITY_STOPS) * MOUSE_SENSITIVITY_STEP
++}
++
++pub fn mouse_sensitivity_thumb_left(percent: u32, rect: RectPx) -> i32 {
++    thumb_left(
++        mouse_sensitivity_slider_pos(percent) as i32,
++        rect.w,
++        0,
++        MOUSE_SENSITIVITY_STOPS as i32,
++    )
++}
++
+ /// Control-local thumb left for BBB's plain rail. Active 4E1FE0 sends 4AC=0
+ /// at 4E207F..2089 / 4E2128..2132, disabling the default 50px plaque.
+ /// Native 61DA52..61DA79 and 61E486..61E4A8 project using range, not range+1.
+@@ -102,6 +141,34 @@ mod tests {
+         assert!(s.unit_action_lines && !s.show_hidden && s.tooltips);
+     }
+ 
++    #[test]
++    fn mouse_gain_range_round_trips_and_reset_keeps_map_and_game_speeds() {
++        let mut state = InGameOptionsState::default();
++        assert_eq!(state.mouse_sensitivity_percent, 100);
++        for position in 0..=MOUSE_SENSITIVITY_STOPS {
++            let percent = mouse_sensitivity_from_slider_pos(position);
++            assert!((25..=400).contains(&percent));
++            assert_eq!(percent % 5, 0);
++            assert_eq!(mouse_sensitivity_slider_pos(percent), position);
++        }
++        for invalid in [-1, 0, 24, 401, i32::MAX] {
++            assert_eq!(normalized_mouse_sensitivity(invalid), 100);
++        }
++        assert_eq!(normalized_mouse_sensitivity(103), 105);
++        state.scroll_rate = 5;
++        state.game_speed = 2;
++        state.mouse_sensitivity_percent = 400;
++        state.reset_mouse_sensitivity();
++        assert_eq!(
++            (
++                state.mouse_sensitivity_percent,
++                state.scroll_rate,
++                state.game_speed
++            ),
++            (100, 5, 2)
++        );
++    }
++
+     #[test]
+     fn plain_192_rail_matches_original_thumb_and_partition_boundaries() {
+         // Original-instruction fixture includes the ordinary BBB width192,
+diff --git a/src/ui/shell/layout.rs b/src/ui/shell/layout.rs
+index d950e2762074dd56552f8fcf27d8576a22f6b86e..3f3bb146fda45f1f789981bce7589186015cdcd4 100644
+--- a/src/ui/shell/layout.rs
++++ b/src/ui/shell/layout.rs
+@@ -105,7 +105,8 @@ pub fn layout_pass_in_game_options(
+     desc.controls
+         .iter()
+         .map(|c| {
+-            let rect = if c.kind == ControlKind::Button {
++            let rect = if c.kind == ControlKind::Button && c.id != control::MOUSE_SENSITIVITY_RESET
++            {
+                 let y = match c.id {
+                     control::BACK => anchor.back_button_y,
+                     control::KEYBOARD => anchor.button_stack_top_y + anchor.button_canvas_h,
 diff --git a/src/ui/shell/list.rs b/src/ui/shell/list.rs
 index bac38cdda74f49f4e7c6399aab887e1f0e5eb37c..bad67fdbe63ba7a9e01c3b051da45837cf8cff00 100644
 --- a/src/ui/shell/list.rs
@@ -99551,6 +102423,98 @@ index 0000000000000000000000000000000000000000..9eed1d8dd4aa4274a1048a51e2e2d0f9
 +        Ok(())
 +    }
 +}
+diff --git a/src/util/browser_menu_media.rs b/src/util/browser_menu_media.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee9a9aa108aeacea2d707118cffd04a0aae99836
+--- /dev/null
++++ b/src/util/browser_menu_media.rs
+@@ -0,0 +1,86 @@
++//! A bounded presentation-only slot for the approved browser menu MP4.
++//!
++//! The JavaScript ContentStore checks its catalog digest before installation.
++//! This slot cannot modify mounted retail assets or any frozen game capability.
++
++use std::sync::Arc;
++
++const MAX_MENU_BYTES: usize = 8 * 1024 * 1024;
++
++#[derive(Default)]
++struct MenuMedia {
++    bytes: Option<Arc<Vec<u8>>>,
++}
++
++impl MenuMedia {
++    fn install(&mut self, bytes: Vec<u8>) -> Result<(), String> {
++        if bytes.len() < 16 || bytes.len() > MAX_MENU_BYTES || &bytes[4..8] != b"ftyp" {
++            return Err("invalid compressed menu MP4".into());
++        }
++        let first_box = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
++        if !(16..=bytes.len()).contains(&first_box) {
++            return Err("invalid menu MP4 file-type box".into());
++        }
++        if let Some(installed) = &self.bytes {
++            return if installed.as_slice() == bytes.as_slice() {
++                Ok(())
++            } else {
++                Err("the menu MP4 is already installed".into())
++            };
++        }
++        self.bytes = Some(Arc::new(bytes));
++        Ok(())
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++thread_local! {
++    static MEDIA: std::cell::RefCell<MenuMedia> = std::cell::RefCell::new(MenuMedia::default());
++}
++
++#[cfg(target_arch = "wasm32")]
++pub fn install(bytes: Vec<u8>) -> Result<(), String> {
++    MEDIA.with(|media| media.borrow_mut().install(bytes))
++}
++
++#[cfg(target_arch = "wasm32")]
++pub fn current() -> Option<Arc<Vec<u8>>> {
++    MEDIA.with(|media| media.borrow().bytes.clone())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn mp4() -> Vec<u8> {
++        let mut bytes = 16_u32.to_be_bytes().to_vec();
++        bytes.extend_from_slice(b"ftypisom\0\0\0\0");
++        bytes
++    }
++
++    #[test]
++    fn one_bounded_presentation_slot_is_idempotent_but_cannot_replace_content() {
++        let mut media = MenuMedia::default();
++        media.install(mp4()).unwrap();
++        let original = media.bytes.clone().unwrap();
++        media.install(mp4()).unwrap();
++        assert!(Arc::ptr_eq(&original, media.bytes.as_ref().unwrap()));
++        let mut other = mp4();
++        other.push(1);
++        assert!(media.install(other).is_err());
++        assert_eq!(media.bytes.as_ref().unwrap().as_slice(), mp4());
++    }
++
++    #[test]
++    fn invalid_or_unbounded_media_never_occupies_the_slot() {
++        for invalid in [Vec::new(), vec![0; 16], vec![0; MAX_MENU_BYTES + 1], {
++            let mut bytes = mp4();
++            bytes[..4].copy_from_slice(&32_u32.to_be_bytes());
++            bytes
++        }] {
++            let mut media = MenuMedia::default();
++            assert!(media.install(invalid).is_err());
++            assert!(media.bytes.is_none());
++        }
++    }
++}
 diff --git a/src/util/case_insensitive_path.rs b/src/util/case_insensitive_path.rs
 index 493d20d0e6ec978090e53d2a3a52bdfe241c3ac2..74f80cfb4867b758b67666a659c76c5f551dfeef 100644
 --- a/src/util/case_insensitive_path.rs
@@ -99708,7 +102672,7 @@ index 5772c39a59c9040fc278685be9a703b456d6f216..efaefa24ec881300046d80133459fac2
  const CAPACITY: usize = 4_000;
  const MESSAGE_BYTES: usize = 2_048;
 diff --git a/src/util/mod.rs b/src/util/mod.rs
-index 635492e0488399682628410cb15501e1b646d53b..64ab8eadab906ee6ecc22a23baf84082550afdd3 100644
+index 635492e0488399682628410cb15501e1b646d53b..227622decf75149ff7276e0177497350601f0858 100644
 --- a/src/util/mod.rs
 +++ b/src/util/mod.rs
 @@ -8,6 +8,7 @@
@@ -99753,13 +102717,16 @@ index 635492e0488399682628410cb15501e1b646d53b..64ab8eadab906ee6ecc22a23baf84082
  // pub mod color;
  
  pub mod native_file_time;
-@@ -48,3 +49,17 @@ pub mod native_file_time;
+@@ -48,3 +49,20 @@ pub mod native_file_time;
  pub mod native_file_name;
  
  pub mod native_affine;
 +
 +#[cfg(target_arch = "wasm32")]
 +pub mod browser_io;
++
++#[cfg(any(target_arch = "wasm32", test))]
++pub mod browser_menu_media;
 +
 +/// Platform file operations: native disk or the browser-mounted retail/persistent store.
 +pub mod file_io {
@@ -99808,10 +102775,10 @@ index c2a5bcb4cee96dfcd0c0f75dc3333982d1957c94..d401e15ed7425038dd6d05c085d7f5ad
 +}
 diff --git a/src/web_entry.rs b/src/web_entry.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..798b688444ed54a5567432ed95161361a3abf7ca
+index 0000000000000000000000000000000000000000..646602fc9a6d3cfd26b9e6223925cf848ca0dc54
 --- /dev/null
 +++ b/src/web_entry.rs
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,129 @@
 +//! Browser boundary for the complete native client. Rules, UI, input and drawing
 +//! remain owned by the original VERA modules.
 +use wasm_bindgen::prelude::*;
@@ -99851,6 +102818,14 @@ index 0000000000000000000000000000000000000000..798b688444ed54a5567432ed95161361
 +    crate::util::browser_io::register_asset(name, bytes).map_err(|error| JsValue::from_str(&error))
 +}
 +
++/// Presentation-only menu video; retail resources stay frozen after startup.
++#[wasm_bindgen]
++pub fn install_menu_animation(bytes: Vec<u8>) -> Result<(), JsValue> {
++    crate::util::browser_menu_media::install(bytes).map_err(|error| JsValue::from_str(&error))?;
++    crate::app::browser::wake();
++    Ok(())
++}
++
 +#[wasm_bindgen]
 +pub fn configure_content(json: &str) -> Result<(), JsValue> {
 +    crate::util::browser_content::configure(json).map_err(|error| JsValue::from_str(&error))
@@ -99880,6 +102855,18 @@ index 0000000000000000000000000000000000000000..798b688444ed54a5567432ed95161361
 +#[wasm_bindgen]
 +pub fn browser_diagnostics() -> JsValue {
 +    crate::app::browser::diagnostics()
++}
++
++/// Cheap capability reads for the invisible browser adapters. These do not
++/// enable full acceptance snapshots or allocate unit/terrain JSON.
++#[wasm_bindgen]
++pub fn browser_pointer_capture_allowed() -> bool {
++    crate::app::browser::pointer_capture_allowed()
++}
++
++#[wasm_bindgen]
++pub fn browser_menu_active() -> bool {
++    crate::app::browser::menu_active()
 +}
 +
 +#[wasm_bindgen]

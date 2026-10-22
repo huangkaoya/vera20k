@@ -405,7 +405,7 @@ impl App {
 
     /// Direct touch ownership runs before any generic pointer translation.
     /// Other movie-area touches are consumed but never arm a skip action.
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
     pub(crate) fn fullscreen_movie_touch(
         state: &mut AppState,
         touch: &winit::event::Touch,

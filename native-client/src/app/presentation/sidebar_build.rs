@@ -31,8 +31,7 @@ pub(crate) fn build_sidebar_chrome_instances(
     let Some(atlas) = current_sidebar_chrome(state) else {
         return Vec::new();
     };
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    {
+    if cfg!(any(target_os = "ios", target_os = "android")) || state.branded_hud_mode() {
         // The touch sidebar paints its own faction background and controls.
         // Keep the original animated power meter with the production state
         // that already owns its segment count and deficit blink.
@@ -49,9 +48,8 @@ pub(crate) fn build_sidebar_chrome_instances(
             ],
             0.00048,
         );
-        instances
+        return instances;
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     build_sidebar_chrome_instances_for_layout(
         atlas,
         state.match_state.match_presentation.sidebar_layout_spec,
@@ -71,6 +69,9 @@ pub(crate) fn build_sidebar_chrome_instances(
 /// The bottom command bar, which shares the chrome atlas but draws into a
 /// surface of its own (`presentation::sidebar_surface`).
 pub(crate) fn build_command_bar_instances(state: &AppState) -> Vec<SpriteInstance> {
+    if state.branded_hud_mode() {
+        return Vec::new();
+    }
     let mut instances = Vec::new();
     if let Some(atlas) = current_sidebar_chrome(state) {
         command_bar::append(state, atlas, &mut instances);

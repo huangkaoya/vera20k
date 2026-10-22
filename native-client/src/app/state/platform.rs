@@ -83,6 +83,11 @@ pub(crate) struct PlatformState {
     /// Browser transport lifecycle only; never simulation authority.
     #[cfg(target_arch = "wasm32")]
     pub(crate) browser_online: bool,
+    /// Browser touch presentation/input selection, separate from simulation.
+    /// Capability detection enables mobile chrome before the first frame; a
+    /// genuine winit touch also enables it for devices hiding that capability.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) browser_touch: bool,
     /// Whether the window has no visible surface — minimised, or occluded on
     /// the platforms that report occlusion.
     ///
@@ -126,6 +131,9 @@ impl PlatformState {
             pause_on_focus_loss,
             #[cfg(target_arch = "wasm32")]
             browser_online: false,
+            #[cfg(target_arch = "wasm32")]
+            browser_touch: web_sys::window()
+                .is_some_and(|window| window.navigator().max_touch_points() > 0),
             window_hidden: false,
             frame_pacer: LocalFramePacer::new(),
             game_config,

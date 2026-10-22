@@ -53,9 +53,13 @@ fn draw_sidebar_surface(
     encoder: &mut wgpu::CommandEncoder,
     data: &DrawPassData<'_>,
 ) {
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    crate::app::ios_sidebar_art::prepare(state);
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let touch_input =
+        cfg!(any(target_os = "ios", target_os = "android")) || state.branded_hud_mode();
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+    if touch_input {
+        crate::app::ios_sidebar_art::prepare(state);
+    }
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
     let theme = crate::app::presentation::sidebar_render::current_sidebar_theme(state);
     let side_index = crate::app::presentation::sidebar_render::current_sidebar_side(state);
     let presentation = &state.match_state.match_presentation;
@@ -75,20 +79,24 @@ fn draw_sidebar_surface(
     let mut draw = |tex: Option<&BatchTexture>, key: &'static str| {
         draw_pooled_with_camera(&mut pass, batch, camera, pool, tex, key);
     };
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    draw(
-        renderer
-            .ios_sidebar_art
-            .as_ref()
-            .map(|art| art.texture(theme)),
-        "ios_sidebar_background",
-    );
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+    if touch_input {
+        draw(
+            renderer
+                .ios_sidebar_art
+                .as_ref()
+                .map(|art| art.texture(theme)),
+            "ios_sidebar_background",
+        );
+    }
     draw(chrome.map(|atlas| &atlas.texture), "sidebar_chrome");
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    draw(
-        renderer.ios_sidebar_art.as_ref().map(|art| art.glyphs()),
-        "ios_sidebar_controls",
-    );
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+    if touch_input {
+        draw(
+            renderer.ios_sidebar_art.as_ref().map(|art| art.glyphs()),
+            "ios_sidebar_controls",
+        );
+    }
     draw(
         presentation
             .sidebar_cameo_atlas
@@ -196,11 +204,12 @@ fn draw_sidebar_surface(
     };
     draw(cameo_overlay_tex, "sidebar_cameo_overlay");
     draw(Some(renderer.bit_font.atlas()), "sidebar_text");
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
-    draw(
-        presentation.radar_anim.as_ref().map(|ra| ra.texture()),
-        "radar_anim",
-    );
+    if !touch_input {
+        draw(
+            presentation.radar_anim.as_ref().map(|ra| ra.texture()),
+            "radar_anim",
+        );
+    }
     let minimap = presentation.minimap.as_ref();
     draw(minimap.map(|m| m.map_texture()), "minimap");
     draw(minimap.map(|m| m.white_texture()), "viewport_rect");

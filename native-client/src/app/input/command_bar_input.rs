@@ -3,7 +3,11 @@
 use super::*;
 
 pub(super) fn sync(state: &mut AppState) {
-    let layout = crate::app::presentation::sidebar_build::command_bar::layout_and_slots(state);
+    // The shared branded bar owns its own visible buttons. Retiring the old
+    // gadget rectangles also prevents clicks reaching controls behind it.
+    let layout = (!state.branded_hud_mode())
+        .then(|| crate::app::presentation::sidebar_build::command_bar::layout_and_slots(state))
+        .flatten();
     let closed = state
         .match_state
         .match_presentation

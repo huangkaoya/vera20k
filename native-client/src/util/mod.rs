@@ -53,6 +53,9 @@ pub mod native_affine;
 #[cfg(target_arch = "wasm32")]
 pub mod browser_io;
 
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod browser_menu_media;
+
 /// Platform file operations: native disk or the browser-mounted retail/persistent store.
 pub mod file_io {
     #[cfg(target_arch = "wasm32")]

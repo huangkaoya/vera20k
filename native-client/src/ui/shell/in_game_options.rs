@@ -58,6 +58,11 @@ pub mod control {
     pub const VISUAL_DETAILS_VALUE: u16 = 0x0673;
     /// Blank footer / status-line static; `GUI:Blank` (resolves empty), SS_LEFT.
     pub const FOOTER: u16 = 0x0695;
+    // VERA Web-local controls; none replace a retail template control.
+    pub const MOUSE_SENSITIVITY: u16 = 0x7F60;
+    pub const MOUSE_SENSITIVITY_CAPTION: u16 = 0x7F61;
+    pub const MOUSE_SENSITIVITY_VALUE: u16 = 0x7F62;
+    pub const MOUSE_SENSITIVITY_RESET: u16 = 0x7F63;
 }
 
 /// GameSpeed/ScrollRate value-label CSF keys, indexed by SLIDER POSITION (0..6).
@@ -107,7 +112,12 @@ const DIALOG_0BBB: u16 = 0x0BBB;
 /// so it is stored `enabled: false`. The Sound button is template-enabled here
 /// (its runtime no-device disable layers over this in the controller, 5a-iii).
 pub fn build_in_game_options_descriptor() -> DialogDescriptor {
-    DialogDescriptor {
+    build_in_game_options_descriptor_for_web(cfg!(target_arch = "wasm32"))
+}
+
+/// Add the Web pointer preference without changing any retail descriptor.
+pub fn build_in_game_options_descriptor_for_web(web_controls: bool) -> DialogDescriptor {
+    let mut descriptor = DialogDescriptor {
         id: DialogId(DIALOG_0BBB),
         controls: vec![
             options_control(
@@ -231,7 +241,40 @@ pub fn build_in_game_options_descriptor() -> DialogDescriptor {
         bg_kind: BgKind::InGameOptions,
         slide_eligible: false,
         reposition_policy: RepositionPolicy::InGameOptions,
+    };
+    if web_controls {
+        // The retail VisualDetails triplet remains hidden and unchanged. Its
+        // unused third row hosts this independent pointer control on Web.
+        descriptor.controls.extend([
+            options_control(
+                control::MOUSE_SENSITIVITY,
+                ControlKind::Trackbar,
+                RectPx::new(144, 162, 128, 13),
+                true,
+                true,
+            ),
+            options_static(
+                control::MOUSE_SENSITIVITY_CAPTION,
+                RectPx::new(61, 161, 78, 15),
+                "VERA:MouseSensitivity",
+                true,
+            ),
+            options_static(
+                control::MOUSE_SENSITIVITY_VALUE,
+                RectPx::new(278, 161, 92, 15),
+                "GUI:Blank",
+                true,
+            ),
+            options_control(
+                control::MOUSE_SENSITIVITY_RESET,
+                ControlKind::Button,
+                RectPx::new(278, 181, 92, 16),
+                true,
+                true,
+            ),
+        ]);
     }
+    descriptor
 }
 
 /// One Options control descriptor. The `anchor` field is unused under
@@ -260,6 +303,7 @@ fn options_control(
             control::TARGET_LINES => Some("GUI:TargetLines"),
             control::SHOW_HIDDEN => Some("GUI:ShowHidden"),
             control::TOOLTIPS => Some("GUI:Tooltips"),
+            control::MOUSE_SENSITIVITY_RESET => Some("VERA:MouseSensitivityReset"),
             _ => None,
         },
         tooltip_key: None,
@@ -297,6 +341,49 @@ fn options_static(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_mouse_controls_extend_but_do_not_replace_the_retail_template() {
+        let retail = build_in_game_options_descriptor_for_web(false);
+        let web = build_in_game_options_descriptor_for_web(true);
+        assert_eq!(retail.controls.len(), 17);
+        assert_eq!(web.controls.len(), 21);
+        for (before, after) in retail.controls.iter().zip(web.controls.iter()) {
+            assert_eq!(
+                (
+                    before.id,
+                    before.kind,
+                    before.dlu_rect,
+                    before.visible,
+                    before.enabled
+                ),
+                (
+                    after.id,
+                    after.kind,
+                    after.dlu_rect,
+                    after.visible,
+                    after.enabled
+                )
+            );
+        }
+        assert!(
+            web.controls
+                .iter()
+                .filter(|control| matches!(
+                    control.id,
+                    control::VISUAL_DETAILS
+                        | control::VISUAL_DETAILS_CAPTION
+                        | control::VISUAL_DETAILS_VALUE
+                ))
+                .all(|control| !control.visible)
+        );
+        assert!(
+            web.controls
+                .iter()
+                .filter(|control| control.id >= control::MOUSE_SENSITIVITY)
+                .all(|control| control.visible && control.enabled)
+        );
+    }
     use crate::ui::shell::geom;
     use crate::ui::shell::layout::layout_pass;
 

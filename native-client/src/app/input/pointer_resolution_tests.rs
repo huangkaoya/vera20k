@@ -130,3 +130,75 @@ fn capture_only_source_input_keeps_the_rendered_transition_fallback() {
     input.sync_cursor_space(None);
     assert_eq!((input.cursor_x, input.cursor_y), (400.0, 300.0));
 }
+
+#[test]
+fn browser_integrated_motion_starts_a_fresh_projection_after_letterbox_clamps() {
+    for (width, height, percent, axis) in [
+        (1600, 900, 100, 0),
+        (3200, 1800, 200, 0),
+        (4800, 2700, 300, 0),
+        (600, 1000, 100, 1),
+        (1200, 2000, 200, 1),
+    ] {
+        let zoom = ZoomGeometry::new(width, height, percent, FrameShape::Original);
+        let mut input = input();
+        let start = if axis == 0 {
+            (0.0, 100.0)
+        } else {
+            (100.0, 0.0)
+        };
+        let physical = zoom.source_to_window(start.0, start.1);
+        input.set_cursor_from_window(physical, Some(zoom), true);
+        // This is the WASM DeviceEvent route: the visible window cursor has
+        // already integrated the physical movement. It must not be reduced a
+        // second time against the previous off-frame candidate.
+        for (source_delta, expected) in [(-10.0, 0.0), (1.0, 1.0), (1.0, 2.0)] {
+            let visible = zoom.source_to_window(input.cursor_x, input.cursor_y);
+            let delta = source_delta * zoom.scale();
+            let candidate = if axis == 0 {
+                (visible.0 + delta, visible.1)
+            } else {
+                (visible.0, visible.1 + delta)
+            };
+            input.reset_window_cursor_motion();
+            input.set_cursor_from_window(candidate, Some(zoom), true);
+            let actual = if axis == 0 {
+                input.cursor_x
+            } else {
+                input.cursor_y
+            };
+            assert_eq!(
+                actual, expected,
+                "{width}x{height}, zoom {percent}%, axis {axis}"
+            );
+        }
+    }
+}
+
+#[test]
+fn browser_physical_delta_gain_and_tactical_zoom_are_each_applied_once() {
+    for dpr in [1, 2, 3] {
+        let zoom = ZoomGeometry::new(1600 * dpr, 900 * dpr, 100 * dpr, FrameShape::Original);
+        for percent in [25, 100, 200, 400] {
+            let gain =
+                crate::app::input::cursor::browser::sensitivity_gain(percent).unwrap() as f32;
+            let mut input = input();
+            let start = zoom.source_to_window(100.0, 100.0);
+            input.set_cursor_from_window(start, Some(zoom), true);
+            // Winit already normalized this device motion to window pixels.
+            // One DPI-scaled physical move appears as 30/20 source pixels at
+            // a matching tactical zoom; no extra DPI factor belongs here.
+            let candidate = (
+                start.0 + 30.0 * dpr as f32 * gain,
+                start.1 + 20.0 * dpr as f32 * gain,
+            );
+            input.reset_window_cursor_motion();
+            input.set_cursor_from_window(candidate, Some(zoom), true);
+            assert_eq!(
+                (input.cursor_x, input.cursor_y),
+                (100.0 + 30.0 * gain, 100.0 + 20.0 * gain),
+                "DPR {dpr}, sensitivity {percent}%"
+            );
+        }
+    }
+}

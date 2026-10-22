@@ -19,6 +19,10 @@ use crate::sim::combat;
 #[path = "macos_cursor.rs"]
 pub(crate) mod macos;
 
+#[cfg(any(target_arch = "wasm32", test))]
+#[path = "browser_cursor.rs"]
+pub(crate) mod browser;
+
 /// WWMouse's display depth, separate from Scenario's authoritative input
 /// lock. Lock684240 hides only at depth0; Unlock684290 unwinds negative
 /// depth only when the previous Scenario byte is1. Software presentation
@@ -1832,12 +1836,8 @@ fn current_cursor_clip() -> Option<(i32, i32, i32, i32)> {
 fn apply_cursor_confinement_impl(state: &AppState, verbose: bool) {
     #[cfg(target_arch = "wasm32")]
     {
-        // Browser Pointer Lock is relative mouse input, not a Confined grab,
-        // and needs an explicit user gesture. Keep the native absolute cursor
-        // and the player's retained preference without retrying an unsupported
-        // Confined request on every presentation frame.
         let _ = verbose;
-        state.platform.pointer_held.set(false);
+        browser::apply(state);
     }
     #[cfg(target_os = "macos")]
     macos::apply(state, verbose);
@@ -1999,6 +1999,8 @@ fn apply_cursor_confinement_impl(state: &AppState, verbose: bool) {
 /// behaviour). Presentation-only.
 pub(crate) fn release_cursor_confinement(state: &AppState) {
     state.platform.pointer_held.set(false);
+    #[cfg(target_arch = "wasm32")]
+    browser::release(state);
     #[cfg(target_os = "macos")]
     macos::release(state);
 

@@ -441,6 +441,29 @@ impl LandscapeLayout {
         preferences: &Preferences,
         editor: Option<&ShortcutEditor>,
     ) -> Self {
+        Self::for_input(
+            width,
+            height,
+            scale,
+            sidebar_width,
+            preferences,
+            editor,
+            true,
+        )
+    }
+
+    /// One geometry owner for both input devices. Mouse users get the same
+    /// editable bar and center alignment, while map space has no hidden stick
+    /// or ring-button hit targets.
+    pub(super) fn for_input(
+        width: f32,
+        height: f32,
+        scale: f32,
+        sidebar_width: f32,
+        preferences: &Preferences,
+        editor: Option<&ShortcutEditor>,
+        direct_touch: bool,
+    ) -> Self {
         let width = finite_positive(width, 1.0);
         let height = finite_positive(height, 1.0);
         let scale = finite_positive(scale, 1.0);
@@ -531,6 +554,9 @@ impl LandscapeLayout {
                 false,
                 true,
             );
+        }
+        if !direct_touch {
+            return result;
         }
         let radius = (48.0 * scale).min(available * 0.18).min(height * 0.18);
         let ring_size = size;

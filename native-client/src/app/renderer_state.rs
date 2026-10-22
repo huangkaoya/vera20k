@@ -12,9 +12,9 @@ use crate::render::gpu::GpuContext;
 pub(crate) struct RendererState {
     pub(crate) gpu: GpuContext,
     pub(crate) batch_renderer: BatchRenderer,
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
     pub(super) ios_hud: Option<crate::app::ios_hud_render::IosHudArt>,
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
     pub(super) ios_sidebar_art: Option<crate::app::ios_sidebar_art::IosSidebarArt>,
     pub(crate) fps_overlay: crate::app::diagnostics::fps_overlay::FpsOverlay,
     pub(crate) terrain_draw_renderer: crate::render::terrain_draw::TerrainDrawRenderer,

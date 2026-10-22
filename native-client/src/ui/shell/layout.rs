@@ -105,7 +105,8 @@ pub fn layout_pass_in_game_options(
     desc.controls
         .iter()
         .map(|c| {
-            let rect = if c.kind == ControlKind::Button {
+            let rect = if c.kind == ControlKind::Button && c.id != control::MOUSE_SENSITIVITY_RESET
+            {
                 let y = match c.id {
                     control::BACK => anchor.back_button_y,
                     control::KEYBOARD => anchor.button_stack_top_y + anchor.button_canvas_h,

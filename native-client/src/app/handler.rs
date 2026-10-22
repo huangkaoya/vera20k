@@ -228,7 +228,7 @@ fn show_menu_bar_and_dock_after_full_screen() {
 }
 
 impl ApplicationHandler for App {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_arch = "wasm32"))]
     fn device_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -238,14 +238,30 @@ impl ApplicationHandler for App {
         let winit::event::DeviceEvent::MouseMotion { delta } = event else {
             return;
         };
-        let Some(state) = self.state.as_ref() else {
+        let Some(state) = self.state.as_mut() else {
             return;
         };
+        #[cfg(target_os = "macos")]
         let Some(position) = crate::app::input::cursor::macos::raw_motion(state, delta) else {
             return;
         };
+        #[cfg(target_arch = "wasm32")]
+        let Some(position) = crate::app::input::cursor::browser::raw_motion(state, delta) else {
+            return;
+        };
         let window_id = state.platform.window.id();
+        #[cfg(target_os = "macos")]
         state.platform.macos_cursor.from_device.set(true);
+        #[cfg(target_arch = "wasm32")]
+        {
+            state.platform.pointer_in_client = true;
+            // Browser raw_motion already integrated the physical delta into
+            // the visible window cursor. Feeding it through the confined OS
+            // absolute-history reducer again amplifies reversals at letterbox
+            // clamps. Start this synthesized absolute projection afresh.
+            state.match_state.input.reset_window_cursor_motion();
+            crate::app::input::cursor::browser::begin_relative(state.window_cursor_position());
+        }
         // Reuse every existing splash/capture/modal/drag gate and screen route.
         self.window_event(
             event_loop,
@@ -255,8 +271,13 @@ impl ApplicationHandler for App {
                 position,
             },
         );
+        #[cfg(target_os = "macos")]
         if let Some(state) = self.state.as_ref() {
             state.platform.macos_cursor.from_device.set(false);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(state) = self.state.as_ref() {
+            crate::app::input::cursor::browser::end_relative(state.window_cursor_position());
         }
     }
 
@@ -433,8 +454,9 @@ impl App {
         _id: WindowId,
         event: WindowEvent,
     ) {
-        #[cfg(any(target_os = "ios", target_os = "android"))]
+        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
         {
+            #[cfg(any(target_os = "ios", target_os = "android"))]
             if self.ios_suspended && matches!(&event, WindowEvent::RedrawRequested) {
                 return;
             }
@@ -453,6 +475,12 @@ impl App {
                     return;
                 }
                 if let Some(state) = self.state.as_mut() {
+                    #[cfg(target_arch = "wasm32")]
+                    if !state.platform.browser_touch {
+                        state.platform.browser_touch = true;
+                        crate::app::input::cursor::apply_cursor_confinement(state);
+                        crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
+                    }
                     if Self::fullscreen_movie_touch(state, touch) {
                         self.ios_touch.reset();
                         crate::app::ios_controls::reset(state);
@@ -497,6 +525,24 @@ impl App {
         let tactical_capture_active = self.tactical_capture.is_some();
         let Some(state) = &mut self.state else { return };
         state.sync_cursor_space();
+        #[cfg(target_arch = "wasm32")]
+        let event = match event {
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            } => {
+                let Some(position) =
+                    crate::app::input::cursor::browser::absolute_motion(state, position)
+                else {
+                    return;
+                };
+                WindowEvent::CursorMoved {
+                    device_id,
+                    position,
+                }
+            }
+            event => event,
+        };
         // Normalize Mac pointer delivery before status cards or any other
         // early owner can consume a native echo of the relative mouse event.
         #[cfg(target_os = "macos")]
@@ -707,6 +753,10 @@ impl App {
         if crate::app::browser_shell::handle_event(state, &event) {
             return;
         }
+        #[cfg(target_arch = "wasm32")]
+        if crate::app::ios_controls::handle_mouse_event(state, &event) {
+            return;
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -725,7 +775,7 @@ impl App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                #[cfg(any(target_os = "ios", target_os = "android"))]
+                #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
                 crate::app::ios_controls::reset(state);
                 // A zero dimension is how Windows reports a minimise — that
                 // backend never sends `Occluded` — so the hidden flag is

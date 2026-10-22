@@ -19,8 +19,9 @@ use crate::app::AppState;
 use crate::ui::shell::descriptor::ControlKind;
 use crate::ui::shell::in_game_options::{build_in_game_options_descriptor, control, control_shown};
 use crate::ui::shell::in_game_options_state::{
-    InGameOptionsState, OPTIONS_SPEED_MAX, OPTIONS_SPEED_MIN, plain_trackbar_thumb_left,
-    speed_from_slider_pos, speed_slider_pos, trackbar_pos_from_mouse_x,
+    InGameOptionsState, MOUSE_SENSITIVITY_STOPS, OPTIONS_SPEED_MAX, OPTIONS_SPEED_MIN,
+    mouse_sensitivity_from_slider_pos, mouse_sensitivity_slider_pos, mouse_sensitivity_thumb_left,
+    plain_trackbar_thumb_left, speed_from_slider_pos, speed_slider_pos, trackbar_pos_from_mouse_x,
 };
 use crate::ui::shell::layout::{LaidOutControl, layout_pass_in_game_options};
 use crate::ui::shell::trackbar::admits_press_y;
@@ -46,8 +47,17 @@ pub(crate) fn in_game_options_hit(
     cursor: (i32, i32),
     game_speed_hidden: bool,
 ) -> OptionsHit {
-    let (cx, cy) = cursor;
     let desc = build_in_game_options_descriptor();
+    in_game_options_hit_with_descriptor(&desc, laid, cursor, game_speed_hidden)
+}
+
+fn in_game_options_hit_with_descriptor(
+    desc: &crate::ui::shell::descriptor::DialogDescriptor,
+    laid: &[LaidOutControl],
+    cursor: (i32, i32),
+    game_speed_hidden: bool,
+) -> OptionsHit {
+    let (cx, cy) = cursor;
     for (c, l) in desc.controls.iter().zip(laid.iter()) {
         if !control_shown(c, game_speed_hidden) || !l.rect.contains(cx, cy) {
             continue;
@@ -62,7 +72,7 @@ pub(crate) fn in_game_options_hit(
                 let pos = trackbar_pos_from_mouse_x(
                     cx,
                     OPTIONS_SPEED_MIN as i32,
-                    OPTIONS_SPEED_MAX as i32,
+                    slider_max(c.id),
                     l.rect,
                 );
                 return OptionsHit::Slider(c.id, pos);
@@ -199,6 +209,14 @@ pub(crate) fn in_game_options_mouse(state: &mut AppState, button: MouseButton, p
                 crate::ui::shell::keyboard::KeyboardParent::GameControls,
             ),
             Some(control::BACK) => crate::app::App::route_in_game_menu_escape(state),
+            Some(control::MOUSE_SENSITIVITY_RESET) => {
+                state
+                    .match_state
+                    .match_presentation
+                    .in_game_options
+                    .reset_mouse_sensitivity();
+                state.platform.window.request_redraw();
+            }
             _ => {}
         }
     }
@@ -235,8 +253,7 @@ pub(crate) fn in_game_options_drag(state: &mut AppState) {
     let Some(rect) = laid.iter().find(|l| l.id == id).map(|l| l.rect) else {
         return;
     };
-    let pos =
-        trackbar_pos_from_mouse_x(x, OPTIONS_SPEED_MIN as i32, OPTIONS_SPEED_MAX as i32, rect);
+    let pos = trackbar_pos_from_mouse_x(x, OPTIONS_SPEED_MIN as i32, slider_max(id), rect);
     if store_slider_value(
         &mut state.match_state.match_presentation.in_game_options,
         id,
@@ -253,24 +270,35 @@ fn begin_slider_press(opts: &mut InGameOptionsState, id: u16, rect: RectPx, cx: 
     let internal = match id {
         control::GAME_SPEED => opts.game_speed,
         control::SCROLL_RATE => opts.scroll_rate,
+        control::MOUSE_SENSITIVITY => mouse_sensitivity_slider_pos(opts.mouse_sensitivity_percent),
         _ => return false,
     };
-    let left = rect.x + plain_trackbar_thumb_left(speed_slider_pos(internal), rect);
+    let left = rect.x
+        + if id == control::MOUSE_SENSITIVITY {
+            mouse_sensitivity_thumb_left(opts.mouse_sensitivity_percent, rect)
+        } else {
+            plain_trackbar_thumb_left(speed_slider_pos(internal), rect)
+        };
     if (left..left + 12).contains(&cx) {
         opts.dragging_slider = Some(id);
         return false;
     }
-    let pos = trackbar_pos_from_mouse_x(cx, 0, OPTIONS_SPEED_MAX as i32, rect);
+    let pos = trackbar_pos_from_mouse_x(cx, 0, slider_max(id), rect);
     store_slider_value(opts, id, pos)
 }
 
 /// Store a slider's new internal value from a slider position (`6 - pos`). Render
 /// reads the stored value to draw the thumb + value label; no effect applies here.
 fn store_slider_value(opts: &mut InGameOptionsState, id: u16, pos: i32) -> bool {
-    let value = speed_from_slider_pos(pos.max(0) as u32);
+    let value = if id == control::MOUSE_SENSITIVITY {
+        mouse_sensitivity_from_slider_pos(pos.max(0) as u32)
+    } else {
+        speed_from_slider_pos(pos.max(0) as u32)
+    };
     let stored = match id {
         control::GAME_SPEED => &mut opts.game_speed,
         control::SCROLL_RATE => &mut opts.scroll_rate,
+        control::MOUSE_SENSITIVITY => &mut opts.mouse_sensitivity_percent,
         _ => return false,
     };
     if *stored == value {
@@ -278,6 +306,14 @@ fn store_slider_value(opts: &mut InGameOptionsState, id: u16, pos: i32) -> bool 
     }
     *stored = value;
     true
+}
+
+fn slider_max(id: u16) -> i32 {
+    if id == control::MOUSE_SENSITIVITY {
+        MOUSE_SENSITIVITY_STOPS as i32
+    } else {
+        OPTIONS_SPEED_MAX as i32
+    }
 }
 
 /// Toggle a checkbox's stored bool (the rendered check state only — the downstream
@@ -294,6 +330,77 @@ fn toggle_checkbox(opts: &mut InGameOptionsState, id: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_sensitivity_hit_drag_and_reset_never_change_scroll_or_game_speed() {
+        let desc =
+            crate::ui::shell::in_game_options::build_in_game_options_descriptor_for_web(true);
+        let anchor = crate::ui::shell::layout::InGameOptionsAnchor {
+            button_canvas_w: 125,
+            button_canvas_h: 25,
+            button_stack_top_y: 200,
+            back_button_y: 540,
+        };
+        let laid = layout_pass_in_game_options(&desc, 800, 600, anchor);
+        let rail = laid
+            .iter()
+            .find(|control| control.id == control::MOUSE_SENSITIVITY)
+            .unwrap()
+            .rect;
+        let mut options = InGameOptionsState {
+            scroll_rate: 5,
+            game_speed: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            in_game_options_hit_with_descriptor(
+                &desc,
+                &laid,
+                (rail.x + rail.w - 1, rail.y + rail.h - 1),
+                true
+            ),
+            OptionsHit::Slider(control::MOUSE_SENSITIVITY, MOUSE_SENSITIVITY_STOPS as i32)
+        );
+        let thumb = rail.x + mouse_sensitivity_thumb_left(100, rail);
+        assert!(!begin_slider_press(
+            &mut options,
+            control::MOUSE_SENSITIVITY,
+            rail,
+            thumb + 1
+        ));
+        assert_eq!(options.dragging_slider, Some(control::MOUSE_SENSITIVITY));
+        assert!(store_slider_value(
+            &mut options,
+            control::MOUSE_SENSITIVITY,
+            75
+        ));
+        assert_eq!(options.mouse_sensitivity_percent, 400);
+        assert!(store_slider_value(
+            &mut options,
+            control::MOUSE_SENSITIVITY,
+            0
+        ));
+        assert_eq!(options.mouse_sensitivity_percent, 25);
+        options.reset_mouse_sensitivity();
+        assert_eq!(
+            (
+                options.mouse_sensitivity_percent,
+                options.scroll_rate,
+                options.game_speed
+            ),
+            (100, 5, 2)
+        );
+        let reset = laid
+            .iter()
+            .find(|control| control.id == control::MOUSE_SENSITIVITY_RESET)
+            .unwrap()
+            .rect;
+        assert!(reset.y >= rail.y + rail.h);
+        assert_eq!(
+            in_game_options_hit_with_descriptor(&desc, &laid, (reset.x + 2, reset.y + 2), false),
+            OptionsHit::Button(control::MOUSE_SENSITIVITY_RESET)
+        );
+    }
     use crate::ui::shell::layout::InGameOptionsAnchor;
 
     fn test_laid() -> Vec<LaidOutControl> {

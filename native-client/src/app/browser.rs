@@ -24,6 +24,9 @@ mod network_launch;
 thread_local! {
     static STARTED: Cell<bool> = const { Cell::new(false) };
     static DIAGNOSTICS_ENABLED: Cell<bool> = const { Cell::new(false) };
+    // Presentation-only derived state for resource activation. Reading it must
+    // not enable full unit/terrain acceptance diagnostics in ordinary play.
+    static MENU_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static DIAGNOSTICS: RefCell<Value> = RefCell::new(json!({"stage":"not-started"}));
     static NETWORK_START: RefCell<Option<network_launch::NetworkStartConfig>> = const { RefCell::new(None) };
     static NETWORK_LEAVE: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -197,8 +200,21 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
 /// commands, or writable simulation references are exposed to JavaScript.
 pub fn diagnostics() -> JsValue {
     DIAGNOSTICS_ENABLED.with(|enabled| enabled.set(true));
-    DIAGNOSTICS
-        .with(|value| js_sys::JSON::parse(&value.borrow().to_string()).unwrap_or(JsValue::NULL))
+    DIAGNOSTICS.with(|value| {
+        let mut snapshot = value.borrow().clone();
+        // Pointer admission is consumed synchronously by trusted mouse events.
+        // Keep it current even while the heavier acceptance snapshot is throttled.
+        snapshot["pointerCaptureAllowed"] = json!(super::input::cursor::browser::policy());
+        js_sys::JSON::parse(&snapshot.to_string()).unwrap_or(JsValue::NULL)
+    })
+}
+
+pub fn pointer_capture_allowed() -> bool {
+    super::input::cursor::browser::policy()
+}
+
+pub fn menu_active() -> bool {
+    MENU_ACTIVE.with(Cell::get)
 }
 
 fn set_stage(browser: &BrowserState, stage: &str, error: Option<&str>) {
@@ -407,7 +423,9 @@ impl App {
     }
 
     pub(super) fn cancel_browser_initialization(&mut self) {
+        MENU_ACTIVE.with(|active| active.set(false));
         if let Some(state) = self.state.as_ref() {
+            super::input::cursor::browser::release(state);
             state.platform.window.set_cursor_visible(true);
         }
         if let Some(browser) = self.browser.as_mut() {
@@ -423,6 +441,13 @@ impl App {
     }
 
     pub(super) fn update_browser_diagnostics(&mut self) {
+        MENU_ACTIVE.with(|active| {
+            active.set(
+                self.state
+                    .as_ref()
+                    .is_some_and(|state| state.frontend.screen == GameScreen::MainMenu),
+            );
+        });
         if !DIAGNOSTICS_ENABLED.with(Cell::get) {
             return;
         }
@@ -478,6 +503,7 @@ fn diagnostic_snapshot(state: &AppState) -> Value {
     let center_base_binding = input
         .hotkey_bindings
         .first_key(super::input::hotkeys::HotkeyCommand::CenterBase);
+    let loading_paints = super::loading::pump::browser_paint_counts();
     let mut result = json!({
         "stage":"ready","mode":mode,
         "shellRoute":format!("{:?}",state.frontend.shell_route),
@@ -494,6 +520,12 @@ fn diagnostic_snapshot(state: &AppState) -> Value {
         "camera":{"x":input.camera_x,"y":input.camera_y,"zoom":input.zoom_level},
         "cursor":{"x":input.cursor_x,"y":input.cursor_y},
         "pointerInClient":state.platform.pointer_in_client,
+        "cursorConfined":state.platform.cursor_confined,
+        "pointerCaptureAllowed":super::input::cursor::browser::eligible(state),
+        "pointerMotion":super::input::cursor::browser::diagnostics(state),
+        "touchInput":state.touch_input_mode(),
+        "brandedHud":state.branded_hud_mode(),
+        "loadingPaints":{"scheduled":loading_paints.0,"completed":loading_paints.1},
         "windowActive":state.platform.window_active,
         "windowHidden":state.platform.window_hidden,
         "tacticalViewport":{"x":viewport.0,"y":viewport.1,"width":viewport.2,"height":viewport.3},

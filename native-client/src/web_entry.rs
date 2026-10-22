@@ -37,6 +37,14 @@ pub fn mount_resource(name: &str, bytes: Vec<u8>) -> Result<(), JsValue> {
     crate::util::browser_io::register_asset(name, bytes).map_err(|error| JsValue::from_str(&error))
 }
 
+/// Presentation-only menu video; retail resources stay frozen after startup.
+#[wasm_bindgen]
+pub fn install_menu_animation(bytes: Vec<u8>) -> Result<(), JsValue> {
+    crate::util::browser_menu_media::install(bytes).map_err(|error| JsValue::from_str(&error))?;
+    crate::app::browser::wake();
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub fn configure_content(json: &str) -> Result<(), JsValue> {
     crate::util::browser_content::configure(json).map_err(|error| JsValue::from_str(&error))
@@ -66,6 +74,18 @@ pub fn source_revision() -> String {
 #[wasm_bindgen]
 pub fn browser_diagnostics() -> JsValue {
     crate::app::browser::diagnostics()
+}
+
+/// Cheap capability reads for the invisible browser adapters. These do not
+/// enable full acceptance snapshots or allocate unit/terrain JSON.
+#[wasm_bindgen]
+pub fn browser_pointer_capture_allowed() -> bool {
+    crate::app::browser::pointer_capture_allowed()
+}
+
+#[wasm_bindgen]
+pub fn browser_menu_active() -> bool {
+    crate::app::browser::menu_active()
 }
 
 #[wasm_bindgen]

@@ -84,8 +84,8 @@ impl AppState {
         width: u32,
         height: u32,
     ) -> crate::ui::sidebar::SidebarFrame {
-        #[cfg(any(target_os = "ios", target_os = "android"))]
-        if self.platform.capture_client_size.is_none() {
+        #[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
+        if self.branded_hud_mode() {
             let window_zoom = self.tactical_zoom().map_or(1.0, |zoom| zoom.scale());
             return crate::ui::sidebar::SidebarFrame::for_ios(
                 width,
@@ -158,10 +158,26 @@ impl AppState {
             .map_or((x, y), |zoom| zoom.source_to_window(x, y))
     }
 
-    /// Ordinary iOS uses direct touch targets, never a visible mouse pointer.
+    /// The Web client shares the generated faction chrome and editable bar
+    /// with native mobile. Input-device selection remains independent.
+    pub(crate) fn branded_hud_mode(&self) -> bool {
+        cfg!(any(
+            target_os = "ios",
+            target_os = "android",
+            target_arch = "wasm32"
+        )) && self.platform.capture_client_size.is_none()
+    }
+
+    /// Direct-touch input is independent of the shared branded HUD. Desktop
+    /// Web keeps its mouse cursor, edge scrolling and ordinary world controls.
     pub(crate) fn touch_input_mode(&self) -> bool {
+        if self.platform.capture_client_size.is_some() {
+            return false;
+        }
+        #[cfg(target_arch = "wasm32")]
+        return self.platform.browser_touch;
+        #[cfg(not(target_arch = "wasm32"))]
         cfg!(any(target_os = "ios", target_os = "android"))
-            && self.platform.capture_client_size.is_none()
     }
 
     /// Whether the software cursor (mouse.shp) should be active this frame.

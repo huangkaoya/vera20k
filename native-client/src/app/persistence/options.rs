@@ -34,6 +34,10 @@ pub(crate) fn in_game_options_from_profile(profile: &RetailOptionsProfile) -> In
         unit_action_lines: profile.unit_action_lines,
         show_hidden: profile.show_hidden,
         tooltips: profile.tooltips,
+        mouse_sensitivity_percent:
+            crate::ui::shell::in_game_options_state::normalized_mouse_sensitivity(
+                i32::try_from(profile.mouse_sensitivity_percent).unwrap_or(-1),
+            ),
         ..Default::default()
     }
 }
@@ -53,6 +57,10 @@ fn update_profile_from_in_game_options(
     profile.unit_action_lines = options.unit_action_lines;
     profile.show_hidden = options.show_hidden;
     profile.tooltips = options.tooltips;
+    profile.mouse_sensitivity_percent =
+        crate::ui::shell::in_game_options_state::normalized_mouse_sensitivity(
+            i32::try_from(options.mouse_sensitivity_percent).unwrap_or(-1),
+        );
 }
 
 fn apply_target_lines(target_lines: &mut TargetLineState, options: &InGameOptionsState) {
@@ -206,6 +214,36 @@ pub(crate) fn accept_in_game_options(state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_sensitivity_uses_the_accepted_profile_transaction_only() {
+        let profile = RetailOptionsProfile {
+            scroll_rate: 5,
+            game_speed: 2,
+            ..Default::default()
+        };
+        let options = InGameOptionsState {
+            mouse_sensitivity_percent: 250,
+            scroll_rate: 5,
+            game_speed: 2,
+            ..Default::default()
+        };
+        let mut rejected = recording_transaction(profile.clone(), options.clone());
+        assert!(!dispatch_in_game_options_transaction(&mut rejected, 2));
+        assert_eq!(rejected.profile.mouse_sensitivity_percent, 100);
+        assert_eq!(rejected.writes, 0);
+        let mut accepted = recording_transaction(profile, options);
+        assert!(dispatch_in_game_options_transaction(
+            &mut accepted,
+            IN_GAME_OPTIONS_RESULT_BACK
+        ));
+        assert_eq!(accepted.profile.mouse_sensitivity_percent, 250);
+        assert_eq!(
+            (accepted.profile.scroll_rate, accepted.profile.game_speed),
+            (5, 2)
+        );
+        assert_eq!(accepted.writes, 1);
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TransactionEvent {

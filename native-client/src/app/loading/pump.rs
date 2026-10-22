@@ -11,6 +11,11 @@
 mod render;
 pub(crate) use render::transfer_progress_draws;
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser_paint;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use browser_paint::counts as browser_paint_counts;
+
 #[cfg(test)]
 mod tests;
 
@@ -567,6 +572,8 @@ pub(crate) struct NativeLoadingScreenState {
     /// entry. Capture that pre-load count before the later rules reset.
     runtime_color_scheme_count: usize,
     progress_cadence: NativeLoadingProgressCadence,
+    #[cfg(target_arch = "wasm32")]
+    browser_backdrop_only: bool,
 }
 
 impl NativeLoadingScreenState {
@@ -592,6 +599,8 @@ impl NativeLoadingScreenState {
             campaign_presentation: None,
             runtime_color_scheme_count: 0,
             progress_cadence,
+            #[cfg(target_arch = "wasm32")]
+            browser_backdrop_only: false,
         }
     }
 
@@ -613,6 +622,8 @@ impl NativeLoadingScreenState {
             campaign_presentation: None,
             runtime_color_scheme_count: 0,
             progress_cadence: NativeLoadingProgressCadence::SelectedMap,
+            #[cfg(target_arch = "wasm32")]
+            browser_backdrop_only: false,
         }
     }
 
@@ -668,6 +679,8 @@ pub(crate) struct LoadingSession {
     /// nothing else reaches the screen until the loading screen's first
     /// repaint. Generic sessions start at their first frame.
     next_frame: NextLoadingFrame,
+    #[cfg(target_arch = "wasm32")]
+    browser_paint: browser_paint::BrowserPaintGate,
 }
 
 impl LoadingSession {
@@ -722,13 +735,15 @@ impl LoadingSession {
         };
         Self {
             stage: LoadingStage::Selected(request),
-            next_frame: if native.is_some() {
+            next_frame: if native.is_some() && !cfg!(target_arch = "wasm32") {
                 NextLoadingFrame::Blank
             } else {
                 NextLoadingFrame::First
             },
             native,
             job: LoadingJob::new(),
+            #[cfg(target_arch = "wasm32")]
+            browser_paint: browser_paint::BrowserPaintGate::default(),
         }
     }
 }
@@ -851,6 +866,7 @@ pub(crate) fn begin_loading(state: &mut AppState, request: LoadingRequest) {
         now_ms,
     );
     state.frontend.screen = GameScreen::Loading;
+    state.platform.window.request_redraw();
 }
 
 /// Establish replacement admission before retiring the previous attempt's
@@ -1270,6 +1286,8 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                         native: Some(native),
                         job,
                         next_frame: NextLoadingFrame::Later,
+                        #[cfg(target_arch = "wasm32")]
+                        browser_paint: browser_paint::BrowserPaintGate::default(),
                     },
                 )
             } else {
@@ -1421,6 +1439,8 @@ fn prepare_loading_session(
         mut native,
         mut job,
         next_frame,
+        #[cfg(target_arch = "wasm32")]
+        browser_paint,
     } = session;
     let stage = match stage {
         stage @ LoadingStage::AwaitingPeers { .. } => stage,
@@ -1478,6 +1498,8 @@ fn prepare_loading_session(
         native,
         job,
         next_frame,
+        #[cfg(target_arch = "wasm32")]
+        browser_paint,
     })
 }
 
@@ -1714,7 +1736,18 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
         .loading_session
         .as_ref()
         .and_then(|session| session.native.as_ref())
-        .is_some_and(|native| native.atlas.is_some() || native.suppresses_chrome())
+        .is_some_and(|native| {
+            let ready = native.atlas.is_some() || native.suppresses_chrome();
+            #[cfg(target_arch = "wasm32")]
+            let ready = ready
+                && (!native.browser_backdrop_only
+                    || state
+                        .frontend
+                        .loading_session
+                        .as_ref()
+                        .is_some_and(|session| matches!(session.stage, LoadingStage::Selected(_))));
+            ready
+        })
     {
         return Ok(());
     }
@@ -1740,6 +1773,31 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
         return Err(anyhow::anyhow!(
             "native loading archives LOADMD.MIX and LOAD.MIX are unavailable"
         ));
+    }
+    #[cfg(target_arch = "wasm32")]
+    if state
+        .frontend
+        .loading_session
+        .as_ref()
+        .is_some_and(|session| {
+            matches!(session.stage, LoadingStage::Selected(_))
+                && session.native.as_ref().is_some_and(|native| {
+                    matches!(native.variant, NativeLoadingArt::StockOffline(_))
+                })
+        })
+    {
+        // Paint existing country art before parsing/generating the map. Preview
+        // and markers are added from the same authoritative prepared map later.
+        build_standard_loading_atlas(state, false)?;
+        if let Some(native) = state
+            .frontend
+            .loading_session
+            .as_mut()
+            .and_then(|session| session.native.as_mut())
+        {
+            native.browser_backdrop_only = true;
+        }
+        return Ok(());
     }
     prepare_scenario_initial_before_first_frame(state)?;
     if state
@@ -1810,8 +1868,27 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
         log::info!("Native campaign loading atlas ready");
         return Ok(());
     }
+    build_standard_loading_atlas(state, true)?;
+    #[cfg(target_arch = "wasm32")]
+    if let Some(session) = state.frontend.loading_session.as_mut()
+        && let Some(native) = session.native.as_mut()
+        && native.browser_backdrop_only
+    {
+        native.browser_backdrop_only = false;
+        session.next_frame = NextLoadingFrame::First;
+        session.browser_paint = browser_paint::BrowserPaintGate::default();
+    }
+    Ok(())
+}
+
+fn build_standard_loading_atlas(
+    state: &mut AppState,
+    include_composition: bool,
+) -> anyhow::Result<()> {
     let variant = selected_loading_art_variant(state);
-    ensure_loading_composition_snapshot(state);
+    if include_composition {
+        ensure_loading_composition_snapshot(state);
+    }
     let Some(assets) = state
         .frontend
         .loading_session
@@ -2012,6 +2089,23 @@ pub(crate) fn after_loading_frame_presented(state: &mut AppState) {
         state.platform.window.request_redraw();
         return;
     }
+    #[cfg(target_arch = "wasm32")]
+    if let Some(session) = state.frontend.loading_session.as_mut()
+        && session.next_frame == NextLoadingFrame::First
+    {
+        match session.browser_paint.pending(&state.renderer.gpu.queue) {
+            Ok(true) => {
+                state.platform.window.request_redraw();
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let policy = loading_failure_policy(state);
+                fail_loading(state, policy, anyhow::anyhow!(error));
+                return;
+            }
+        }
+    }
     loading_screen_presented(state);
     let policy = loading_failure_policy(state);
     match pump_loading_after_present(state) {
@@ -2167,6 +2261,13 @@ pub(crate) fn present_saved_game_loading(state: &mut AppState) {
 /// the first game frame (`0x00683E07..0x00683E1C`, again at
 /// `0x0052EAA1..0x0052EAEB`); the tactical install runs under it.
 pub(crate) fn present_game_mode_blank(state: &AppState) {
+    // The browser keeps the last fully rendered loading image while the world
+    // and tactical GPU objects are installed. The next canvas presentation is
+    // the first battle frame; presenting black here exposes a browser frame
+    // without contributing to either loading or gameplay.
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
     if let Err(err) = render::present_blank(
         &state.renderer.gpu,
         &state.renderer.shell_surface_presenter,

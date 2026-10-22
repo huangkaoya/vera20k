@@ -4,14 +4,19 @@ import {createContentController} from './content-controller.js';
 import {createNativeShellBridge} from './shell-bridge.js';
 import {createVeraRuntime} from './runtime-adapter.js';
 import {installNativeLobby} from './lobby.js';
+import {installPointerCapture} from './pointer-capture.js';
+import {installMenuAnimationPrefetch} from './menu-animation.js';
 
 const status = document.querySelector('#status'), progress = document.querySelector('#progress');
 const startup = document.querySelector('#startup'), canvas = document.querySelector('#game');
 const actions = document.querySelector('#startup-actions'), selectionKey = 'vera.content.selection.v1';
 const controller = new AbortController(), size = bytes => `${(bytes / 1048576).toFixed(1)} MB`;
-let runtime, initialized = false, cacheWarning = false;
+let runtime, pointerCapture, menuAnimation, menuAnimationState = {state: 'idle'};
+let initialized = false, cacheWarning = false;
 const shell = createNativeShellBridge();
-window.addEventListener('pagehide', event => { if (!event.persisted) shell.dispose(); });
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) { pointerCapture?.dispose(); menuAnimation?.dispose(); shell.dispose(); }
+});
 function action(text, callback) {
   const button = document.createElement('button'); button.type = 'button'; button.textContent = text;
   button.addEventListener('click', callback); return button;
@@ -28,7 +33,7 @@ function canonical(value) {
 }
 function activationAllowed() {
   if (!runtime || !initialized) return false;
-  return runtime.diagnostics()?.mode === 'menu'
+  return runtime.menuActive()
     && !['loading', 'ready', 'running', 'finishing'].includes(runtime.networkStatus()?.phase);
 }
 
@@ -106,12 +111,20 @@ try {
   const lobby = installNativeLobby({native: runtime.network, canvas, onState: state => shell.publish('lobby', state)});
   shell.attach('lobby', lobby);
   runtime.start(canvas);
-  runtime.diagnostics(); // Enable the native read-only snapshot before content activation needs it.
   Object.defineProperty(window, '__veraNative', {value: Object.freeze({sourceRevision: runtime.sourceRevision(),
-    diagnostics: runtime.diagnostics, networkStatus: runtime.networkStatus})});
+    diagnostics: runtime.diagnostics, networkStatus: runtime.networkStatus,
+    pointerCaptureStatus: () => pointerCapture?.snapshot(),
+    menuAnimationStatus: () => structuredClone(menuAnimationState)})});
   await ready; initialized = true; startup.hidden = true; content.refresh(); canvas.focus();
+  pointerCapture = installPointerCapture({canvas,
+    getState: () => ({pointerCaptureAllowed: runtime.pointerCaptureAllowed()})});
+  menuAnimation = installMenuAnimationPrefetch({catalog, store,
+    onReady: bytes => runtime.installMenuAnimation(bytes),
+    onState: state => { menuAnimationState = state; content.refresh(); }});
+  menuAnimation.start();
 } catch (error) {
   controller.abort();
+  pointerCapture?.dispose(); menuAnimation?.dispose();
   shell.dispose();
   status.textContent = error?.name === 'AbortError' ? '下载已取消，已完成校验的缓存会保留。'
     : `游戏启动失败：${error instanceof Error ? error.message : String(error)}`;

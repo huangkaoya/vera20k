@@ -72,10 +72,15 @@ Validation runs in the candidate project, not against a moving stable source:
 2. Node network, shard routing, idle cleanup, bounded load-tool integration,
    lobby admission and adapter contract tests run. Load-tool integration uses
    a small local fixture; it does not manufacture public 100-user acceptance.
+   A separate browser presentation gate checks mouse capture and the verified
+   background menu-video download, without requiring a visible DOM overlay.
 3. The controlled-delay network regression runs separately. This tests the real
    coordinator with simulated transport timing, not an actual engine battle.
 4. `cargo test --lib browser_network` tests the production Rust pipeline module.
-5. `build:native-web` builds the candidate WASM and checks source identity before
+5. A native browser-input gate runs the production pointer projection, mouse
+   gain/settings/persistence and touch/HUD regression tests in both client and
+   core crates. This protects the browser adaptation while simulation evolves.
+6. `build:native-web` builds the candidate WASM and checks source identity before
    and after compilation.
 
 Every gate writes a log and digest. After each command, the updater checks that
