@@ -7,6 +7,8 @@ import {installNativeLobby} from './lobby.js';
 import {installPointerCapture} from './pointer-capture.js';
 import {installMenuAnimationPrefetch} from './menu-animation.js';
 import {createWebHost} from './host.js';
+import {resourcePackUrls} from './host-config.js';
+import {createResourcePackFetch} from './resource-packs.js';
 
 const status = document.querySelector('#status'), progress = document.querySelector('#progress');
 const startup = document.querySelector('#startup'), canvas = document.querySelector('#game');
@@ -56,7 +58,9 @@ try {
       localStorage.removeItem('vera.content.selection.v1');
     }
   } catch {}
-  const plan = resolveContentPlan(catalog, selection), store = new ContentStore({fetch: host.fetchContent, onCacheStatus: event => {
+  const fetchContent = await createResourcePackFetch({sources: resourcePackUrls, catalog,
+    fallbackFetch: host.fetchContent, signal: controller.signal});
+  const plan = resolveContentPlan(catalog, selection), store = new ContentStore({fetch: fetchContent, onCacheStatus: event => {
     if (['unavailable', 'write-failed'].includes(event.state)) cacheWarning = true;
   }});
   const content = createContentController({catalog, store,

@@ -21,7 +21,7 @@ async function setup(t) {
   for (const dir of ['retail','web-native','public/native','native-client/art/fonts','native-client/art/branding']) await fs.mkdir(path.join(root,dir),{recursive:true});
   await fs.writeFile(path.join(root,'web-native/index.html'),'<title>王二火大</title><canvas id="game"></canvas>');
   await fs.writeFile(path.join(root,'web-native/bootstrap.js'),'export const native=true;');
-  for (const name of ['pointer-capture.js','menu-animation.js']) await fs.writeFile(path.join(root,'web-native',name),'export const adapter=true;');
+  for (const name of ['pointer-capture.js','menu-animation.js','host.js','host-config.js','resource-packs.js']) await fs.writeFile(path.join(root,'web-native',name),'export const adapter=true;');
   await fs.writeFile(path.join(root,'public/native/werhd_bg.wasm'),Buffer.from([0,97,115,109,1,0,0,0]));
   await fs.writeFile(path.join(root,'public/native/werhd.js'),'export const start_browser=()=>{};');
   // Deliberately retained old output bytes must still be inaccessible.
@@ -41,7 +41,7 @@ async function setup(t) {
 test('native shell serves real WASM and native media, preserving private profiles',async t=>{
   const {app}=await setup(t);
   assert.match((await request(app.url,'/')).body.toString(),/canvas/);
-  for (const route of ['/pointer-capture.js','/menu-animation.js']) {
+  for (const route of ['/pointer-capture.js','/menu-animation.js','/host.js','/host-config.js','/resource-packs.js']) {
     const response=await request(app.url,route);
     assert.equal(response.status,200); assert.match(response.body.toString(),/adapter/);
   }

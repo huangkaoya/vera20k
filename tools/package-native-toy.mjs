@@ -5,6 +5,7 @@ import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {verifyNativeBuild, hashNativeFile, nativeContentCatalogIdentity} from './native-build-manifest.mjs';
+import {resourcePackUrls} from '../web-native/host-config.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const exec = promisify(execFile), sha = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -52,7 +53,7 @@ export async function packageNativeToy({origin = 'https://wan.youlidefuchou.com'
   for (const name of (await fs.readdir(path.join(root, 'web-native'))).sort()) {
     if (!/\.(?:html|js|css)$/.test(name)) continue;
     if (name === 'host-config.js')
-      await write(name, Buffer.from(`// Static Toy export: original engine, catalog and multiplayer service.\nexport const serviceOrigin = ${JSON.stringify(origin)};\n`));
+      await write(name, Buffer.from(`// Static Toy export: original engine, catalog and multiplayer service.\nexport const serviceOrigin = ${JSON.stringify(origin)};\nexport const resourcePackUrls = ${JSON.stringify(resourcePackUrls, null, 2)};\n`));
     else await copy(path.join(root, 'web-native', name), name);
   }
   await copy(path.join(root, 'native-client/art/branding/wannafire-app-icon.png'), 'branding/icon.png');
@@ -61,7 +62,8 @@ export async function packageNativeToy({origin = 'https://wan.youlidefuchou.com'
   await write('werhd-release.json', Buffer.from(JSON.stringify({schema: 1, name: '王二火大',
     serviceOrigin: origin, renderer: build.renderer, patchSha256: build.patchSha256,
     resourceManifestSha256: build.resourceManifestSha256, catalogIdentity: catalog.catalogIdentity,
-    outputs: build.outputs, defaultProfile: 'skirmish', assetsBundled: false, loginRequired: false}, null, 2) + '\n'));
+    outputs: build.outputs, defaultProfile: 'skirmish', assetsBundled: false, loginRequired: false,
+    resourcePackUrls}, null, 2) + '\n'));
   files.sort((a, b) => a.path.localeCompare(b.path, 'en'));
   const contentsSha256 = sha(JSON.stringify(files));
   const filename = `werhd-toy-${build.patchSha256.slice(0, 10)}-${contentsSha256.slice(0, 8)}.zip`;

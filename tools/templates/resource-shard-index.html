@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#142a35">
+<title>王二火大 · 尤里资源校验 · @@PACK_ID@@</title>
+<style>
+:root{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;color-scheme:dark;background:#0d1920;color:#e5eef2}*{box-sizing:border-box}body{margin:0;padding:24px 16px}main{max-width:900px;margin:auto}header,article{border:1px solid #355362;background:#142a35;border-radius:12px;padding:20px;margin-bottom:16px}h1{font-size:24px;margin:0 0 12px}p{line-height:1.7;color:#c0d2db}dl{display:grid;grid-template-columns:110px 1fr;gap:10px;margin:0}dt{color:#90b3c4}dd{margin:0;overflow-wrap:anywhere}code{font-size:12px;overflow-wrap:anywhere}button,a{display:inline-block;padding:10px 14px;border:1px solid #4a879e;background:#21485c;border-radius:6px;color:#eefaff;font:inherit;text-decoration:none;cursor:pointer}button:disabled{opacity:.6;cursor:wait}.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.result{min-height:26px;margin:12px 0 0;color:#a5d8e8}.ok{color:#9be9b1}.bad{color:#ffb2a4}.name{font-weight:700;margin:0 0 12px}.detail{font-size:13px;color:#90b3c4}.warning{color:#e7c38d}@media(max-width:480px){body{padding:12px}header,article{padding:15px}dl{grid-template-columns:85px 1fr}h1{font-size:21px}}
+</style>
+<main>
+<header>
+<h1>王二火大 · 尤里资源校验</h1>
+<p>用于查看、下载和校验尤里版本游戏资源的压缩分片。本页包含资源数据与校验工具，完整游戏由独立游戏入口提供。分片是 gzip 传输对象的一段，需要按清单中的顺序还原后才能使用。</p>
+<dl><dt>资源包</dt><dd>@@PACK_ID@@ · 第 @@PACK_NUMBER@@ / @@PACK_COUNT@@ 包</dd><dt>分片数据</dt><dd>@@PART_BYTES@@ 字节</dd><dt>目录身份</dt><dd><code>@@CATALOG_ID@@</code></dd></dl>
+<p>无需登录。打开页面只读取清单；点击“校验分片”才会下载对应分片并检查 SHA-256。资源不会上传到其他服务器。</p>
+<p id="status" role="status" aria-live="polite">正在读取本包清单…</p>
+</header>
+<section id="parts" aria-label="资源分片"></section>
+</main>
+<script id="resource-labels" type="application/json">@@LABELS_JSON@@</script>
+<script>
+const labels=JSON.parse(document.querySelector('#resource-labels').textContent);
+const list=document.querySelector('#parts'),status=document.querySelector('#status');
+const size=n=>`${(n/1000000).toFixed(2)} MB (${n.toLocaleString('zh-CN')} 字节)`;
+const element=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
+let busy=false;
+async function start(){
+ const response=await fetch('./v2/manifest.json',{cache:'no-store'});
+ if(!response.ok)throw new Error(`清单读取失败：${response.status}`);
+ const manifest=await response.json();
+ if(manifest.schema!==1||manifest.kind!=='werhd-resource-shard'||manifest.packId!==labels.packId||manifest.catalogIdentity!==labels.catalogIdentity)throw new Error('资源包与清单身份不一致');
+ for(const [i,part] of manifest.parts.entries()){
+  if(!Number.isSafeInteger(part.bytes)||part.bytes<1||part.bytes>16000000||!/^parts\/[a-f0-9]{64}\.bin$/.test(part.path)||part.path!==`parts/${part.sha256}.bin`)throw new Error('分片描述无效');
+  const article=element('article');article.append(element('p',`${i+1}. ${(labels.names[part.wireSha256]||['资源']).join('、')}`,'name'));
+  const dl=element('dl');for(const [k,v] of [['分片大小',size(part.bytes)],['对象范围',`${part.offset.toLocaleString('zh-CN')}–${(part.offset+part.bytes-1).toLocaleString('zh-CN')} / ${part.wireBytes.toLocaleString('zh-CN')} 字节`],['分片 SHA-256',part.sha256]]){dl.append(element('dt',k),element('dd',v));}article.append(dl);
+  const controls=element('div',undefined,'controls'),button=element('button','校验分片');button.type='button';
+  const download=element('a','下载分片');download.href=`./v2/${part.path}`;download.download=part.path.split('/').pop();
+  const result=element('p','尚未校验','result');result.setAttribute('role','status');result.setAttribute('aria-live','polite');
+  button.addEventListener('click',async()=>{
+   if(busy){result.textContent='请等待当前分片校验完成。';return;}
+   if(!globalThis.crypto?.subtle){result.textContent='当前环境无法使用 SHA-256，请通过 HTTPS 或本机 HTTP 访问。';result.className='result bad';return;}
+   busy=true;button.disabled=true;result.className='result';result.textContent='正在下载并校验…';
+   try{const r=await fetch(`./v2/${part.path}`);if(!r.ok)throw new Error(`下载失败：${r.status}`);const data=await r.arrayBuffer();if(data.byteLength!==part.bytes)throw new Error('长度不匹配');const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',data)),b=>b.toString(16).padStart(2,'0')).join('');if(hash!==part.sha256)throw new Error('SHA-256 不匹配');result.textContent=`校验通过 · ${size(data.byteLength)}`;result.className='result ok';}
+   catch(error){result.textContent=`校验失败：${error.message||error}`;result.className='result bad';}
+   finally{busy=false;button.disabled=false;}
+  });
+  controls.append(button,download);article.append(controls,result);list.append(article);
+ }
+ status.textContent=`清单已就绪，共 ${manifest.parts.length} 个分片。`;
+}
+start().catch(error=>{status.textContent=error.message||String(error);status.className='warning';});
+</script>
+</html>
