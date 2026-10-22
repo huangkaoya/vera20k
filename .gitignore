@@ -5,6 +5,7 @@ validation/
 public/generated/
 public/wasm/
 public/native/
+public/native-content/
 native-client/target/
 native-client/.cargo-run/
 **/__pycache__/

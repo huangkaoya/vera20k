@@ -38,7 +38,13 @@ pub fn mount_resource(name: &str, bytes: Vec<u8>) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn configure_content(json: &str) -> Result<(), JsValue> {
+    crate::util::browser_content::configure(json).map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
 pub fn start_browser(canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+    crate::util::browser_content::freeze();
     crate::util::browser_io::finish_mount_and_hydrate()
         .map_err(|error| JsValue::from_str(&error))?;
     crate::app::browser::start(canvas)

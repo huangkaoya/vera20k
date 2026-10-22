@@ -188,9 +188,13 @@ impl AppAudioRuntime {
     }
 
     fn theme_gates(&self) -> ThemeGates {
+        let startup_suppressed = self.theme_startup_suppressed;
+        #[cfg(target_arch = "wasm32")]
+        let startup_suppressed =
+            startup_suppressed || !crate::util::browser_content::capabilities().music;
         ThemeGates {
             launcher_audio_available: self.launcher_audio_available,
-            startup_suppressed: self.theme_startup_suppressed,
+            startup_suppressed,
         }
     }
 

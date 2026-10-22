@@ -66,6 +66,16 @@ the in-game UI; long lines wrap within their own columns. Their
 text floats over a translucent bottom scrim inside the full-height 4:3 picture.
 The loading label sits above that overlay; no separate footer shrinks the art.
 
+The browser delivery is separate: `werhd-menu.mp4` is the approved H.264 preview,
+4,110,830 bytes, SHA-256
+`4ddd2bf8634ad34e8d5257263f91aaedb54419303c3edad8571e059927df4ae9`.
+It retains the same 632×570, 431-frame, 15 fps, silent sequence and is an optional
+content download. The browser's media decoder supplies RGBA frames to the existing
+GPU texture. The full `.wmvframes` archive is never embedded into the WASM build.
+The default web package uses `werhd-menu-poster.wmvframes`, containing the exact
+first PNG from that archive, without fetching the optional animation. iOS/macOS
+continue to use the original frame archive above.
+
 Format: `VWMV0001`, six little-endian u32 values (width, height, FPS numerator,
 FPS denominator, frame count, key interval), then frame-count-plus-one u64
 offsets relative to the following PNG payload. Transparent delta pixels retain

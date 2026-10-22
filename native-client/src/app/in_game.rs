@@ -215,6 +215,10 @@ impl App {
             return;
         }
         state.platform.window_active = active;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(movie) = state.frontend.main_menu_movie.as_mut() {
+            movie.set_window_active(active && !state.platform.window_hidden);
+        }
         state
             .match_state
             .match_presentation
@@ -263,6 +267,10 @@ impl App {
             return;
         }
         state.platform.window_hidden = hidden;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(movie) = state.frontend.main_menu_movie.as_mut() {
+            movie.set_window_active(state.platform.window_active && !hidden);
+        }
         if !hidden {
             state.platform.window.request_redraw();
         }

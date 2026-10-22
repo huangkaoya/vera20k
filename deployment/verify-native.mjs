@@ -2,10 +2,12 @@
 // simulated: the test receipts/CRC below are deliberately synthetic. A passing
 // result does not replace a real two-browser WebGPU battle.
 import fs from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {createHash, randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
 import WebSocket from '../node_modules/ws/wrapper.mjs';
-import {nativeAssetManifestIdentity} from '../tools/native-build-manifest.mjs';
+import {nativeAssetManifestIdentity,nativeContentCatalogIdentity} from '../tools/native-build-manifest.mjs';
 
 const TIMEOUT = 20000;
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -17,6 +19,86 @@ const deadline = (promise, label, milliseconds = TIMEOUT) => {
   return Promise.race([promise, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`${label}: timed out`)), milliseconds); })])
     .finally(() => clearTimeout(timer));
 };
+
+/** Pure release validation; importing this module never starts an HTTP/WS probe. */
+export function validateRelease(release) {
+  assert.equal(release?.schema, 1, 'Release schema');
+  assert.equal(release.build?.schema, 2, 'Build schema');
+  const resources = release.resources;
+  assert.equal(resources?.schema, 2, 'Layered content catalog schema');
+  assert.equal(resources.defaultProfile, 'skirmish', 'Default content profile');
+  const resourceIdentity = nativeAssetManifestIdentity(resources);
+  const catalogIdentity = nativeContentCatalogIdentity(resources);
+  assert.match(catalogIdentity, /^[a-f0-9]{64}$/, 'Catalog identity format');
+  assert.equal(resources.identity, resourceIdentity, 'Local required resource identity');
+  assert.equal(resources.catalogIdentity, catalogIdentity, 'Local canonical catalog identity');
+  assert.equal(release.catalogIdentity, catalogIdentity, 'Release catalog identity');
+  assert.equal(release.build.contentCatalogIdentity, catalogIdentity, 'Build catalog identity');
+  assert.equal(release.build.resourceManifestSha256, resourceIdentity, 'Compiled required resources');
+  const objects = release.objects;
+  assert.ok(objects && typeof objects === 'object' && !Array.isArray(objects), 'Release objects');
+  const requiredUrls = new Set();
+  function descriptor(url, file, label) {
+    assert.equal(typeof url, 'string', `${label}: object URL`);
+    assert.ok(url.startsWith('/') && !url.startsWith('//') && !/[?#]/.test(url), `${label}: local immutable object path`);
+    assert.ok(Number.isSafeInteger(file?.bytes) && file.bytes >= 0 && /^[a-f0-9]{64}$/.test(file.sha256), `${label}: descriptor`);
+    const entry = Object.hasOwn(objects, url) ? objects[url] : null;
+    assert.ok(entry, `${label}: release object coverage`);
+    assert.equal(entry.bytes, file.bytes, `${label}: release object bytes`);
+    assert.equal(entry.sha256, file.sha256, `${label}: release object SHA`);
+    assert.equal(typeof entry.contentType, 'string', `${label}: release object MIME`);
+    requiredUrls.add(url);
+    return entry;
+  }
+  function fileDescriptor(file, label) {
+    nativeAssetManifestIdentity({files: [file]});
+    assert.equal(file.url, `/content/objects/${file.sha256}`, `${label}: content-addressed raw URL`);
+    descriptor(file.url, file, `${label} raw`);
+    if (file.download) {
+      assert.ok(['gzip', 'identity'].includes(file.download.encoding), `${label}: transfer encoding`);
+      assert.equal(file.download.url, `/content/objects/${file.download.sha256}`, `${label}: content-addressed transfer URL`);
+      descriptor(file.download.url, file.download, `${label} transfer`);
+      if (file.download.encoding === 'identity') {
+        assert.equal(file.download.sha256, file.sha256, `${label}: identity transfer SHA`);
+        assert.equal(file.download.bytes, file.bytes, `${label}: identity transfer bytes`);
+      }
+    }
+  }
+  function group(group, label) {
+    assert.ok(Array.isArray(group?.files), `${label}: files`);
+    nativeAssetManifestIdentity(group);
+    group.files.forEach((file, index) => fileDescriptor(file, `${label} file ${index}`));
+    assert.equal(group.totalBytes, group.files.reduce((sum, file) => sum + file.bytes, 0), `${label}: total bytes`);
+    assert.equal(group.downloadBytes, group.files.reduce((sum, file) => sum + (file.download?.bytes ?? file.bytes), 0), `${label}: transfer bytes`);
+  }
+  const profiles = resources.profiles;
+  assert.ok(profiles?.skirmish && profiles?.full, 'Default and full content profiles');
+  for (const [name, profile] of Object.entries(profiles)) {
+    group(profile, `Profile ${name}`);
+    assert.equal(profile.requiredResourceIdentity, resourceIdentity, `Profile ${name}: shared gameplay identity`);
+  }
+  assert.equal(nativeAssetManifestIdentity(profiles.skirmish), resourceIdentity, 'Default profile required identity');
+  equal(resources.files, profiles.skirmish.files, 'Default manifest file selection');
+  assert.equal(resources.totalBytes, profiles.skirmish.totalBytes, 'Default manifest raw size');
+  assert.equal(resources.downloadBytes, profiles.skirmish.downloadBytes, 'Default manifest transfer size');
+  const packs = resources.packs;
+  assert.ok(packs && typeof packs === 'object' && !Array.isArray(packs), 'Optional content packs');
+  for (const [name, pack] of Object.entries(packs)) group(pack, `Pack ${name}`);
+
+  const wasmOutput = release.build.outputs?.['vera20k_bg.wasm'];
+  const wasm = descriptor('/native/vera20k_bg.wasm', wasmOutput, 'WASM raw');
+  assert.ok(wasm.bytes >= 8, 'WASM raw header extent');
+  assert.equal(wasm.contentType, 'application/wasm', 'WASM raw object MIME');
+  const wasmDownload = wasmOutput.download;
+  assert.equal(wasmDownload?.encoding, 'gzip', 'WASM compressed transfer descriptor');
+  assert.ok(wasmDownload.bytes >= 10, 'WASM gzip header extent');
+  assert.equal(wasmDownload.url, `/content/objects/${wasmDownload.sha256}`, 'WASM transfer object URL');
+  assert.equal(descriptor(wasmDownload.url, wasmDownload, 'WASM gzip').contentType, 'application/gzip', 'WASM transfer MIME');
+  return {resourceIdentity, catalogIdentity, wasm, wasmDownload,
+    coverage: {profiles: Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, profile.files.length])),
+      packs: Object.fromEntries(Object.entries(packs).map(([name, pack]) => [name, pack.files.length])),
+      objects: Object.keys(objects).length, requiredObjectUrls: requiredUrls.size}};
+}
 
 function originArgument() {
   const args = process.argv.slice(2);
@@ -79,11 +161,32 @@ function createHttp(origin) {
         assert.equal(response.headers.get('Content-Range'), `bytes 0-7/${entry.bytes}`, 'WASM range extent');
         assert.equal(response.headers.get('Content-Length'), '8', 'WASM range length');
         assert.equal(response.headers.get('ETag'), `"${entry.sha256}"`, 'WASM range ETag');
+        assert.equal(response.headers.get('Content-Encoding'), null, 'WASM raw range must not carry HTTP content encoding');
         const bytes = await smallBody(response, 8, 'WASM range');
         downloadedBytes += bytes.length;
         assert.deepEqual([...bytes], [0, 97, 115, 109, 1, 0, 0, 0], 'WASM magic/version');
       } finally {
         await deadline(response.body?.cancel().catch(() => {}), 'WASM response cleanup', 2000);
+      }
+    },
+    async gzipHeader(pathname, entry) {
+      const response = await deadline(request(`${pathname}?sha256=${entry.sha256}`, {headers: {Range: 'bytes=0-9'}}), 'WASM gzip range');
+      if (response.status !== 206) {
+        await deadline(response.body?.cancel().catch(() => {}), 'WASM gzip range cleanup', 2000);
+        throw new Error(`WASM gzip range: expected 206, got ${response.status}`);
+      }
+      try {
+        assert.equal(response.headers.get('Content-Range'), `bytes 0-9/${entry.bytes}`, 'WASM gzip extent');
+        assert.equal(response.headers.get('Content-Length'), '10', 'WASM gzip range bytes');
+        assert.equal(response.headers.get('ETag'), `"${entry.sha256}"`, 'WASM gzip range ETag');
+        assert.equal(mime(response), 'application/gzip', 'WASM gzip range MIME');
+        assert.equal(response.headers.get('Content-Encoding'), null, 'Gzip object bytes must not carry HTTP content encoding');
+        const bytes = await smallBody(response, 10, 'WASM gzip range');
+        downloadedBytes += bytes.length;
+        assert.equal(bytes.length, 10, 'WASM gzip header length');
+        assert.deepEqual([...bytes.subarray(0, 3)], [31, 139, 8], 'WASM gzip magic/method');
+      } finally {
+        await deadline(response.body?.cancel().catch(() => {}), 'WASM gzip response cleanup', 2000);
       }
     },
   };
@@ -104,6 +207,7 @@ async function objectHeads(http, objects) {
       assert.equal(response.headers.get('ETag'), `"${entry.sha256}"`, `HEAD ${pathname}: ETag`);
       assert.equal(mime(response), entry.contentType, `HEAD ${pathname}: MIME`);
       assert.equal(response.headers.get('Accept-Ranges'), 'bytes', `HEAD ${pathname}: ranges`);
+      assert.equal(response.headers.get('Content-Encoding'), null, `HEAD ${pathname}: object bytes must not carry HTTP content encoding`);
     }
   }));
   const failure = workers.find(result => result.status === 'rejected');
@@ -257,43 +361,50 @@ async function transportProbe(origin, release) {
   }
 }
 
-const report = {ok: false, scope: 'published HTTP assets and native-v2 transport probe', engineGameplayVerified: false, checks: {}};
-let stage = 'arguments';
-try {
-  const origin = originArgument(); report.origin = origin;
-  stage = 'local-release';
-  const raw = await deadline(fs.readFile(new URL('./generated/release.json', import.meta.url)), 'Read local release');
-  const release = JSON.parse(raw.toString('utf8'));
-  assert.equal(release.schema, 1, 'Release schema');
-  const resourceIdentity = nativeAssetManifestIdentity(release.resources);
-  assert.equal(resourceIdentity, release.build.resourceManifestSha256, 'Local canonical resource identity');
-  assert.equal(release.resources.identity, resourceIdentity, 'Local resource receipt');
-  assert.equal(Object.keys(release.objects).length, release.resources.files.length + 1, 'Release object coverage');
-  const wasm = release.objects['/native/vera20k_bg.wasm']; assert.ok(wasm, 'Release WASM object');
-  report.releaseSha256 = createHash('sha256').update(raw).digest('hex');
-  const http = createHttp(origin);
-  stage = 'health';
-  const health = await http.json('/api/health');
-  assert.ok(health.ok && health.app === 'werhd-vera-native' && health.protocol === 2, 'Native service health/protocol');
-  assert.equal(health.patchSha256, release.build.patchSha256, 'Published native patch');
-  assert.equal(health.resourceManifestSha256, resourceIdentity, 'Published native resources');
-  report.checks.health = true;
-  stage = 'build'; equal(await http.json('/native/build.json'), release.build, 'Published build identity'); report.checks.build = true;
-  stage = 'resources';
-  const resources = await http.json('/api/native/resources');
-  assert.equal(nativeAssetManifestIdentity(resources), resourceIdentity, 'Published canonical resource identity');
-  assert.equal(resources.identity, resourceIdentity, 'Published resource identity receipt');
-  assert.equal(resources.totalBytes, release.resources.totalBytes, 'Published resource total');
-  equal(resources, release.resources, 'Published resource URLs and manifest');
-  report.checks.resourceManifest = true;
-  stage = 'object-heads'; report.checks.objectHeads = await objectHeads(http, release.objects);
-  stage = 'wasm-range'; await http.wasmHeader('/native/vera20k_bg.wasm', wasm); report.checks.wasmHeader = true;
-  report.httpBodyBytes = http.downloadedBytes;
-  stage = 'websocket-transport'; report.checks.webSocket = await transportProbe(origin, release);
-  report.ok = true;
-} catch (error) {
-  report.stage = stage;
-  report.error = (error instanceof Error ? error.message : String(error)).split('\n')[0].slice(0, 400);
-  process.exitCode = 1;
+async function main() {
+  const report = {ok: false, scope: 'published HTTP assets and native-v2 transport probe', engineGameplayVerified: false, checks: {}};
+  let stage = 'arguments';
+  try {
+    const origin = originArgument(); report.origin = origin;
+    stage = 'local-release';
+    const raw = await deadline(fs.readFile(new URL('./generated/release.json', import.meta.url)), 'Read local release');
+    const release = JSON.parse(raw.toString('utf8'));
+    const {resourceIdentity, catalogIdentity, wasm, wasmDownload, coverage} = validateRelease(release);
+    report.catalogIdentity = catalogIdentity;
+    report.requiredResourceIdentity = resourceIdentity;
+    report.checks.localCatalog = coverage;
+    report.releaseSha256 = createHash('sha256').update(raw).digest('hex');
+    const http = createHttp(origin);
+    stage = 'health';
+    const health = await http.json('/api/health');
+    assert.ok(health.ok && health.app === 'werhd-vera-native' && health.protocol === 2, 'Native service health/protocol');
+    assert.equal(health.patchSha256, release.build.patchSha256, 'Published native patch');
+    assert.equal(health.resourceManifestSha256, resourceIdentity, 'Published native resources');
+    assert.equal(health.contentCatalogIdentity, catalogIdentity, 'Published native catalog');
+    report.checks.health = true;
+    stage = 'build'; equal(await http.json('/native/build.json'), release.build, 'Published build identity'); report.checks.build = true;
+    stage = 'resources';
+    const resources = await http.json('/api/native/resources');
+    assert.equal(resources.schema, 2, 'Published layered content catalog');
+    assert.equal(nativeAssetManifestIdentity(resources), resourceIdentity, 'Published required resource identity');
+    assert.equal(nativeContentCatalogIdentity(resources), catalogIdentity, 'Published canonical catalog identity');
+    assert.equal(resources.identity, resourceIdentity, 'Published resource identity receipt');
+    assert.equal(resources.catalogIdentity, catalogIdentity, 'Published catalog identity receipt');
+    assert.equal(resources.totalBytes, release.resources.totalBytes, 'Published default resource total');
+    equal(resources, release.resources, 'Published resource URLs and manifest');
+    report.checks.resourceManifest = true;
+    stage = 'object-heads'; report.checks.objectHeads = await objectHeads(http, release.objects);
+    stage = 'wasm-range'; await http.wasmHeader('/native/vera20k_bg.wasm', wasm); report.checks.wasmHeader = true;
+    stage = 'wasm-gzip-range'; await http.gzipHeader(wasmDownload.url, wasmDownload); report.checks.wasmGzipHeader = true;
+    report.httpBodyBytes = http.downloadedBytes;
+    stage = 'websocket-transport'; report.checks.webSocket = await transportProbe(origin, release);
+    report.ok = true;
+  } catch (error) {
+    report.stage = stage;
+    report.error = (error instanceof Error ? error.message : String(error)).split('\n')[0].slice(0, 400);
+    process.exitCode = 1;
+  }
+  console.log(JSON.stringify(report));
 }
-console.log(JSON.stringify(report));
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

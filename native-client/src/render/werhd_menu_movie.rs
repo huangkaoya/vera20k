@@ -1,12 +1,76 @@
 //! The menu loop's presentation source. Retail/capture keeps the original
-//! Bink surface; interactive iOS/macOS uses the approved branded menu movie, losslessly
-//! stored as indexed PNG keyframes and XOR deltas. This is deliberately not a
-//! source for the campaign/fullscreen movie player.
+//! Bink surface; iOS/macOS/Android retain the approved indexed PNG/XOR loop.
+//! Web uses its original first-frame poster plus an optional browser-decoded
+//! compressed MP4. This is not the campaign/fullscreen movie player.
 
 use crate::assets::error::AssetError;
 use crate::render::batch::BatchTexture;
 use crate::render::bink_movie::{BinkMovieStep, BinkMovieSurface};
 use crate::render::gpu::GpuContext;
+
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(target_arch = "wasm32")]
+#[path = "werhd_menu_movie_browser.rs"]
+mod browser_video;
+
+/// Decoded media timestamps are authoritative. The compatibility path samples
+/// the same media clock at the approved MP4's 15 fps, never the UI frame rate.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Default)]
+struct VideoFrameClock {
+    last: Option<(bool, u64)>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl VideoFrameClock {
+    fn admit(&mut self, seconds: f64, decoded_timestamp: bool) -> bool {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return false;
+        }
+        let seconds = if seconds == 0.0 { 0.0 } else { seconds };
+        let value = if decoded_timestamp {
+            seconds.to_bits()
+        } else {
+            (seconds * 15.0).floor() as u64
+        };
+        let stamp = (decoded_timestamp, value);
+        if self.last == Some(stamp) {
+            return false;
+        }
+        self.last = Some(stamp);
+        true
+    }
+}
+
+/// The shell owns playback admission; browser decode time must stop whenever
+/// the native movie control is hidden or its application is not foreground.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy)]
+struct VideoPlaybackGate {
+    menu_shown: bool,
+    window_active: bool,
+    document_visible: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl Default for VideoPlaybackGate {
+    fn default() -> Self {
+        Self {
+            menu_shown: false,
+            window_active: true,
+            document_visible: true,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl VideoPlaybackGate {
+    fn playing(self) -> bool {
+        self.menu_shown && self.window_active && self.document_visible
+    }
+}
 
 pub(crate) enum MenuMovieSurface {
     Retail(BinkMovieSurface),
@@ -26,6 +90,24 @@ impl From<BinkMovieSurface> for MenuMovieSurface {
 }
 
 impl MenuMovieSurface {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn set_playing(&mut self, playing: bool) {
+        if let Self::Branded(movie) = self
+            && let Some(video) = movie.video.as_mut()
+        {
+            video.set_playing(playing);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn set_window_active(&mut self, active: bool) {
+        if let Self::Branded(movie) = self
+            && let Some(video) = movie.video.as_mut()
+        {
+            video.set_window_active(active);
+        }
+    }
+
     #[cfg(any(
         target_os = "ios",
         target_os = "macos",
@@ -61,7 +143,7 @@ impl MenuMovieSurface {
                 target_os = "android",
                 target_arch = "wasm32"
             ))]
-            Self::Branded(_) => "built-in WERHD menu movie",
+            Self::Branded(movie) => movie.source,
         }
     }
 
@@ -91,8 +173,13 @@ impl MenuMovieSurface {
 ))]
 pub(crate) struct BrandedMenuSurface {
     frames: FrameStream<'static>,
+    source: &'static str,
     texture: wgpu::Texture,
     batch_texture: BatchTexture,
+    #[cfg(target_arch = "wasm32")]
+    video: Option<browser_video::BrowserMenuVideo>,
+    #[cfg(target_arch = "wasm32")]
+    showing_video: bool,
 }
 
 #[cfg(any(
@@ -106,7 +193,47 @@ impl BrandedMenuSurface {
         gpu: &GpuContext,
         batch: &crate::render::batch::BatchRenderer,
     ) -> Result<Self, AssetError> {
-        let frames = FrameStream::new(include_bytes!("../../art/branding/werhd-menu.wmvframes"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let (frames, source) = (
+            FrameStream::new(include_bytes!("../../art/branding/werhd-menu.wmvframes"))?,
+            "built-in WERHD menu movie",
+        );
+        #[cfg(target_arch = "wasm32")]
+        let frames = {
+            const POSTER: &[u8] = include_bytes!("../../art/branding/werhd-menu-poster.wmvframes");
+            FrameStream::new(POSTER)?
+        };
+        #[cfg(target_arch = "wasm32")]
+        let video = {
+            if crate::util::browser_content::capabilities().menu_animation {
+                let path = std::path::Path::new(crate::util::browser_io::RETAIL_ROOT)
+                    .join("werhd-menu.mp4");
+                match crate::util::browser_io::read_shared(path) {
+                    Ok(bytes) => match browser_video::BrowserMenuVideo::new(
+                        bytes.as_slice(),
+                        frames.archive.width,
+                        frames.archive.height,
+                    ) {
+                        Ok(video) => Some(video),
+                        Err(error) => {
+                            log::warn!(
+                                "Could not prepare browser menu MP4: {error:?}; keeping poster"
+                            );
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let source = if video.is_some() {
+            "/retail/werhd-menu.mp4 (browser decoder)"
+        } else {
+            "built-in WERHD menu poster"
+        };
         let (texture, batch_texture) = batch.create_updatable_texture(
             &gpu.device,
             &gpu.queue,
@@ -117,15 +244,57 @@ impl BrandedMenuSurface {
         );
         Ok(Self {
             frames,
+            source,
             texture,
             batch_texture,
+            #[cfg(target_arch = "wasm32")]
+            video,
+            #[cfg(target_arch = "wasm32")]
+            showing_video: false,
         })
     }
 
     fn step(&mut self, gpu: &GpuContext, elapsed_secs: f64) -> Result<BinkMovieStep, AssetError> {
-        if !self.frames.advance(elapsed_secs)? {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = elapsed_secs; // The browser's decoder owns MP4 time/looping.
+            let Some(video) = self.video.as_mut() else {
+                return Ok(BinkMovieStep::Unchanged);
+            };
+            match video.frame() {
+                browser_video::FrameUpdate::Ready(rgba) => {
+                    self.showing_video = true;
+                    self.upload_frame(gpu, &rgba);
+                    return Ok(BinkMovieStep::FrameUploaded);
+                }
+                browser_video::FrameUpdate::Failed => {
+                    log::warn!("Browser menu MP4 is unavailable; keeping poster");
+                    self.video = None;
+                    self.source = "built-in WERHD menu poster";
+                }
+                // A buffering/pending frame retains the last valid texture;
+                // only a failed decoder replaces it with the static poster.
+                browser_video::FrameUpdate::Waiting => return Ok(BinkMovieStep::Unchanged),
+                browser_video::FrameUpdate::Unchanged => return Ok(BinkMovieStep::Unchanged),
+            }
+            if self.showing_video {
+                self.showing_video = false;
+                self.upload_frame(gpu, &self.frames.rgba);
+                return Ok(BinkMovieStep::FrameUploaded);
+            }
             return Ok(BinkMovieStep::Unchanged);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.frames.advance(elapsed_secs)? {
+                return Ok(BinkMovieStep::Unchanged);
+            }
+            self.upload_frame(gpu, &self.frames.rgba);
+            Ok(BinkMovieStep::FrameUploaded)
+        }
+    }
+
+    fn upload_frame(&self, gpu: &GpuContext, rgba: &[u8]) {
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -133,7 +302,7 @@ impl BrandedMenuSurface {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &self.frames.rgba,
+            rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(self.frames.archive.width * 4),
@@ -145,7 +314,36 @@ impl BrandedMenuSurface {
                 depth_or_array_layers: 1,
             },
         );
-        Ok(BinkMovieStep::FrameUploaded)
+    }
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "android",
+    target_arch = "wasm32",
+    test
+))]
+enum FrameBytes<'a> {
+    Borrowed(&'a [u8]),
+    #[cfg(test)]
+    Shared(Arc<Vec<u8>>),
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "android",
+    target_arch = "wasm32",
+    test
+))]
+impl FrameBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            #[cfg(test)]
+            Self::Shared(bytes) => bytes.as_slice(),
+        }
     }
 }
 
@@ -157,7 +355,8 @@ impl BrandedMenuSurface {
     test
 ))]
 struct FrameArchive<'a> {
-    payload: &'a [u8],
+    bytes: FrameBytes<'a>,
+    payload_start: usize,
     offsets: Vec<usize>,
     width: u32,
     height: u32,
@@ -174,6 +373,11 @@ struct FrameArchive<'a> {
 ))]
 impl<'a> FrameArchive<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self, AssetError> {
+        Self::from_bytes(FrameBytes::Borrowed(bytes))
+    }
+
+    fn from_bytes(source: FrameBytes<'a>) -> Result<Self, AssetError> {
+        let bytes = source.as_slice();
         const HEADER_SIZE: usize = 8 + 6 * 4;
         if bytes.len() < HEADER_SIZE || &bytes[..8] != b"VWMV0001" {
             return Err(invalid("unrecognized or truncated header"));
@@ -221,7 +425,8 @@ impl<'a> FrameArchive<'a> {
             return Err(invalid("frame index does not cover the payload"));
         }
         Ok(Self {
-            payload,
+            bytes: source,
+            payload_start: index_end,
             offsets,
             width,
             height,
@@ -238,8 +443,9 @@ impl<'a> FrameArchive<'a> {
         let Some((&start, &end)) = self.offsets.get(index).zip(self.offsets.get(index + 1)) else {
             return Err(invalid("frame index is out of range"));
         };
+        let payload = &self.bytes.as_slice()[self.payload_start..];
         let png =
-            image::load_from_memory_with_format(&self.payload[start..end], image::ImageFormat::Png)
+            image::load_from_memory_with_format(&payload[start..end], image::ImageFormat::Png)
                 .map_err(|error| invalid(format!("frame {index} PNG: {error}")))?
                 .into_rgba8();
         if png.width() != self.width || png.height() != self.height {
@@ -272,7 +478,8 @@ impl<'a> FrameArchive<'a> {
 struct FrameStream<'a> {
     archive: FrameArchive<'a>,
     /// One restored frame; decoding temporarily holds one additional PNG RGBA
-    /// frame, then drops it. The compressed archive is borrowed, never copied.
+    /// frame, then drops it. The compressed archive is borrowed or Arc-shared,
+    /// never copied into each menu session.
     rgba: Vec<u8>,
     next_frame: usize,
     accumulator_secs: f64,
@@ -288,6 +495,15 @@ struct FrameStream<'a> {
 impl<'a> FrameStream<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self, AssetError> {
         let archive = FrameArchive::parse(bytes)?;
+        Self::from_archive(archive)
+    }
+
+    #[cfg(test)]
+    fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self, AssetError> {
+        Self::from_archive(FrameArchive::from_bytes(FrameBytes::Shared(bytes))?)
+    }
+
+    fn from_archive(archive: FrameArchive<'a>) -> Result<Self, AssetError> {
         let mut rgba = Vec::new();
         archive.decode(0, &mut rgba)?;
         Ok(Self {
@@ -299,6 +515,11 @@ impl<'a> FrameStream<'a> {
     }
 
     fn advance(&mut self, elapsed_secs: f64) -> Result<bool, AssetError> {
+        // A one-frame poster is a static texture, not a looping stream that
+        // repeatedly decodes and uploads the same frame.
+        if self.archive.frame_count() == 1 {
+            return Ok(false);
+        }
         if elapsed_secs.is_finite() {
             self.accumulator_secs += elapsed_secs.max(0.0);
         }
@@ -343,6 +564,60 @@ fn invalid(detail: impl Into<String>) -> AssetError {
 mod tests {
     use super::*;
     use image::ImageEncoder;
+
+    #[test]
+    fn browser_video_requires_visible_movie_and_foreground_document() {
+        let mut gate = VideoPlaybackGate::default();
+        assert!(
+            !gate.playing(),
+            "entry slide must keep the media clock stopped"
+        );
+        gate.menu_shown = true;
+        assert!(gate.playing());
+        gate.document_visible = false;
+        assert!(
+            !gate.playing(),
+            "background tabs stop even without a redraw"
+        );
+        gate.document_visible = true;
+        gate.window_active = false;
+        assert!(
+            !gate.playing(),
+            "document visibility cannot override WindowActive"
+        );
+        gate.menu_shown = false;
+        gate.window_active = true;
+        assert!(
+            !gate.playing(),
+            "focus restore cannot restart a sliding movie"
+        );
+        gate.menu_shown = true;
+        assert!(
+            gate.playing(),
+            "steady foreground menu resumes the same clock"
+        );
+    }
+
+    #[test]
+    fn browser_video_clock_uploads_new_media_frames_and_accepts_loop_rewind() {
+        let mut clock = VideoFrameClock::default();
+        assert!(clock.admit(0.0, true));
+        assert!(!clock.admit(0.0, true));
+        assert!(clock.admit(1.0 / 15.0, true));
+        assert!(!clock.admit(f64::NAN, true));
+        assert!(!clock.admit(f64::INFINITY, true));
+        assert!(!clock.admit(-1.0, true));
+        assert!(!clock.admit(1.0 / 15.0, true));
+        assert!(
+            clock.admit(0.0, true),
+            "browser loop time rewinds naturally"
+        );
+
+        assert!(clock.admit(0.0, false));
+        assert!(!clock.admit(1.0 / 60.0, false));
+        assert!(!clock.admit(1.0 / 30.0, false));
+        assert!(clock.admit(1.0 / 15.0, false));
+    }
 
     fn fixture(frames: &[Vec<u8>], width: u32, height: u32, interval: usize) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -421,5 +696,77 @@ mod tests {
         let mut wrong_size = bytes;
         wrong_size[8..12].copy_from_slice(&2_u32.to_le_bytes());
         assert!(FrameStream::new(&wrong_size).is_err());
+    }
+
+    #[test]
+    fn shared_stream_keeps_one_archive_allocation_and_releases_its_owner() {
+        let frames = vec![
+            vec![1, 2, 3, 255],
+            vec![7, 8, 9, 255],
+            vec![11, 12, 13, 255],
+        ];
+        let shared = Arc::new(fixture(&frames, 1, 1, 2));
+        let weak = Arc::downgrade(&shared);
+        let mut first = FrameStream::from_shared(Arc::clone(&shared)).unwrap();
+        let second = FrameStream::from_shared(Arc::clone(&shared)).unwrap();
+        assert_eq!(Arc::strong_count(&shared), 3);
+        for stream in [&first, &second] {
+            let FrameBytes::Shared(owner) = &stream.archive.bytes else {
+                panic!("owned stream must retain the existing Arc");
+            };
+            assert!(Arc::ptr_eq(owner, &shared));
+        }
+        drop(shared);
+        assert!(first.advance(1.0 / 15.0).unwrap());
+        assert_eq!(first.rgba, frames[1]);
+        assert_eq!(
+            second.rgba, frames[0],
+            "decoded frames belong to each session"
+        );
+        drop(second);
+        assert!(first.advance(1.0 / 15.0).unwrap());
+        assert_eq!(first.rgba, frames[2]);
+        drop(first);
+        assert!(
+            weak.upgrade().is_none(),
+            "no leaked static archive allocation"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn browser_poster_preserves_the_original_first_png_and_never_animates() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        // Read only the first compressed frame, never the 73 MB archive.
+        let mut original = std::fs::File::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("art/branding/werhd-menu.wmvframes"),
+        )
+        .unwrap();
+        let mut header = [0_u8; 32];
+        original.read_exact(&mut header).unwrap();
+        let count = u32::from_le_bytes(header[24..28].try_into().unwrap()) as u64;
+        let mut first_offsets = [0_u8; 16];
+        original.read_exact(&mut first_offsets).unwrap();
+        assert_eq!(&first_offsets[..8], &[0_u8; 8]);
+        let length = u64::from_le_bytes(first_offsets[8..].try_into().unwrap()) as usize;
+        original
+            .seek(SeekFrom::Start(32 + (count + 1) * 8))
+            .unwrap();
+        let mut first_png = vec![0_u8; length];
+        original.read_exact(&mut first_png).unwrap();
+
+        let poster = include_bytes!("../../art/branding/werhd-menu-poster.wmvframes");
+        let archive = FrameArchive::parse(poster).unwrap();
+        assert_eq!(archive.frame_count(), 1);
+        assert_eq!(
+            &archive.bytes.as_slice()[archive.payload_start..],
+            first_png
+        );
+        let mut stream = FrameStream::new(poster).unwrap();
+        let initial = stream.rgba.clone();
+        assert!(!stream.advance(60.0).unwrap());
+        assert_eq!(stream.rgba, initial);
     }
 }

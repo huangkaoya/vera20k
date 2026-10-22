@@ -21,7 +21,9 @@ npm run start:native-web
 ~/Library/Application Support/VERA20k/retail-assets
 ```
 
-其他资源目录可设置 `VERA_ASSET_ROOT=/absolute/path/to/assets` 再编译并启动服务。构建记录绑定资源清单，服务启动时检查实际 JS/WASM 和资源身份；不匹配时需重新构建。服务器只开放游戏资源白名单，不开放个人 `RA2MD.INI`、快捷键配置或源代码。原生客户端需要完整的音乐/影片包；首次载入会校验所有资源的长度和 SHA256。
+其他资源目录可设置 `VERA_ASSET_ROOT=/absolute/path/to/assets` 再编译并启动服务。构建记录绑定资源清单，服务启动时检查实际 JS/WASM 和资源身份；不匹配时需重新构建。服务器只开放游戏资源白名单，不开放个人 `RA2MD.INI`、快捷键配置或源代码。
+
+默认启动只下载遭遇战素材（约 279 MB）和压缩引擎（约 10 MB），不包含战役、过场影片、音乐及菜单动画。在「资源管理」中可以下载可选内容或完整资源，退出对局后重新载入启用。已校验文件按 SHA256 缓存到 CacheStorage；浏览器允许持久缓存时，后续载入复用缓存。压缩传输与解压后的文件均检查长度和 SHA256。菜单动画使用之前确认的约 4.11 MB MP4，由浏览器解码；默认使用静态背景。分包、构建和验证方法见 [资源架构说明](docs/native-content.md)。
 
 网页沿用 VERA 的操作：左键选择和下达上下文命令、右键取消/拖动视角、拖框选取、双击基地车展开。生产与建筑放置走原侧栏。具体快捷键沿用 VERA 的选项设置。
 
@@ -42,6 +44,8 @@ npm run start:native-web
 - `native-client/`：完整 VERA 源码快照及本仓库的浏览器平台适配。
 - `native-source.lock.json`：原本机提交、两路远端提交、整合提交和逐文件来源摘要。
 - `web-native/`：页面启动、字体及资源校验；游戏界面由 Rust 绘制。
+- `web-native/content-store.js`、`content-plan.js`：独立资源下载、缓存和内容方案；后续大厅可直接复用。
+- `web-native/runtime-adapter.js`：当前原生客户端的加载、资源挂载和联机接口，后续只接 sim 时替换该适配层及对局生命周期。
 - `tools/build-native-web.mjs`：WASM 编译、16 MB 栈、版本匹配的 wasm-bindgen 及构建记录。
 - `tools/native-server.mjs`：同源本地 HTTP 服务，支持 WASM MIME、资源校验、HEAD 与范围请求。
 - `tools/services/native-room-coordinator.mjs`：本地 WebSocket 与云端 Durable Object 共用的原生房间/回合同步所有者。

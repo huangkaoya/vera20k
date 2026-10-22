@@ -86,6 +86,29 @@ pub(super) fn request_network_lobby() {
     notify("vera-native-network");
 }
 
+pub(super) fn request_content(pack: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let detail = js_sys::Object::new();
+    if js_sys::Reflect::set(
+        &detail,
+        &JsValue::from_str("pack"),
+        &JsValue::from_str(pack),
+    )
+    .is_err()
+    {
+        return;
+    }
+    let init = web_sys::CustomEventInit::new();
+    init.set_detail(&detail);
+    if let Ok(event) =
+        web_sys::CustomEvent::new_with_event_init_dict("vera-content-required", &init)
+    {
+        let _ = window.dispatch_event(&event);
+    }
+}
+
 pub(super) fn notify_network_return() {
     notify("vera-native-network-return");
 }

@@ -27,8 +27,11 @@ function selectedRange(header,size) {
 async function objectResponse(request,env,entry) {
   const url=new URL(request.url),etag=`"${entry.sha256}"`;
   if(url.searchParams.has('sha256')&&url.searchParams.get('sha256')!==entry.sha256)return json({error:'Resource version unavailable'},404);
+  const immutable=url.pathname===`/content/objects/${entry.sha256}`||url.searchParams.get('sha256')===entry.sha256;
+  // Gzip is an explicit transfer object, not HTTP content negotiation. Setting
+  // Content-Encoding here would let fetch decode before the client checks SHA.
   const headers=new Headers({'Content-Type':entry.contentType,'ETag':etag,'Accept-Ranges':'bytes','X-Content-Type-Options':'nosniff',
-    'Cache-Control':url.searchParams.get('sha256')===entry.sha256?'public, max-age=31536000, immutable, no-transform':'public, max-age=0, must-revalidate, no-transform'});
+    'Cache-Control':immutable?'public, max-age=31536000, immutable, no-transform':'public, max-age=0, must-revalidate, no-transform'});
   const conditional=request.headers.get('If-None-Match');
   if(conditional?.split(',').map(value=>value.trim()).some(value=>value===etag||value==='*'))return new Response(null,{status:304,headers});
   const rangeHeader=request.headers.get('If-Range')&&request.headers.get('If-Range')!==etag?null:request.headers.get('Range');
@@ -87,7 +90,7 @@ export default {
         return env.NATIVE_ROOMS.getByName('native-v2').fetch(request);
       }
       if(!methodAllowed(request))return new Response(null,{status:405,headers:{Allow:'GET, HEAD'}});
-      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:2,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256});
+      if(url.pathname==='/api/health')return json({ok:true,app:'werhd-vera-native',protocol:2,renderer:'VERA wgpu/WebGPU',patchSha256:release.build.patchSha256,resourceManifestSha256:release.build.resourceManifestSha256,contentCatalogIdentity:release.build.contentCatalogIdentity});
       if(url.pathname==='/api/native/resources')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.resources);
       if(url.pathname==='/native/build.json')return request.method==='HEAD'?new Response(null,{headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}):json(release.build);
       let pathname;
@@ -97,7 +100,7 @@ export default {
       if(entry)return objectResponse(request,env,entry);
       // Unlisted retail files and all source/config paths fail closed. ASSETS
       // contains only the intentionally packaged browser entry, JS and fonts.
-      if(pathname.startsWith('/retail/')||pathname.endsWith('.wasm')||pathname.startsWith('/api/'))return json({error:'Route not exposed'},404);
+      if(pathname.startsWith('/retail/')||pathname.startsWith('/content/')||pathname.endsWith('.wasm')||pathname.startsWith('/api/'))return json({error:'Route not exposed'},404);
       const assetRequest=url.pathname==='/'?new Request(new URL('/index.html',url),request):request;
       const response=await env.ASSETS.fetch(assetRequest);
       const headers=new Headers(response.headers);

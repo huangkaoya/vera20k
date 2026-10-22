@@ -5,7 +5,7 @@
   "baselineModes": {},
   "patch": {
     "path": "patches/native-client.patch",
-    "sha256": "52cc2974f9831c3cfbcfb0224242a377b2b8b272526715be5f6cf79d7a99acb9"
+    "sha256": "fe3c680e9416c36b0ba219823681f90553e2cc8fda358f1ff59e59a1fca173ba"
   },
   "files": {
     "Cargo.lock": {
@@ -13,15 +13,31 @@
       "mode": "100644"
     },
     "Cargo.toml": {
-      "sha256": "022f59d816ad9b514513d62ba209b04780c16e6cf76a926e8e1ab45fbc68fa88",
+      "sha256": "8744bae9fdf0daebb664268ceaa2100fa1bf5acbfbae4eaec7490a53c172d830",
+      "mode": "100644"
+    },
+    "art/branding/README.md": {
+      "sha256": "7b03c50fddb38c039788410d888df618cdb287fa3caf809c74cf9783e82b0c96",
+      "mode": "100644"
+    },
+    "art/branding/werhd-menu-poster.wmvframes": {
+      "sha256": "73250dd1384a12226a3f53692c61118543975a8c74612aef343ef85efedb7d0b",
+      "mode": "100644"
+    },
+    "art/branding/werhd-menu.mp4": {
+      "sha256": "4ddd2bf8634ad34e8d5257263f91aaedb54419303c3edad8571e059927df4ae9",
       "mode": "100644"
     },
     "src/Cargo.toml": {
       "sha256": "6df6cc53b1382d46590ecb81796f1675fc4ffa1088780d5458f8aa3849526284",
       "mode": "100644"
     },
+    "src/app/audio_runtime.rs": {
+      "sha256": "fc086c55e9d971cbf5d277e32051ba17b1bc19c99c55bbceda504c908068d392",
+      "mode": "100644"
+    },
     "src/app/browser.rs": {
-      "sha256": "6636354eb02a35fa42a8a6a78e87899e720938ff656b14025d4525351e7a56cc",
+      "sha256": "01313c5745a16d8facad4111c510ae0cb19fd1bb39be062998cca19738ca12da",
       "mode": "100644"
     },
     "src/app/browser/network_launch.rs": {
@@ -81,11 +97,11 @@
       "mode": "100644"
     },
     "src/app/frontend/main_menu_shell_render.rs": {
-      "sha256": "e2b6c37b0c5b6c2e47a12c7c127ae1fc9efb89022d01ae72171145192956090d",
+      "sha256": "9ce00ad799b0684492d5044f7aa172692c2f37ab4467f4f1df6e621d0f777479",
       "mode": "100644"
     },
     "src/app/frontend/menu_page_render.rs": {
-      "sha256": "c1e44e52920e50b48717aee6bf38c3783a7b2ca5962ebe287777bbd6d971569b",
+      "sha256": "6061a050106bb3427d50c6ba25263d1be6dd73c7ee24c7c714b9f654c1318339",
       "mode": "100644"
     },
     "src/app/frontend/movies_credits_render.rs": {
@@ -166,6 +182,10 @@
     },
     "src/app/handler.rs": {
       "sha256": "e1674a54e1c0dd37005e94c23edc1735cd9e264c1940ea415fa2cbf767812b98",
+      "mode": "100644"
+    },
+    "src/app/in_game.rs": {
+      "sha256": "074185863fd94ff936d395858a8e11154e0927584e0ce62b45b78e508c83e4f7",
       "mode": "100644"
     },
     "src/app/initialize.rs": {
@@ -361,7 +381,7 @@
       "mode": "100644"
     },
     "src/app/shell_campaign.rs": {
-      "sha256": "d46745dcb5df8a2ec4ab4426c0220f38447b32676ad9168f136779efb2ae22cc",
+      "sha256": "0ebd10d1314e5ab5a0d0985f8f603df4c816e06e18d64c27d25198c91563e395",
       "mode": "100644"
     },
     "src/app/shell_lan.rs": {
@@ -477,7 +497,7 @@
       "mode": "100644"
     },
     "src/assets/asset_manager.rs": {
-      "sha256": "ec8d76bf9f380448457997c083a49f8d7b5bfc0e3722661c4078a1dc922a5cdf",
+      "sha256": "0560b9a03d17c750391436282c81333957e60b47a6636a814e4976054e1d45f7",
       "mode": "100644"
     },
     "src/assets/mix_archive.rs": {
@@ -645,7 +665,11 @@
       "mode": "100644"
     },
     "src/render/werhd_menu_movie.rs": {
-      "sha256": "0888b4773df00942154627c785698ccd241b8de1167d40d6797763db94464219",
+      "sha256": "a8c11d11d9a7e1abcfba6acdb722c366de24a86a38bdb02ce971034bf8b36f4e",
+      "mode": "100644"
+    },
+    "src/render/werhd_menu_movie_browser.rs": {
+      "sha256": "5c00358949bcf06e95857b81675e06d7e2eefcc7a3b089b80d370ee07c7f0cf8",
       "mode": "100644"
     },
     "src/sim/frame_profile.rs": {
@@ -768,6 +792,10 @@
       "sha256": "624773920485186cf9df12a697a97a192e9450b517616b08a0c01b22087447b1",
       "mode": "100644"
     },
+    "src/util/browser_content.rs": {
+      "sha256": "8256d62c0e2f842d60a2b9caf2ed7fd2027dcacb6d0a6dadad4de0e9cdfeb829",
+      "mode": "100644"
+    },
     "src/util/browser_io.rs": {
       "sha256": "299c5ca5a585a05614e24a6d5a448376f0e372e4d8ff49cfab41b411046320e7",
       "mode": "100644"
@@ -789,7 +817,7 @@
       "mode": "100644"
     },
     "src/util/mod.rs": {
-      "sha256": "63166f50074dac152eedb6b5f30d39b83da464648dad37a3245122b0453e616c",
+      "sha256": "b65a85c8d57d48261319e6c5a1aa3d25cd0d923014a0e3ea0446882c8e7008fa",
       "mode": "100644"
     },
     "src/util/native_file_name.rs": {
@@ -797,7 +825,7 @@
       "mode": "100644"
     },
     "src/web_entry.rs": {
-      "sha256": "ad0ff20d8c6bf1fb21824114523dacfb3d7145c13033babad417cbfed98207c3",
+      "sha256": "f3347a1c5e8c569c8ef657b21b67a43134631dbbaa62fee14b8379422694e6a4",
       "mode": "100644"
     }
   }

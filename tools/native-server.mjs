@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {requestPath, openRegularFile, fingerprint, sendFile, sendJson, methods, failRequest, listen, closeServer, httpError} from './services/http-files.mjs';
 import {attachNativeMultiplayer} from './services/native-websocket.mjs';
-import {isNativeAssetName,readNativeResourceManifest,verifyNativeBuild,nativeAssetManifestIdentity} from './native-build-manifest.mjs';
+import {isNativeAssetName,readNativeResourceManifest,readNativeContentIndex,verifyNativeBuild,nativeAssetManifestIdentity} from './native-build-manifest.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const isNativeRetailFile = isNativeAssetName;
@@ -14,16 +14,32 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
   assetRoot=process.env.VERA_ASSET_ROOT ?? path.join(os.homedir(),'Library/Application Support/VERA20k/retail-assets')} = {}) {
   root = await fs.realpath(path.resolve(root));
   const retailRoot = await fs.realpath(path.resolve(assetRoot));
-  const index = await readNativeResourceManifest({assetRoot:retailRoot});
+  let content;
+  try {content=await readNativeContentIndex({root});}
+  catch(error){if(verifyBuild||error.code!=='ENOENT')throw error;}
+  // The legacy branch is restricted to tiny isolated server fixtures. Ordinary
+  // local play and release packaging require the generated content catalog.
+  const index = content??await readNativeResourceManifest({assetRoot:retailRoot});
   const build = verifyBuild ? await verifyNativeBuild({root,requireChecked,sourceCheck}) : null;
   if(build && build.resourceManifestSha256!==nativeAssetManifestIdentity(index.manifest)) {
     throw new Error('Native resource manifest differs from the compiled client; rebuild with these resources');
   }
+  if(build&&build.contentCatalogIdentity!==content?.manifest.catalogIdentity)throw new Error('Native content catalog differs from this client build');
   const admitted = new Map();
-  for (const [name, file] of index.allowed) {
+  for (const [name, file] of index.allowed??[]) {
     const opened = await openRegularFile(retailRoot, file.name);
     admitted.set(name, {...file, fingerprint:fingerprint(opened.stat)});
     await opened.handle.close();
+  }
+  const contentObjects=new Map(content?.objects??[]);
+  if(build?.outputs['vera20k_bg.wasm'].download) {
+    const download=build.outputs['vera20k_bg.wasm'].download;
+    contentObjects.set(download.sha256,{...download,path:path.join(root,'.build/native-content/objects',download.sha256),contentType:'application/gzip'});
+  }
+  for(const [sha256,object] of contentObjects) {
+    const opened=await openRegularFile(path.dirname(object.path),path.basename(object.path));
+    if(opened.stat.size!==object.bytes)throw new Error('Native content object length differs from its build plan');
+    contentObjects.set(sha256,{...object,fingerprint:fingerprint(opened.stat)});await opened.handle.close();
   }
   const nativeRoot = path.join(root,'public/native'), sourceRoot=path.join(root,'web-native');
   const cache = new Map();
@@ -37,6 +53,12 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
         sendJson(request,response,ready?200:503,{ok:ready,app:'werhd-vera-native',renderer:'VERA wgpu/WebGPU',multiplayer:{protocol:2,rooms:multiplayer.coordinator.rooms.size},resources:{count:index.manifest.files.length,bytes:index.manifest.totalBytes}}); return;
       }
       if (pathname==='/api/native/resources') {sendJson(request,response,200,index.manifest);return;}
+      if(/^\/content\/objects\/[a-f0-9]{64}$/.test(pathname)) {
+        const sha256=pathname.split('/').pop(),object=contentObjects.get(sha256);
+        if(!object)throw httpError(404,'Content object not published');
+        await sendFile(request,response,await openRegularFile(path.dirname(object.path),path.basename(object.path)),{
+          digest:sha256,expectedFingerprint:object.fingerprint,mime:object.contentType});return;
+      }
       if (pathname.startsWith('/retail/')) {
         const name=pathname.slice('/retail/'.length), item=isNativeRetailFile(name)?admitted.get(name.toLowerCase()):undefined;
         if (!item) throw httpError(404,'Resource not exposed');
@@ -44,7 +66,7 @@ export async function createNativeServer({root=projectRoot, host='127.0.0.1', po
       }
       let directory, relative;
       if (pathname==='/' || pathname==='/index.html') {directory=sourceRoot;relative='index.html';}
-      else if (['/bootstrap.js','/lobby.js','/lobby.css'].includes(pathname)) {directory=sourceRoot;relative=pathname.slice(1);}
+      else if (['/bootstrap.js','/lobby.js','/lobby.css','/content-store.js','/content-plan.js','/runtime-adapter.js','/content-panel.js','/content-panel.css'].includes(pathname)) {directory=sourceRoot;relative=pathname.slice(1);}
       else if (pathname==='/branding/icon.png' || pathname==='/favicon.ico') {directory=path.join(root,'native-client/art/branding');relative='wannafire-app-icon.png';}
       else if (pathname==='/fonts/FiraSansCondensed-Medium.ttf' || pathname==='/fonts/FiraSansCondensed-OFL') {
         directory=path.join(root,'native-client/art/fonts');relative=path.basename(pathname);

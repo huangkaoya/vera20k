@@ -325,7 +325,9 @@ pub(crate) fn ensure_movie_for_current_layout(
         target_os = "android",
         target_arch = "wasm32"
     ))]
-    if shell_layout::uses_branded_main_menu(state) {
+    if shell_layout::uses_branded_main_menu(state)
+        || cfg!(target_arch = "wasm32") && !crate::util::browser_content::capabilities().movies
+    {
         let movie = crate::render::werhd_menu_movie::MenuMovieSurface::branded(
             &state.renderer.gpu,
             &state.renderer.batch_renderer,
@@ -533,6 +535,11 @@ fn render_main_menu_shell_to_target_inner(
     let sliding = !matches!(slide, MainMenuSlide::Steady);
     let leaving = matches!(slide, MainMenuSlide::Exit(_));
     let movie_shown = !sliding && !backdrop;
+    #[cfg(target_arch = "wasm32")]
+    if let Some(movie) = state.frontend.main_menu_movie.as_mut() {
+        movie.set_window_active(state.platform.window_active && !state.platform.window_hidden);
+        movie.set_playing(movie_shown);
+    }
     if !movie_shown {
         state.frontend.main_menu_movie_last_step = Instant::now();
     } else if let Some(movie) = state.frontend.main_menu_movie.as_mut() {

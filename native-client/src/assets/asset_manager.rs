@@ -394,6 +394,18 @@ impl AssetManager {
 
     /// Load the core runtime archive stack for one native media-selection mode.
     pub fn new(ra2_dir: &Path, media_mode: MediaArchiveMode) -> Result<Self, AssetError> {
+        Self::new_with_content(
+            ra2_dir,
+            media_mode,
+            crate::util::browser_content::capabilities(),
+        )
+    }
+
+    fn new_with_content(
+        ra2_dir: &Path,
+        media_mode: MediaArchiveMode,
+        content: crate::util::browser_content::ContentCapabilities,
+    ) -> Result<Self, AssetError> {
         let mut manager = Self {
             archives: Vec::new(),
             archive_catalog: Vec::new(),
@@ -446,16 +458,24 @@ impl AssetManager {
         manager.mount_named_archive("cameomd.mix", true)?;
         manager.mount_named_archive("cameo.mix", true)?;
 
-        manager.mount_native_map_media(media_mode)?;
+        // Browser distribution packs may omit campaign maps and presentation
+        // media. Native installs pass FULL and retain the retail requirements.
+        if content.campaign {
+            manager.mount_native_map_media(media_mode)?;
+        }
         manager.mount_named_archive("multimd.mix", true)?;
-        manager.mount_named_archive("thememd.mix", false)?;
-        // VERA presentation extension: native YR mounts THEME.MIX only when
-        // THEMEMD.MIX is absent. Keep MD first, then make original RA2 music
-        // available to the shared Theme catalog without displacing YR files.
-        // Preserve this user-requested parity exception during future parity
-        // work unless the user explicitly asks to change the music catalog.
-        manager.mount_named_archive("theme.mix", false)?;
-        manager.mount_native_movie_media(media_mode)?;
+        if content.music {
+            manager.mount_named_archive("thememd.mix", false)?;
+            // VERA presentation extension: native YR mounts THEME.MIX only when
+            // THEMEMD.MIX is absent. Keep MD first, then make original RA2 music
+            // available to the shared Theme catalog without displacing YR files.
+            // Preserve this user-requested parity exception during future parity
+            // work unless the user explicitly asks to change the music catalog.
+            manager.mount_named_archive("theme.mix", false)?;
+        }
+        if content.movies {
+            manager.mount_native_movie_media(media_mode)?;
+        }
 
         // Loose YRO archives are deliberately absent here. Retail registers
         // each one during SessionClass scenario enumeration, immediately
@@ -1609,6 +1629,65 @@ mod tests {
                 _ => panic!("unexpected music source"),
             }
         }
+    }
+
+    #[test]
+    fn browser_skirmish_content_omits_optional_media_but_keeps_core_archives() {
+        use crate::util::browser_content::ContentCapabilities;
+
+        let dir = audio_test_install("browser-content");
+        for name in ["mapsmd03.mix", "movmd03.mix"] {
+            crate::util::file_io::remove_file(dir.path().join(name)).unwrap();
+        }
+        dir.write_mix("thememd.mix", "optional-music.wav", b"YR music");
+        dir.write_mix("theme.mix", "optional-music.wav", b"RA2 music");
+        let light = ContentCapabilities::default();
+        let manager =
+            AssetManager::new_with_content(dir.path(), MediaArchiveMode::STOCK_DIGITAL, light)
+                .expect("a skirmish install does not require campaign/movie media");
+        let names = manager.registered_archive_names();
+        for required in ["ra2md.mix", "ra2.mix", "multimd.mix", "conquer.mix"] {
+            assert!(names.iter().any(|name| name == required), "{required}");
+        }
+        assert!(manager.get_ref("optional-music.wav").is_none());
+        assert!(!names.iter().any(|name| name == "thememd.mix"));
+
+        assert!(
+            AssetManager::new_with_content(
+                dir.path(),
+                MediaArchiveMode::STOCK_DIGITAL,
+                ContentCapabilities {
+                    campaign: true,
+                    ..light
+                },
+            )
+            .is_err(),
+            "campaign admission still requires its map media"
+        );
+        assert!(
+            AssetManager::new_with_content(
+                dir.path(),
+                MediaArchiveMode::STOCK_DIGITAL,
+                ContentCapabilities {
+                    movies: true,
+                    ..light
+                },
+            )
+            .is_err(),
+            "movie admission still requires its selected movie media"
+        );
+
+        dir.write_mix("mapsmd03.mix", "campaign-map.bin", b"campaign");
+        dir.write_mix("movmd03.mix", "movie.bin", b"movie");
+        let full = AssetManager::new_with_content(
+            dir.path(),
+            MediaArchiveMode::STOCK_DIGITAL,
+            ContentCapabilities::FULL,
+        )
+        .expect("full content follows the original media registration path");
+        assert_eq!(full.get_ref("campaign-map.bin"), Some(&b"campaign"[..]));
+        assert_eq!(full.get_ref("movie.bin"), Some(&b"movie"[..]));
+        assert_eq!(full.get_ref("optional-music.wav"), Some(&b"YR music"[..]));
     }
 
     #[test]

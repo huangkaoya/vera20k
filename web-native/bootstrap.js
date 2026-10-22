@@ -1,49 +1,112 @@
-const status = document.querySelector('#status');
-const progress = document.querySelector('#progress');
-const startup = document.querySelector('#startup');
-const canvas = document.querySelector('#game');
+import {ContentStore} from './content-store.js';
+import {resolveContentPlan} from './content-plan.js';
+import {installContentPanel} from './content-panel.js';
+import {createVeraRuntime} from './runtime-adapter.js';
+import {installNativeLobby} from './lobby.js';
+
+const status = document.querySelector('#status'), progress = document.querySelector('#progress');
+const startup = document.querySelector('#startup'), canvas = document.querySelector('#game');
+const actions = document.querySelector('#startup-actions'), selectionKey = 'vera.content.selection.v1';
+const controller = new AbortController(), size = bytes => `${(bytes / 1048576).toFixed(1)} MB`;
+let runtime, initialized = false, cacheWarning = false;
+function action(text, callback) {
+  const button = document.createElement('button'); button.type = 'button'; button.textContent = text;
+  button.addEventListener('click', callback); return button;
+}
+async function json(url) {
+  const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
+  if (!response.ok) throw new Error(`版本信息读取失败：${response.status}`);
+  return response.json();
+}
+const digest = async bytes => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
+function canonical(value) {
+  return Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+}
+function activationAllowed() {
+  if (!runtime || !initialized) return true;
+  return runtime.diagnostics()?.mode === 'menu'
+    && !['loading', 'ready', 'running', 'finishing'].includes(runtime.networkStatus()?.phase);
+}
+
 try {
-  if (!navigator.gpu) throw new Error('当前浏览器未提供 WebGPU。请使用支持 WebGPU 的浏览器打开游戏。');
-  const native = await import('/native/vera20k.js');
-  const {installNativeLobby} = await import('./lobby.js');
-  status.textContent = '正在载入游戏引擎…';
-  await native.default();
-  const font = new FontFace('Vera UI', 'url(/fonts/FiraSansCondensed-Medium.ttf)', {weight:'500'});
+  if (!navigator.gpu) throw new Error('当前浏览器未提供 WebGPU，请使用支持 WebGPU 的浏览器。');
+  const [build, catalog] = await Promise.all([json('/native/build.json'), json('/api/native/resources')]);
+  const {catalogIdentity, ...catalogBody} = catalog;
+  if (catalogIdentity !== await digest(new TextEncoder().encode(JSON.stringify(canonical(catalogBody))))
+    || build.contentCatalogIdentity !== catalogIdentity || build.resourceManifestSha256 !== catalog.identity)
+    throw new Error('引擎与资源目录版本不一致，请重新载入游戏');
+  let selection = {profile: 'skirmish', addons: []};
+  try { const saved = JSON.parse(localStorage.getItem(selectionKey)); if (saved) { resolveContentPlan(catalog, saved); selection = saved; } } catch {}
+  const plan = resolveContentPlan(catalog, selection), store = new ContentStore({onCacheStatus: event => {
+    if (['unavailable', 'write-failed'].includes(event.state)) cacheWarning = true;
+  }});
+  const panel = installContentPanel({catalog, store, initialSelection: {profile: plan.profile, addons: plan.addons}, isActivationAllowed: activationAllowed, onActivate: next => {
+    if (!activationAllowed()) throw new Error('请先退出对局，再切换资源');
+    const checked = resolveContentPlan(catalog, next);
+    localStorage.setItem(selectionKey, JSON.stringify({profile: checked.profile, addons: checked.addons}));
+    controller.abort(); location.reload();
+  }});
+  window.addEventListener('vera-content-required', event => panel.open({pack: event.detail?.pack}));
+  actions.append(action('取消下载', () => controller.abort()), action('资源管理', () => panel.open()));
+  Object.defineProperty(window, '__veraContent', {value: Object.freeze({profile: plan.profile, addons: plan.addons,
+    requiredResourceIdentity: plan.requiredResourceIdentity, catalogIdentity, files: plan.files.length,
+    rawBytes: plan.totalBytes, downloadBytes: plan.downloadBytes, capabilities: plan.capabilities})});
+  const engine = build.outputs?.['vera20k_bg.wasm'];
+  if (!engine) throw new Error('缺少游戏引擎版本信息');
+  const engineFile = {name: 'vera20k_bg.wasm', ...engine, url: '/native/vera20k_bg.wasm'};
+  status.textContent = `正在载入游戏引擎 · ${size(engine.download?.bytes ?? engine.bytes)}`;
+  const engineBytes = await store.loadFile(engineFile, {signal: controller.signal, onProgress: event => {
+    progress.value = Math.min(1, event.attemptWireBytes / Math.max(1, event.wireTotalBytes));
+    status.textContent = event.cacheStatus === 'hit' ? '正在读取已校验的引擎缓存…'
+      : `正在载入游戏引擎 ${size(event.attemptWireBytes)} / ${size(event.wireTotalBytes)}`;
+  }});
+  runtime = await createVeraRuntime({moduleUrl: `/native/vera20k.js?sha256=${build.outputs['vera20k.js'].sha256}`, engineBytes});
+  runtime.configureContent(plan.capabilities);
+  const font = new FontFace('Vera UI', 'url(/fonts/FiraSansCondensed-Medium.ttf)', {weight: '500'});
   document.fonts.add(await font.load());
-  const response = await fetch('/api/native/resources');
-  if (!response.ok) throw new Error(`游戏资源清单读取失败：${response.status}`);
-  const manifest = await response.json();
-  let completed = 0;
-  for (const file of manifest.files) {
-    status.textContent = `正在载入游戏资源 ${Math.round(completed / 1048576)} / ${Math.round(manifest.totalBytes / 1048576)} MB`;
-    const response = await fetch(file.url);
-    if (!response.ok) throw new Error(`资源 ${file.name} 读取失败：${response.status}`);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength !== file.bytes) throw new Error(`资源 ${file.name} 长度校验失败`);
-    const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2,'0')).join('');
-    if (digest !== file.sha256) throw new Error(`资源 ${file.name} 完整性校验失败`);
-    native.mount_resource(file.name, bytes);
-    completed += file.bytes;
-    progress.value = completed / manifest.totalBytes;
-    await new Promise(resolve => requestAnimationFrame(resolve));
-  }
+  let cursor = 0, complete = 0, firstError;
+  const progressByFile = new Map();
+  const report = () => {
+    const prepared = [...progressByFile.values()].reduce((sum, bytes) => sum + bytes, 0);
+    progress.value = Math.min(1, prepared / Math.max(1, plan.downloadBytes));
+    status.textContent = `正在准备${plan.profile === 'full' ? '完整' : '遭遇战'}素材 ${complete} / ${plan.files.length}\n${size(prepared)} / ${size(plan.downloadBytes)}\n`
+      + (cacheWarning ? '浏览器缓存不可用，后续可能需要重新下载。' : '已校验资源会保留在本地缓存。');
+  };
+  const workers = await Promise.allSettled(Array.from({length: 2}, async () => {
+    try {
+      while (cursor < plan.files.length) {
+        controller.signal.throwIfAborted();
+        const file = plan.files[cursor++], wireBytes = file.download?.bytes ?? file.bytes;
+        const bytes = await store.loadFile(file, {signal: controller.signal, onProgress: event => {
+          progressByFile.set(file.sha256, event.cacheStatus === 'hit' || event.stage === 'complete'
+            ? wireBytes : Math.min(wireBytes, event.attemptWireBytes)); report();
+        }});
+        controller.signal.throwIfAborted();
+        runtime.mountResource(file.name, bytes); ++complete; progressByFile.set(file.sha256, wireBytes); report();
+      }
+    } catch (error) { firstError ??= error; controller.abort(); throw error; }
+  }));
+  if (firstError) throw firstError;
+  if (workers.some(worker => worker.status === 'rejected')) throw new Error('素材准备失败');
   status.textContent = '正在初始化画面…';
-  const initialized = new Promise((resolve, reject) => {
-    const inspect = () => {
+  const ready = new Promise((resolve, reject) => {
+    const observer = new MutationObserver(() => {
       if (canvas.dataset.veraStage === 'ready') { observer.disconnect(); resolve(); }
-      else if (canvas.dataset.veraStage === 'error') { observer.disconnect(); reject(new Error(canvas.dataset.veraError ?? '原生客户端初始化失败')); }
-    };
-    const observer = new MutationObserver(inspect);
-    observer.observe(canvas, {attributes:true, attributeFilter:['data-vera-stage','data-vera-error']});
+      else if (canvas.dataset.veraStage === 'error') { observer.disconnect(); reject(new Error(canvas.dataset.veraError ?? '游戏初始化失败')); }
+    });
+    observer.observe(canvas, {attributes: true, attributeFilter: ['data-vera-stage', 'data-vera-error']});
   });
-  installNativeLobby({native,canvas});
-  native.start_browser(canvas);
-  Object.defineProperty(window, '__veraNative', {value:Object.freeze({sourceRevision:native.source_revision(), diagnostics:()=>native.browser_diagnostics?.(), networkStatus:()=>native.network_status()})});
-  await initialized;
-  startup.hidden = true;
-  canvas.focus();
+  installNativeLobby({native: runtime.network, canvas});
+  runtime.start(canvas);
+  runtime.diagnostics(); // Enable the native read-only snapshot before content activation needs it.
+  Object.defineProperty(window, '__veraNative', {value: Object.freeze({sourceRevision: runtime.sourceRevision(),
+    diagnostics: runtime.diagnostics, networkStatus: runtime.networkStatus})});
+  await ready; initialized = true; startup.hidden = true; canvas.focus();
 } catch (error) {
-  status.textContent = `游戏启动失败：${error instanceof Error ? error.message : String(error)}`;
-  progress.hidden = true;
-  console.error(error);
+  controller.abort();
+  status.textContent = error?.name === 'AbortError' ? '下载已取消，已完成校验的缓存会保留。'
+    : `游戏启动失败：${error instanceof Error ? error.message : String(error)}`;
+  progress.hidden = true; actions.replaceChildren(action('重新载入并重试', () => location.reload()));
+  if (error?.name !== 'AbortError') console.error(error);
 }

@@ -20,18 +20,53 @@ npm run check --prefix deployment
 ```
 
 Packaging requires a checked schema 2 native build. It checks the source patch,
-actual JS/WASM hashes and the canonical retail manifest before writing ignored
+actual JS/WASM hashes and the schema-2 content catalog before writing ignored
 `generated/` output. Native source, retail archives and credentials are never
 copied into the small static-assets directory. Source edits after packaging
 require a new checked build/package.
 
 The static directory contains HTML/JS/CSS/font/icon files below 25 MiB. WASM and
-retail archives stay in R2 under
+retail/content archives stay in R2 under
 `vera20k/web-native/objects/sha256/<content-sha256>`. Unchanged archives are reused
 across releases. The Worker only reads the object keys in its bundled release
 manifest, serves `application/wasm`, streams full or single byte ranges, and
-rejects unlisted retail/config/source paths. Resource URLs carry their SHA and
-the client still checks the complete bytes before mounting them.
+rejects unlisted content/retail/config/source paths. `/api/native/resources`
+returns the complete catalog with `skirmish` as the default startup profile,
+optional packs and a separate full startup profile. Resource URLs are immutable
+`/content/objects/<sha256>` paths. The client checks compressed size/SHA,
+decompresses, then checks raw size/SHA before mounting.
+
+## Default and optional content
+
+Build the reproducible catalog with `python3 tools/native-content.py build`
+before the checked native build, then run `python3 tools/native-content.py check`.
+The public catalog contains no local installation paths; the ignored
+`.build/native-content/plan.json` maps exact SHA objects to read-only retail or
+generated files for packaging. See [the content pipeline](../docs/native-content.md).
+
+The default profile contains 26 files: 602,239,457 raw bytes and 279,134,944
+download bytes, including all six theaters, skirmish maps, unit art and YR
+audio. Campaign, cinematics, music and branding animation are optional. Campaign
+depends on cinematics. The current branding animation is the approved
+4,110,830-byte compressed MP4; the 73 MB PNG-frame stream is not published by
+this catalog and is not a first-start download. Theater groups currently
+describe bundled content, not runtime hot-mountable packs.
+
+The full profile preserves the original 32 retail files plus that MP4. It is an
+alternative startup set because its language containers differ from the lean
+ones. Optional additions are cached and enabled on reload; caching them alone
+does not change simulation resources or the network identity.
+
+Packaging requires both `build.resourceManifestSha256 === catalog.identity`
+and `build.contentCatalogIdentity === catalog.catalogIdentity`. The former is
+the fixed default gameplay identity, also required by full; the latter pins the
+entire recursively canonicalized catalog, including all optional descriptors.
+The release publishes every raw/gzip object in the private plan, the raw WASM
+alias `/native/vera20k_bg.wasm`, and its explicit gzip transfer descriptor.
+Content-addressed R2 keys deduplicate unchanged objects across releases. Gzip
+objects use `application/gzip` with **no HTTP Content-Encoding**, so fetch cannot
+silently decode bytes before their transfer SHA is checked. Retain old immutable
+objects during rollout/rollback; a release whitelist only exposes its own keys.
 
 ## Target, authentication and upload
 
@@ -79,7 +114,7 @@ Production was connected on 2026-10-22:
   targets `youlidefuchou-wan.pages.dev` and is now proxied by Cloudflare.
 - The same Worker is available at
   `https://werhd-vera-native.chdhyc.workers.dev`. Small assets use its ASSETS
-  binding; the WASM and 32 retail files use the `youlidefuchou-res` R2 binding
+  binding; the WASM and content objects use the `youlidefuchou-res` R2 binding
   and our immutable content-addressed prefix. All game requests stay on the
   browser's selected origin, including `/ws/native` to the `NativeRooms` DO.
 - The existing `youlidefuchou-wan` Pages project, custom domain and production
@@ -96,11 +131,15 @@ npm run verify --prefix deployment -- --origin=https://wan.youlidefuchou.com
 ```
 
 The probe requires the matching local `generated/release.json`. It checks
-health/build/resource identities, every object's HEAD size/ETag/MIME, an
-eight-byte WASM Range response, rejected missing/foreign WebSocket Origins and
+health/build/catalog identities, shared required identity across profiles,
+every published raw/gzip object's HEAD size/ETag/MIME and absent Content-Encoding,
+an eight-byte WASM Range response and gzip header, rejected missing/foreign WebSocket Origins and
 a temporary two-peer native-v2 room. Its launch receipts and checksum are
 synthetic; it removes its temporary rooms and does not load the engine. Both
-hostnames passed this HTTP/transport probe at cutover. Actual WebGPU rendering,
+hostnames passed the previous complete-file HTTP/transport probe at initial
+cutover. A newly prepared content-catalog package needs its own upload,
+deployment and matching probe; local fixture tests do not establish that it is
+live. Actual WebGPU rendering,
 two-browser gameplay and exit/reentry require separate browser acceptance.
 
 ## Route rollback
@@ -123,6 +162,6 @@ rooms. It uses standard WebSockets so a connected match retains its coordinator
 in memory. Deploy/restart/disconnect terminates a match, like the local adapter;
 there is no unimplemented promise of resuming a partially committed game.
 
-Cloudflare does not run the 95 MiB game WASM inside its Worker. Browsers run the
+Cloudflare does not run the game WASM inside its Worker. Browsers run the
 unchanged VERA client; the Worker streams assets and the coordinator admits
 ordered native commands and checks matching hashes.

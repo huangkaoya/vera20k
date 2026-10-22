@@ -371,6 +371,11 @@ pub(crate) fn render_menu_page(
     // timer (`0x006071E0`; the teardown also stops it with 0x4E2), so the
     // shell background shows and the movie clock starts after the slide.
     let sliding = wave.is_some();
+    #[cfg(target_arch = "wasm32")]
+    if let Some(movie) = state.frontend.main_menu_movie.as_mut() {
+        movie.set_window_active(state.platform.window_active && !state.platform.window_hidden);
+        movie.set_playing(!sliding);
+    }
     if sliding {
         state.frontend.main_menu_movie_last_step = Instant::now();
     } else if let Some(movie) = state.frontend.main_menu_movie.as_mut() {

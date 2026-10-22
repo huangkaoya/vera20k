@@ -21,6 +21,14 @@ impl App {
     /// State 8: create `0x94` after `0x100` is destroyed. Its proc starts the
     /// slider at OptionsClass `Difficulty` (`0x0052F114`).
     pub(super) fn open_campaign_page(state: &mut AppState) {
+        #[cfg(target_arch = "wasm32")]
+        if !crate::util::browser_content::capabilities().campaign {
+            // The ordinary Single Player exit has already torn down its
+            // dialog. Recreate it before handing optional content to the host.
+            Self::open_single_player_shell(state);
+            crate::app::browser::request_content("campaign");
+            return;
+        }
         crate::app::frontend::main_menu_shell_render::clear_ra2ts_movie_session(state);
         crate::app::frontend::shell_transition::invalidate_main_menu_dialog_instance(state);
         state.frontend.campaign = Some(CampaignShellState::open(
