@@ -234,4 +234,3 @@ export function installContentPanel({catalog, store, onActivate, isActivationAll
   return {open, dispose() { if (disposed) return; disposed = true; ++epoch; stopAllowedWatch(); state.job?.controller.abort(); state.job = null; shell.remove(); launcher.remove(); stylesheet.remove(); }};
 }
 import {resolveContentPlan} from './content-plan.js';
-

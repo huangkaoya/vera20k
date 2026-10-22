@@ -1,7 +1,10 @@
 # Content delivery acceptance — 2026-10-22
 
 Published at <https://wan.youlidefuchou.com/> with Worker version
-`88b63973-6945-4811-92e6-062fd61e1e61`.
+`e4f87bfd-8a61-48ff-8ea7-fb7e60c2aa49`. Browser gameplay below ran on
+`88b63973-6945-4811-92e6-062fd61e1e61`; the final publication only removes a
+trailing blank line in the content-panel JavaScript. Native, catalog, Worker
+logic and protocol bytes are unchanged; final static bytes are checked separately.
 
 - Native patch: `fe3c680e9416c36b0ba219823681f90553e2cc8fda358f1ff59e59a1fca173ba`.
 - Required gameplay resources: `4fe1b06b1e33cdfc84916b61706cfdad0ee307d88486b156d2b48bf3b7f78c58`.
@@ -43,6 +46,9 @@ Real UI commands moved/deployed the MCV and completed power production. The
 guest surrendered through the native Observe action. Both clients reached
 `finished` at tick 1380 with CRC `retail:1380:c07d3c57` and no error. Sequential
 running snapshots are not used as evidence of same-tick equality.
+Both clients then returned to the menu, created a new room and reached another
+running match. Their captured tick-241 CRC was `retail:241:cd9ce7f4` on both sides;
+this second match was deliberately stopped by closing the test guest.
 
 ## Limits and evidence
 
