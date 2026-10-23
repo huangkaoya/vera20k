@@ -53,22 +53,45 @@ export function safeToyDiagnostic(value) {
 }
 
 export class ToyCliFailure extends Error {
-  constructor({operation, kind, outcome = 'unknown', apiCode, httpStatus, detail, exitCode, signal}) {
+  constructor({operation, kind, outcome = 'unknown', apiCode, httpStatus, detail, exitCode, signal, stage, reason}) {
     const code = apiCode !== undefined ? ` code=${apiCode}` : '';
     const status = httpStatus ? ` HTTP=${httpStatus}` : '';
+    const safeStage = ['upload-init', 'upload-part', 'upload-complete', 'preview', 'create'].includes(stage) ? stage : null;
+    const safeReason = ['timeout', 'network'].includes(reason) ? reason : null;
+    const transport = `${safeStage ? ` stage=${safeStage}` : ''}${safeReason ? ` reason=${safeReason}` : ''}`;
     const info = safeToyDiagnostic(detail);
-    super(`Toy ${operation} ${kind}${status}${code}${info ? `：${info}` : ''}`);
+    super(`Toy ${operation} ${kind}${status}${code}${transport}${info ? `：${info}` : ''}`);
     Object.assign(this, {name: 'ToyCliFailure', operation, kind, outcome,
       ...(apiCode !== undefined ? {apiCode} : {}), ...(httpStatus ? {httpStatus} : {}),
-      ...(Number.isInteger(exitCode) ? {exitCode} : {}), ...(signal ? {signal} : {})});
+      ...(Number.isInteger(exitCode) ? {exitCode} : {}), ...(signal ? {signal} : {}),
+      ...(safeStage ? {stage: safeStage} : {}), ...(safeReason ? {reason: safeReason} : {})});
   }
   receipt() {
     return {operation: this.operation, kind: this.kind, outcome: this.outcome,
       message: this.message, ...(this.apiCode !== undefined ? {apiCode: this.apiCode} : {}),
       ...(this.httpStatus ? {httpStatus: this.httpStatus} : {}),
       ...(this.exitCode !== undefined ? {exitCode: this.exitCode} : {}),
-      ...(this.signal ? {signal: this.signal} : {})};
+      ...(this.signal ? {signal: this.signal} : {}), ...(this.stage ? {stage: this.stage} : {}),
+      ...(this.reason ? {reason: this.reason} : {})};
   }
+}
+
+function transportDiagnostic(error) {
+  // These literal prefixes occur in the official v0.6.4 CLI. Recognize only
+  // an error line's prefix, never a response body or an embedded URL/message.
+  const line = typeof error?.stderr === 'string' ? error.stderr.split(/\r?\n/).find(value =>
+    /^(?:Error:\s*)?(?:upload\/(?:init|parts|part \d+|complete) failed:|(?:preview|create) Toy failed:)/.test(value)) : null;
+  const prefix = line?.replace(/^Error:\s*/, ''), diagnostic = {};
+  if (prefix?.startsWith('upload/init failed:')) diagnostic.stage = 'upload-init';
+  else if (/^upload\/(?:parts|part \d+) failed:/.test(prefix ?? '')) diagnostic.stage = 'upload-part';
+  else if (prefix?.startsWith('upload/complete failed:')) diagnostic.stage = 'upload-complete';
+  else if (prefix?.startsWith('preview Toy failed:')) diagnostic.stage = 'preview';
+  else if (prefix?.startsWith('create Toy failed:')) diagnostic.stage = 'create';
+  if (error?.killed || /context deadline exceeded|Client\.Timeout|\bi\/o timeout\b|TLS handshake timeout/i.test(line ?? ''))
+    diagnostic.reason = 'timeout';
+  else if (/\bdial (?:tcp|udp)\b|connection (?:reset by peer|refused)|network is unreachable|no such host|unexpected EOF/i.test(line ?? ''))
+    diagnostic.reason = 'network';
+  return diagnostic;
 }
 
 function apiFailure(operation, apiCode, message, httpStatus, exitCode) {
@@ -105,6 +128,7 @@ export function classifyToyCliError(error, operation) {
   return new ToyCliFailure({operation, kind: error?.killed ? 'timeout-unknown' : 'transport-unknown',
     exitCode: Number.isInteger(error?.code) ? error.code : undefined,
     signal: typeof error?.signal === 'string' ? safeToyDiagnostic(error.signal) : undefined,
+    ...transportDiagnostic(error),
     detail: '未取得可确认的提交结果；已保留结果核对边界，不自动重试。'});
 }
 
@@ -309,21 +333,23 @@ function snapshotAttempt(record) {
   return Object.fromEntries(fields.filter(field => record[field] !== undefined).map(field => [field, structuredClone(record[field])]));
 }
 
-export async function publishResourceShards({submit = false, refreshStatus = false, retryQuota = false, limit = Infinity,
+export async function publishResourceShards({submit = false, refreshStatus = false, retryQuota = false, from = 1, limit = Infinity,
   cli = path.join(root, '.build/toy-cli/toy'), run = runToyCli,
   planPath = path.join(root, 'dist/toy-resources/plan.json'),
   proofPath = path.join(root, 'validation/toy-resource-http.json'), poster, icon,
   wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)), onProgress = console.log} = {}) {
   if (submit && refreshStatus) throw new Error('--submit 和 --refresh-status 不能同时使用');
   if (retryQuota && !submit) throw new Error('--retry-quota 仅能搭配显式 --submit 使用');
+  if (!Number.isSafeInteger(from) || from < 1) throw new Error('--from 必须是原计划中从 1 开始的正整数序号');
   if (!(limit === Infinity || Number.isSafeInteger(limit) && limit > 0)) throw new Error('--limit 必须是正整数');
   const {plan, planSha256, outputDirectory} = await validatePublicationPlan({planPath, proofPath, requireProof: submit});
+  if (from > plan.packs.length || from > limit) throw new Error('--from 不能超过资源包总数或 --limit');
   const publishing = refreshStatus ? null : await validatePublishingMedia({
     poster: poster ?? path.join(outputDirectory, 'media/poster.png'),
     icon: icon ?? path.join(outputDirectory, 'media/icon.png')});
   const descriptors = plan.packs.map((pack, index) => publicationDescriptor(plan, pack, index));
   if (!submit && !refreshStatus) {
-    const preview = {dryRun: true, catalogIdentity: plan.catalogIdentity, planSha256,
+    const preview = {dryRun: true, from, catalogIdentity: plan.catalogIdentity, planSha256,
       packages: plan.packs.length, zipBytes: plan.packs.reduce((sum, pack) => sum + pack.zipBytes, 0),
       publishingMetadata: publishing.media, publishingMetadataHash: publishing.mediaHash,
       enabled: false, tools: descriptors.map(({artifact, ...descriptor}) => descriptor)};
@@ -380,7 +406,7 @@ export async function publishResourceShards({submit = false, refreshStatus = fal
       catalogIdentity: plan.catalogIdentity, sources: journal.stagedSources});
   };
   let submitted = 0;
-  for (let index = 0; index < plan.packs.length && index < limit; index++) {
+  for (let index = from - 1; index < plan.packs.length && index < limit; index++) {
     const pack = plan.packs[index], descriptor = descriptors[index];
     let record = journal.packs.find(value => value.packId === pack.packId);
     if (refreshStatus && !record?.id) {
@@ -493,7 +519,7 @@ export async function publishResourceShards({submit = false, refreshStatus = fal
     }
   }
   await persist();
-  const result = {ok: true, submit, refreshStatus, submitted, catalogIdentity: plan.catalogIdentity,
+  const result = {ok: true, submit, refreshStatus, from, submitted, catalogIdentity: plan.catalogIdentity,
     journal: journalPath, packages: plan.packs.length, recorded: journal.packs.length,
     enabled: false, confirmed: journal.packs.filter(record => record.id).length,
     pendingList: journal.packs.filter(record => record.id && record.metadataVerified !== true).length,
@@ -513,6 +539,7 @@ function argumentsFrom(args) {
     else if (arg === '--refresh-status') options.refreshStatus = true;
     else if (arg === '--retry-quota') options.retryQuota = true;
     else if (arg === '--dry-run') continue;
+    else if (/^--from=\d+$/.test(arg)) options.from = Number(arg.slice(7));
     else if (/^--limit=\d+$/.test(arg)) options.limit = Number(arg.slice(8));
     else if (arg.startsWith('--cli=')) options.cli = path.resolve(arg.slice(6));
     else if (arg.startsWith('--poster=')) options.poster = path.resolve(arg.slice(9));

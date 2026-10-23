@@ -6,6 +6,17 @@ original catalog/gameplay identity and do not enable a new production source.
 The tool pages describe and validate their actual resource fragments; they do
 not contain a game or claim to be an unrelated utility.
 
+On 2026-10-24 the original account (UID 429593303) finished the remaining nine
+uploads. All 19 IDs were verified as `published / TOOL / LINK_ONLY`, and all
+19 public manifest responses matched their planned SHA-256. See
+`validation/toy-resource-remote-status.json` and
+`validation/toy-resource-public-manifests-20261024.json`. Sources remain disabled
+pending the user's activation approval and target-game browser validation.
+Pack 12 needed one controlled, unchanged-slug recovery after complete account
+list reconciliation and a successful preview. Its first unknown attempt remains
+in `validation/toy-resource-pack012-recovery-20261024.json` and the journal; this
+does not enable unknown-result retries in the publisher.
+
 Build from the existing checked gzip objects, then exercise the same browser
 transport over real local HTTP:
 
@@ -57,6 +68,9 @@ node tools/publish-native-resource-shards.mjs --refresh-status
 
 # After quota recovery, explicitly resume a confirmed -509 rejection.
 node tools/publish-native-resource-shards.mjs --submit --retry-quota
+
+# Keep an earlier unknown receipt untouched and upload independent packs 13–19.
+node tools/publish-native-resource-shards.mjs --submit --from=13
 ```
 
 Before any submission, the publisher rechecks all ZIP sizes/SHA256 values and
@@ -64,6 +78,15 @@ each tool manifest. `validation/toy-resource-http.json` must have `ok:true`, the
 matching `catalogIdentity`, exactly 35 verified objects and `planSha256` matching
 the exact plan bytes. There is no bypass flag. Limit selects the first N packs,
 not N additional submissions.
+
+`--from=N` explicitly starts the execution loop at original-plan ordinal N
+(1-based); the default remains 1. It must be within the full plan and must not
+exceed a finite `--limit`. The full plan, proof SHA and all artifacts are still
+validated, destinations retain their original titles/slugs, and all sources stay
+disabled. Earlier unknown receipts are preserved without retry or reclassification;
+default execution still stops at an unresolved unknown. This range option lets
+independent later packages proceed while platform reconciliation remains pending.
+Dry-run and completed summaries include `from` for verification.
 
 Before uploads it enumerates the current account's Toy list and checks exact
 slug/title destinations. A matching remote Toy without the matching local
@@ -112,6 +135,13 @@ independent packs.
 An unresolved unknown result never permits another create, including with
 `--retry-quota`. API status/code/message are retained in sanitized failure
 receipts; raw CLI stdout/stderr and credentials are not journaled.
+
+Future transport errors retain an optional fixed stage enum (`upload-init`,
+`upload-part`, `upload-complete`, `preview`, `create`) only when the official CLI's
+error-line prefix is recognized, plus a recognized `timeout` or `network` reason.
+No raw URL, response body or stderr is retained. These diagnostics do not turn a
+network failure into a confirmed rejection, and earlier unknown receipts are not
+reclassified from elapsed time or an empty list/history result.
 
 `staged-sources.json` and the journal's source list always retain
 `enabled:false`. Canonical candidate resource bases use

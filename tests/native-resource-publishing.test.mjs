@@ -226,6 +226,65 @@ test('an unknown create outcome reconciles once and never repeats create even af
   assert.equal(journal.stagedSources[0].baseUrl, null);
 });
 
+test('an explicit original-plan start continues independent packs while preserving an earlier unknown receipt', async t => {
+  const f = await fixture(t, 3), cli = mockCli(), options = {...f.options, run: cli.run, submit: true};
+  await publishResourceShards({...options, limit: 1});
+  cli.state.behavior = 'unknown-no-write';
+  await assert.rejects(publishResourceShards(options), /不会重复创建/);
+  assert.equal(cli.state.creates, 2);
+  cli.state.behavior = 'success';
+  // Default execution still reaches the unresolved second package and stops.
+  await assert.rejects(publishResourceShards(options), /未重复创建/);
+  assert.equal(cli.state.creates, 2);
+  const before = await f.journal(), unknown = structuredClone(before.packs[1]);
+  const callStart = cli.calls.length;
+  const result = await publishResourceShards({...options, from: 3});
+  const creates = cli.calls.slice(callStart).filter(args => args[0] === 'create' && args[1] !== '--help-json');
+  assert.equal(result.from, 3); assert.equal(result.submitted, 1); assert.equal(cli.state.creates, 3);
+  assert.equal(creates.length, 1); assert.equal(creates[0][1], f.plan.packs[2].zip);
+  assert.equal(creates[0][creates[0].indexOf('--title') + 1], title(3));
+  assert.equal(creates[0][creates[0].indexOf('--slug') + 1], slug(3));
+  const after = await f.journal();
+  assert.deepEqual(after.packs[1], unknown);
+  assert.equal(after.packs[0].id, before.packs[0].id);
+  assert.equal(after.packs[2].packId, 'pack-003'); assert.equal(after.packs[2].ordinal, '03');
+  assert.equal(after.planSha256, before.planSha256);
+  assert.equal(after.stagedSources[1].baseUrl, null);
+  assert.ok(after.stagedSources.every(source => source.enabled === false));
+});
+
+test('original-plan start validates bounds and its limit before any Toy API call', async t => {
+  for (const from of [0, -1, 1.5, NaN, Infinity, 4]) {
+    const f = await fixture(t, 3), cli = mockCli();
+    await assert.rejects(publishResourceShards({...f.options, run: cli.run, submit: true, from}), /--from/);
+    assert.equal(cli.calls.length, 0);
+    await assert.rejects(f.journal(), {code: 'ENOENT'});
+  }
+  const f = await fixture(t, 3), cli = mockCli();
+  await assert.rejects(publishResourceShards({...f.options, run: cli.run, submit: true, from: 3, limit: 2}), /--from/);
+  assert.equal(cli.calls.length, 0);
+  const dryRun = await publishResourceShards({...f.options, run: cli.run, from: 2, limit: 2});
+  assert.equal(dryRun.from, 2); assert.deepEqual(dryRun.tools.map(tool => tool.slug), [slug(1), slug(2), slug(3)]);
+});
+
+test('an explicit start retains full-plan artifact and proof checks and exact destination conflict checks', async t => {
+  for (const fault of ['earlier-zip', 'full-plan-proof', 'destination-conflict']) {
+    await t.test(fault, async t => {
+      const f = await fixture(t, 3), cli = mockCli();
+      if (fault === 'earlier-zip') await fs.writeFile(f.plan.packs[0].zip, 'changed earlier archive');
+      else if (fault === 'full-plan-proof') {
+        const proof = JSON.parse(await fs.readFile(f.proofPath)); proof.planSha256 = '0'.repeat(64);
+        await fs.writeFile(f.proofPath, JSON.stringify(proof));
+      } else cli.remote.push({id: 9, title: title(3), url: `https://www.bilibili.com/toy/${slug(3)}/index.html`,
+        status: 'published', visibility: 'LINK_ONLY', category: 'TOOL'});
+      await assert.rejects(publishResourceShards({...f.options, run: cli.run, submit: true, from: 3}));
+      assert.equal(cli.state.creates, 0);
+      if (fault !== 'destination-conflict') assert.equal(cli.calls.length, 0);
+      await assert.rejects(f.journal(), {code: 'ENOENT'});
+    });
+  }
+});
+
 test('exact local proof, 35 objects, ZIP identity and strict 50 MB size gate all run before any API call', async t => {
   for (const fault of ['plan-proof', 'object-count', 'zip-identity', 'size-limit']) {
     await t.test(fault, async t => {
@@ -371,4 +430,30 @@ test('safe CLI diagnostics preserve business causes while distinguishing unknown
   const timeout = classifyToyCliError({killed: true, signal: 'SIGTERM', stderr: 'RAW_SECRET_NO_OUTPUT'}, 'create');
   assert.equal(timeout.kind, 'timeout-unknown'); assert.equal(timeout.outcome, 'unknown');
   assert.doesNotMatch(JSON.stringify(timeout.receipt()), /RAW_SECRET/);
+});
+
+test('transport diagnostics retain only recognized official stage and reason enums without changing the unknown outcome', () => {
+  for (const [prefix, stage] of [
+    ['upload/init failed:', 'upload-init'], ['upload/parts failed:', 'upload-part'],
+    ['upload/part 4 failed:', 'upload-part'], ['upload/complete failed:', 'upload-complete'],
+    ['preview Toy failed:', 'preview'], ['create Toy failed:', 'create'],
+  ]) {
+    const error = classifyToyCliError({code: 1, stderr:
+      `Error: ${prefix} Post "https://private.invalid/token=DO_NOT_RETAIN": context deadline exceeded token=RAW_TOKEN`}, 'create');
+    assert.equal(error.stage, stage); assert.equal(error.reason, 'timeout'); assert.equal(error.outcome, 'unknown');
+    assert.doesNotMatch(JSON.stringify(error.receipt()), /private|DO_NOT_RETAIN|RAW_TOKEN|Post/);
+  }
+  const network = classifyToyCliError({code: 1,
+    stderr: 'Error: upload/part 2 failed: dial tcp 192.0.2.1:443: connection refused'}, 'create');
+  assert.equal(network.stage, 'upload-part'); assert.equal(network.reason, 'network');
+  assert.doesNotMatch(JSON.stringify(network.receipt()), /192\.0\.2|443/);
+  for (const output of [
+    {stderr: '{"message":"upload/init failed: context deadline exceeded"}'},
+    {stderr: 'unrecognized wrapper upload/init failed: context deadline exceeded'},
+    {stdout: 'Error: create Toy failed: context deadline exceeded'},
+    {stderr: 'https://invalid/upload/part 2 failed: context deadline exceeded'},
+  ]) {
+    const error = classifyToyCliError(output, 'create');
+    assert.equal(error.stage, undefined); assert.equal(error.reason, undefined); assert.equal(error.outcome, 'unknown');
+  }
 });
