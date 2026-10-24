@@ -5,13 +5,44 @@ import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {verifyNativeBuild, hashNativeFile, nativeContentCatalogIdentity} from './native-build-manifest.mjs';
-import {resourcePackUrls} from '../web-native/host-config.js';
+import {reviewedToyResourceConfig} from '../web-native/toy-resource-sources.js';
+import {createResourcePackFetch} from '../web-native/resource-packs.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const exec = promisify(execFile), sha = bytes => createHash('sha256').update(bytes).digest('hex');
 
+/** Verify the complete public mirror before exporting a Toy-only configuration.
+ * The checked-in pins replace mutable/local upload journals as the build input.
+ */
+export async function validateToyResourceSources({build, catalog, config = reviewedToyResourceConfig,
+  fetch = globalThis.fetch?.bind(globalThis)} = {}) {
+  if (config.catalogIdentity !== build?.contentCatalogIdentity
+    || config.catalogIdentity !== catalog?.catalogIdentity
+    || config.requiredResourceIdentity !== build?.resourceManifestSha256
+    || config.requiredResourceIdentity !== catalog?.identity)
+    throw new Error('Reviewed Toy resource sources differ from the current build/catalog');
+  if (!Array.isArray(config.sources) || config.sources.length !== 19)
+    throw new Error('Toy export requires all 19 reviewed resource sources');
+  const urls = new Set();
+  for (const source of config.sources) {
+    let url;
+    try { url = new URL(source?.url); } catch { throw new Error('Reviewed Toy resource URL is invalid'); }
+    if (url.origin !== 'https://www.bilibilitoy.com' || url.username || url.password || url.search || url.hash
+      || !/^\/toy\/[a-z0-9][a-z0-9_-]*\/v2\/manifest\.json$/.test(url.pathname)
+      || !/^[a-f0-9]{64}$/.test(source.sha256) || urls.has(url.href))
+      throw new Error('Reviewed Toy resource URLs must be unique pinned public manifests');
+    urls.add(url.href);
+  }
+  // Reuse the production loader's SHA, catalog membership and gap/overlap checks.
+  // This reads only the small manifests; large art downloads are tested separately.
+  await createResourcePackFetch({sources: config.sources, catalog, fetch,
+    signal: AbortSignal.timeout(120000),
+    fallbackFetch: () => { throw new Error('Resource mirror validation cannot use a fallback'); }});
+  return config.sources;
+}
+
 /** Export the checked Cloudflare release as static, subdirectory-safe pages.
- * Immutable engine/art objects and the native lobby remain on the service.
+ * The engine and native lobby remain on the service; reviewed art uses Toy.
  * No retail archives, credentials, source maps or server source enter the ZIP.
  */
 export async function packageNativeToy({origin = 'https://wan.youlidefuchou.com'} = {}) {
@@ -31,6 +62,7 @@ export async function packageNativeToy({origin = 'https://wan.youlidefuchou.com'
     || catalog.catalogIdentity !== nativeContentCatalogIdentity(catalog)
     || catalog.catalogIdentity !== build.contentCatalogIdentity)
     throw new Error('Public engine/catalog integrity differs from the checked build');
+  const resourcePackUrls = await validateToyResourceSources({build, catalog});
 
   const output = path.join(root, 'dist/toy'), web = path.join(output, 'web');
   await fs.mkdir(output, {recursive: true});

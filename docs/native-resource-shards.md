@@ -10,8 +10,11 @@ On 2026-10-24 the original account (UID 429593303) finished the remaining nine
 uploads. All 19 IDs were verified as `published / TOOL / LINK_ONLY`, and all
 19 public manifest responses matched their planned SHA-256. See
 `validation/toy-resource-remote-status.json` and
-`validation/toy-resource-public-manifests-20261024.json`. Sources remain disabled
-pending the user's activation approval and target-game browser validation.
+`validation/toy-resource-public-manifests-20261024.json`. The user then approved
+activation in the main Toy game. Toy exports now use the reviewed 19-source set;
+local/Cloudflare exports retain their original transport because the Toy CDN
+rejects those browser origins. Formal publication is a separate platform gate;
+its observed status is in `validation/toy-resource-main-public-status-20261024.json`.
 Pack 12 needed one controlled, unchanged-slug recovery after complete account
 list reconciliation and a successful preview. Its first unknown attempt remains
 in `validation/toy-resource-pack012-recovery-20261024.json` and the journal; this
@@ -24,6 +27,8 @@ transport over real local HTTP:
 npm run resources:toy:build
 npm run resources:toy:check
 npm run resources:toy:test
+# Download every published part and stream-check complete gzip/raw objects.
+npm run resources:toy:verify-public
 python3 tools/native-resource-shards-test.py
 npm test
 ```
@@ -143,20 +148,40 @@ No raw URL, response body or stderr is retained. These diagnostics do not turn a
 network failure into a confirmed rejection, and earlier unknown receipts are not
 reclassified from elapsed time or an empty list/history result.
 
-`staged-sources.json` and the journal's source list always retain
-`enabled:false`. Canonical candidate resource bases use
+`staged-sources.json` and the upload journal's source list retain `enabled:false`:
+they describe upload candidates, rather than the active host configuration.
+Canonical resource bases use
 `https://www.bilibilitoy.com/toy/<slug>/v2/`, never a temporary preview URL.
 Uploading, review, actual public resource availability and switching the game
-to Toy remain separate steps. Keep the current Cloudflare game configuration
-until the user confirms approval, then verify actual public manifest/part
-bytes before making the final source change.
+to Toy remain separate steps. The user approved the source change on 2026-10-24.
+`web-native/toy-resource-sources.js` now pins every reviewed manifest together with
+the catalog and required-resource identities. `packageNativeToy` checks those
+identities against the checked local/public engine, then uses the production
+loader to validate all manifest SHA values and complete coverage before export.
+The resulting Toy `host-config.js` and `werhd-release.json` contain all 19 pins.
+Missing/overlapping parts, changed bytes, preview URLs or a changed resource
+catalog stop packaging. A later upstream sim update may reuse the pins only when
+its checked content identities still match; changed content requires a newly
+reviewed complete set.
 
-The production default is `resourcePackUrls = []` in
-`web-native/host-config.js`. Once explicitly approved, each entry can be a full
+The local/Cloudflare default is `resourcePackUrls = []` in
+`web-native/host-config.js`. The Toy export replaces this with the approved set.
+Each entry can be a full
 manifest URL, a directory ending in `/`, or `{url, sha256}` binding a manifest
 to its recorded SHA. All complementary shards must be supplied together. A
 missing or incompatible shard fails before art loading instead of silently
 treating an incomplete set as a complete mirror. Never activate preview URLs.
+
+The public-download verifier performs 102 actual requests with no persistent
+cache or fallback: 19 manifests and 83 parts, reconstructing 35 gzip/raw objects
+with streaming SHA/size checks. It uses the production multipart loader, while
+browser CORS remains a separate check. Results are dated under
+`validation/toy-resource-public-downloads-YYYYMMDD.json`. The 2026-10-24 run
+downloaded 854,335,589 part bytes and verified 1,217,267,355 decompressed bytes.
+The actual Toy preview browser reached `data-werhd-stage=ready` and rendered the
+native menu after preparing skirmish content; see
+`validation/toy-resource-main-browser-20261024.json`. This is startup evidence,
+not sustained battle or multiplayer acceptance.
 
 The tool cover/icon are rendered from the code-native SVG/HTML template
 `tools/templates/resource-publish-media.html`. The isolated publishing media
