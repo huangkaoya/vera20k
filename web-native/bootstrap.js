@@ -43,7 +43,7 @@ function activationAllowed() {
 
 try {
   if (!navigator.gpu) throw new Error('当前浏览器未提供 WebGPU，请使用支持 WebGPU 的浏览器。');
-  const [build, catalog] = await Promise.all([json(host.serviceUrl('/native/build.json')), json(host.serviceUrl('/api/native/resources'))]);
+  const [build, catalog] = await Promise.all([json(host.buildUrl()), json(host.catalogUrl())]);
   const {catalogIdentity, ...catalogBody} = catalog;
   if (catalogIdentity !== await digest(new TextEncoder().encode(JSON.stringify(canonical(catalogBody))))
     || build.contentCatalogIdentity !== catalogIdentity || build.resourceManifestSha256 !== catalog.identity)
@@ -85,7 +85,7 @@ try {
     status.textContent = event.cacheStatus === 'hit' ? '正在读取已校验的引擎缓存…'
       : `正在载入游戏引擎 ${size(event.attemptWireBytes)} / ${size(event.wireTotalBytes)}`;
   }});
-  runtime = await createWerhdRuntime({moduleUrl: host.serviceUrl(`/native/werhd.js?sha256=${build.outputs['werhd.js'].sha256}`), engineBytes});
+  runtime = await createWerhdRuntime({moduleUrl: host.engineModuleUrl(build.outputs['werhd.js'].sha256), engineBytes});
   shell.setRuntime(runtime);
   runtime.configureContent(plan.capabilities);
   const font = new FontFace('WERHD UI', `url("${host.assetUrl('fonts/FiraSansCondensed-Medium.ttf')}")`, {weight: '500'});

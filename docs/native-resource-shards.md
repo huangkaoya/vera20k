@@ -11,7 +11,7 @@ uploads. All 19 IDs were verified as `published / TOOL / LINK_ONLY`, and all
 19 public manifest responses matched their planned SHA-256. See
 `validation/toy-resource-remote-status.json` and
 `validation/toy-resource-public-manifests-20261024.json`. The user then approved
-activation in the main Toy game. Toy exports now use the reviewed 19-source set;
+activation in the main Toy game. Generated Toy exports use the reviewed 19-source set;
 local/Cloudflare exports retain their original transport because the Toy CDN
 rejects those browser origins. Formal publication is a separate platform gate;
 its observed status is in `validation/toy-resource-main-public-status-20261024.json`.
@@ -36,8 +36,8 @@ npm test
 The current catalog produces 19 ZIPs from 83 parts covering 35 original objects.
 The largest ZIP is 48,004,373 bytes. Each part is at most 16,000,000 bytes;
 the browser verifies a part before streaming it into the unchanged whole-gzip
-and raw-file verification path. Only art/content moves to these shards; the
-checked WASM engine continues to use the existing service. The default startup
+and raw-file verification path. These shards contain art/content; the checked
+WASM engine is bundled in the main Toy ZIP described below. The default startup
 still selects skirmish, while music, campaign and cinematics remain optional.
 
 Rebuilds are deterministic. An existing output directory requires explicit
@@ -156,13 +156,64 @@ Uploading, review, actual public resource availability and switching the game
 to Toy remain separate steps. The user approved the source change on 2026-10-24.
 `web-native/toy-resource-sources.js` now pins every reviewed manifest together with
 the catalog and required-resource identities. `packageNativeToy` checks those
-identities against the checked local/public engine, then uses the production
+identities against the checked local engine and catalog, then uses the production
 loader to validate all manifest SHA values and complete coverage before export.
 The resulting Toy `host-config.js` and `werhd-release.json` contain all 19 pins.
 Missing/overlapping parts, changed bytes, preview URLs or a changed resource
 catalog stop packaging. A later upstream sim update may reuse the pins only when
 its checked content identities still match; changed content requires a newly
 reviewed complete set.
+
+## Main game delivery
+
+The main Toy ZIP is self-contained for startup: it includes the checked engine
+JavaScript and gzip WASM, build metadata, content catalog, browser scripts,
+generated host configuration, fonts, and branding. It must remain strictly below
+50,000,000 bytes. `tools/toy-static-release.mjs` places the complete executable
+graph and its assets in `releases/<contenthash>/`. The stable root `index.html`
+references that exact directory, and the root `werhd-release.json` records it.
+Changes to the exported source bytes or generated configuration select a new
+directory, so imports cannot mix old root scripts with a newer configuration.
+
+The generated `staticRelease` maps build, catalog, module and engine transport
+paths to files relative to the versioned `host.js`. The gzip object retains its
+original descriptor URL, compressed SHA, raw WASM SHA and sizes; only its actual
+HTTP location changes to the bundled `native/engine.bin`. The existing loader
+still verifies both compressed and decompressed bytes. An unknown object in
+this static fallback fails instead of requesting Cloudflare. The regular
+local/Cloudflare configuration retains `staticRelease = null`.
+
+All 19 art manifest URLs and their pinned SHA values stay unchanged. No resource
+ZIP, catalog identity or original art object is repackaged for this main-game
+change. Game startup HTTP requests use the current Toy version directory and
+the 19 published Toy resource sources. Cloudflare remains the multiplayer
+WebSocket service at `/ws/native`; it no longer supplies the Toy build metadata,
+catalog, scripts or engine.
+
+Packaging, uploading and a platform `published` status do not establish that the
+formal game is serving this version. Verification must open the formal Bilibili
+wrapper, inspect its actual versioned iframe URL, then check the iframe's
+release marker, configuration and startup requests through the first rendered
+menu. The current public release has visitor watermark disabled so anonymous
+visitors can enter. Old files or a 404 at the former flat asset root do not
+describe what the platform-selected version iframe serves.
+
+On 2026-10-24, formal iframe `yuri/46835028978688-v32241/index.html` served release
+`ea296e6d4a20bcc991ae`. With the test browser's app-content cache cleared and HTTP
+cache disabled, startup loaded 19 manifests, 43 art parts (the skirmish plus
+menu-animation subset), and the bundled engine from `www.bilibilitoy.com`.
+All 79 game resource requests used that origin, the canvas reached `ready`,
+the native menu rendered, and the console had no errors. HTTP cache was restored
+afterward. Receipts: `validation/toy-self-contained-formal-browser-20261024.json`
+and `validation/toy-resource-main-public-status-20261024.json`. This proves
+formal resource activation and menu startup; battle play and Android map loading
+remain separate acceptance scopes.
+
+Independent HTTP checks matched all 19 runtime payload files byte for byte.
+The ZIP also includes the font license under its original extensionless name;
+Toy returns 404 for that non-runtime file. It is never requested by the game.
+`validation/toy-self-contained-public-files-20261024.json` retains this exception
+rather than claiming every ZIP member is directly served.
 
 The local/Cloudflare default is `resourcePackUrls = []` in
 `web-native/host-config.js`. The Toy export replaces this with the approved set.
@@ -180,8 +231,9 @@ browser CORS remains a separate check. Results are dated under
 downloaded 854,335,589 part bytes and verified 1,217,267,355 decompressed bytes.
 The actual Toy preview browser reached `data-werhd-stage=ready` and rendered the
 native menu after preparing skirmish content; see
-`validation/toy-resource-main-browser-20261024.json`. This is startup evidence,
-not sustained battle or multiplayer acceptance.
+`validation/toy-resource-main-browser-20261024.json`. That earlier preview receipt
+does not establish formal activation of the new self-contained main ZIP. It is
+startup evidence, not sustained battle or multiplayer acceptance.
 
 The tool cover/icon are rendered from the code-native SVG/HTML template
 `tools/templates/resource-publish-media.html`. The isolated publishing media

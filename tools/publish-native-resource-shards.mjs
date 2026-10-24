@@ -143,7 +143,7 @@ function unwrapped(value, operation = 'API') {
 export async function runToyCli(cli, args) {
   try {
     const result = await exec(cli, args, {cwd: root, encoding: 'utf8',
-      timeout: args[0] === 'create' ? 20 * 60 * 1000 : 60000, maxBuffer: 2 * 1024 * 1024});
+      timeout: ['create', 'update'].includes(args[0]) ? 20 * 60 * 1000 : 60000, maxBuffer: 2 * 1024 * 1024});
     return unwrapped(JSON.parse(result.stdout), args[0]);
   } catch (error) {
     // execFile errors can carry the complete stdout/stderr. Do not propagate
