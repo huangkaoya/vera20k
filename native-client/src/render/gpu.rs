@@ -189,6 +189,23 @@ impl GpuContext {
             .await
             .context("Failed to create wgpu device")?;
 
+        #[cfg(target_arch = "wasm32")]
+        {
+            // WebGPU validation and device loss are asynchronous. Retaining the
+            // loading canvas without surfacing these errors looks like a hung
+            // 100% bar even after the loader has returned successfully.
+            device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+                crate::app::browser::report_runtime_failure(format!("WebGPU: {error}"));
+            }));
+            device.set_device_lost_callback(|reason, message| {
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    crate::app::browser::report_runtime_failure(format!(
+                        "WebGPU device lost ({reason:?}): {message}"
+                    ));
+                }
+            });
+        }
+
         // Pick the best texture format for the surface.
         // This is usually Bgra8UnormSrgb on Windows, Bgra8Unorm on some other platforms.
         let surface_caps: wgpu::SurfaceCapabilities = surface.get_capabilities(&adapter);

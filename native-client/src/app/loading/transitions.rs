@@ -190,14 +190,19 @@ pub(crate) fn install_world_presentation(
     state.match_state.match_presentation.sidebar_chrome = assets.sidebar_chrome;
     // GAME.FNT is process artwork, so retain the established process fallback
     // when optional font preparation did not produce a replacement.
+    #[cfg(target_arch = "wasm32")]
+    crate::app::browser::loading_stage("font");
     if let Some(ref fnt) = assets.fnt_file {
-        state.renderer.bit_font = crate::render::bit_font::BitFont::from_fnt_for_ui(
-            &state.renderer.gpu.device,
-            &state.renderer.gpu.queue,
-            &state.renderer.batch_renderer,
-            fnt,
-            state.platform.capture_client_size.is_none(),
-        );
+        let modern = state.platform.capture_client_size.is_none();
+        if !state.renderer.bit_font.can_reuse_for_ui(fnt, modern) {
+            state.renderer.bit_font = crate::render::bit_font::BitFont::from_fnt_for_ui(
+                &state.renderer.gpu.device,
+                &state.renderer.gpu.queue,
+                &state.renderer.batch_renderer,
+                fnt,
+                modern,
+            );
+        }
     }
 
     // The final sidebar projection resolves incoming side/radar authority.
@@ -239,6 +244,8 @@ pub(crate) fn install_world_presentation(
     // reaches camera and minimap before either route positions its view.
     let (playfield_bounds, playfield_revision) =
         crate::app::input::camera::playfield_presentation_authority(state);
+    #[cfg(target_arch = "wasm32")]
+    crate::app::browser::loading_stage("minimap");
     let minimap = state
         .match_state
         .match_presentation
@@ -268,11 +275,15 @@ pub(crate) fn install_world_presentation(
             )
         });
     state.match_state.match_presentation.minimap = minimap;
+    #[cfg(target_arch = "wasm32")]
+    crate::app::browser::loading_stage("selection");
     state.match_state.match_presentation.selection_overlay = Some(SelectionOverlay::new(
         &state.renderer.gpu,
         &state.renderer.batch_renderer,
         state.process_assets.manager(),
     ));
+    #[cfg(target_arch = "wasm32")]
+    crate::app::browser::loading_stage("shroud");
     let shroud_buffer = state.process_assets.manager().and_then(|assets| {
         let grid = state
             .match_state
@@ -575,6 +586,8 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
                     .multiplayer_shell_runtime
                     .mark_gameplay_scenario_return_pending();
             }
+            #[cfg(target_arch = "wasm32")]
+            crate::app::browser::loading_stage("world-installed");
             log::info!("Transitioned to InGame after scenario installation");
         }
         Err(err) => {

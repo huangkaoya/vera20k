@@ -7,7 +7,7 @@ static LOGGER: BrowserLogger = BrowserLogger;
 
 // Keep upstream format identities unchanged while presenting the product's
 // name in browser diagnostics and panic messages.
-fn browser_message(message: String) -> String {
+pub(crate) fn browser_message(message: String) -> String {
     message
         .replace("VERA20K", "WERHD")
         .replace("VERA20k", "WERHD")
@@ -41,7 +41,9 @@ pub fn initialize_browser_module() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
     std::panic::set_hook(Box::new(|panic| {
-        let error = js_sys::Error::new(&browser_message(panic.to_string()));
+        let message = browser_message(panic.to_string());
+        crate::app::browser::report_runtime_failure(message.clone());
+        let error = js_sys::Error::new(&message);
         web_sys::console::error_1(&error);
     }));
 }

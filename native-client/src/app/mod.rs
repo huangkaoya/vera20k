@@ -35,6 +35,8 @@ pub mod app_bundle;
 pub(crate) mod audio_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser_loading;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod browser_network;
 #[cfg(all(test, not(target_arch = "wasm32")))]

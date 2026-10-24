@@ -9,21 +9,48 @@ import {installMenuAnimationPrefetch} from './menu-animation.js';
 import {createWebHost} from './host.js';
 import {resourcePackUrls} from './host-config.js';
 import {createResourcePackFetch} from './resource-packs.js';
+import {watchRuntimeFailure} from './runtime-failure.js';
 
 const status = document.querySelector('#status'), progress = document.querySelector('#progress');
 const startup = document.querySelector('#startup'), canvas = document.querySelector('#game');
 const actions = document.querySelector('#startup-actions'), selectionKey = 'werhd.content.selection.v1';
 const controller = new AbortController(), size = bytes => `${(bytes / 1048576).toFixed(1)} MB`;
-let runtime, pointerCapture, menuAnimation, menuAnimationState = {state: 'idle'};
-let initialized = false, cacheWarning = false;
+let runtime, pointerCapture, menuAnimation, runtimeFailure, startupObserver, menuAnimationState = {state: 'idle'};
+let initialized = false, cacheWarning = false, failurePresented = false;
 const shell = createNativeShellBridge();
 const host = createWebHost();
 window.addEventListener('pagehide', event => {
-  if (!event.persisted) { pointerCapture?.dispose(); menuAnimation?.dispose(); shell.dispose(); }
+  if (!event.persisted) disposeAdapters();
 });
+function disposeAdapters() {
+  // A native panic may leave a borrowed owner unavailable. Each cleanup is
+  // independent so a secondary failure cannot hide the original fatal UI.
+  for (const dispose of [() => startupObserver?.disconnect(), () => runtimeFailure?.dispose(), () => pointerCapture?.dispose(),
+    () => menuAnimation?.dispose(), () => shell.dispose()]) {
+    try { dispose(); } catch {}
+  }
+}
 function action(text, callback) {
   const button = document.createElement('button'); button.type = 'button'; button.textContent = text;
   button.addEventListener('click', callback); return button;
+}
+function presentFailure(error, stage = canvas.dataset.werhdLoadStage) {
+  if (failurePresented) return;
+  failurePresented = true;
+  const prefix = initialized ? '游戏运行失败' : '游戏启动失败';
+  initialized = false;
+  status.textContent = error?.name === 'AbortError' ? '下载已取消，已完成校验的缓存会保留。'
+    : `${prefix}：${error instanceof Error ? error.message : String(error)}${stage ? `\n发生阶段：${stage}` : ''}`;
+  progress.hidden = true; startup.hidden = false;
+  let reloadRequested = false;
+  const retry = action('重新载入并重试', () => {
+    if (reloadRequested) return;
+    reloadRequested = true; retry.disabled = true; location.reload();
+  });
+  actions.replaceChildren(retry);
+  try { controller.abort(); } catch {}
+  disposeAdapters();
+  if (error?.name !== 'AbortError') console.error(error);
 }
 async function json(url) {
   const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
@@ -120,6 +147,7 @@ try {
       if (canvas.dataset.werhdStage === 'ready') { observer.disconnect(); resolve(); }
       else if (canvas.dataset.werhdStage === 'error') { observer.disconnect(); reject(new Error(canvas.dataset.werhdError ?? '游戏初始化失败')); }
     });
+    startupObserver = observer;
     observer.observe(canvas, {attributes: true, attributeFilter: ['data-werhd-stage', 'data-werhd-error']});
   });
   const lobby = installNativeLobby({native: runtime.network, canvas, socketUrl: host.serviceUrl('/ws/native'), onState: state => shell.publish('lobby', state)});
@@ -129,19 +157,18 @@ try {
     diagnostics: runtime.diagnostics, networkStatus: runtime.networkStatus,
     pointerCaptureStatus: () => pointerCapture?.snapshot(),
     menuAnimationStatus: () => structuredClone(menuAnimationState)})});
-  await ready; initialized = true; startup.hidden = true; content.refresh(); canvas.focus();
-  pointerCapture = installPointerCapture({canvas,
-    getState: () => ({pointerCaptureAllowed: runtime.pointerCaptureAllowed()})});
-  menuAnimation = installMenuAnimationPrefetch({catalog, store,
-    onReady: bytes => runtime.installMenuAnimation(bytes),
-    onState: state => { menuAnimationState = state; content.refresh(); }});
-  menuAnimation.start();
+  await ready; initialized = true;
+  runtimeFailure = watchRuntimeFailure({canvas,
+    onFailure: ({message, stage}) => presentFailure(new Error(message), stage)});
+  if (!failurePresented) {
+    startup.hidden = true; content.refresh(); canvas.focus();
+    pointerCapture = installPointerCapture({canvas,
+      getState: () => ({pointerCaptureAllowed: runtime.pointerCaptureAllowed()})});
+    menuAnimation = installMenuAnimationPrefetch({catalog, store,
+      onReady: bytes => runtime.installMenuAnimation(bytes),
+      onState: state => { menuAnimationState = state; content.refresh(); }});
+    menuAnimation.start();
+  }
 } catch (error) {
-  controller.abort();
-  pointerCapture?.dispose(); menuAnimation?.dispose();
-  shell.dispose();
-  status.textContent = error?.name === 'AbortError' ? '下载已取消，已完成校验的缓存会保留。'
-    : `游戏启动失败：${error instanceof Error ? error.message : String(error)}`;
-  progress.hidden = true; actions.replaceChildren(action('重新载入并重试', () => location.reload()));
-  if (error?.name !== 'AbortError') console.error(error);
+  presentFailure(error);
 }

@@ -1585,6 +1585,8 @@ impl App {
             WindowEvent::RedrawRequested => {
                 if let Err(err) = Self::render_frame(state, event_loop, None, None) {
                     log::error!("Render: {:#}", err);
+                    #[cfg(target_arch = "wasm32")]
+                    crate::app::browser::report_runtime_failure(format!("画面渲染失败：{err:#}"));
                 }
             }
             _ => {}

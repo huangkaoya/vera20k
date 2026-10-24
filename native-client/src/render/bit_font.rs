@@ -100,6 +100,9 @@ pub(crate) struct BitFontCaptureObservation<'a> {
 /// `from_fnt`/`fallback_5x7`).
 pub struct BitFont {
     source_identity: Option<crate::assets::fnt_file::FntSourceIdentity>,
+    /// Reuse provenance is independent of the retail capture identity: modern
+    /// glyphs still report no retail identity, but retain the source metrics.
+    build_identity: Option<FntBuildIdentity>,
     pub(crate) atlas_texture: Option<BatchTexture>,
     pub(crate) glyphs: HashMap<u16, GlyphEntry>,
     pub(crate) missing_glyph: Option<GlyphEntry>,
@@ -112,7 +115,38 @@ pub struct BitFont {
     pub(crate) darken_texture: Option<BatchTexture>,
 }
 
+#[derive(Clone)]
+struct FntBuildIdentity {
+    source: crate::assets::fnt_file::FntSourceIdentity,
+    modern: bool,
+}
+
+impl FntBuildIdentity {
+    fn new(
+        source: Option<&crate::assets::fnt_file::FntSourceIdentity>,
+        modern: bool,
+    ) -> Option<Self> {
+        source.cloned().map(|source| Self { source, modern })
+    }
+
+    fn matches(
+        &self,
+        source: Option<&crate::assets::fnt_file::FntSourceIdentity>,
+        modern: bool,
+    ) -> bool {
+        self.modern == modern && source == Some(&self.source)
+    }
+}
+
 impl BitFont {
+    /// Keep an already rendered process font only when the exact FNT bytes and
+    /// requested raster mode match. Unidentified and fallback fonts never hit.
+    pub(crate) fn can_reuse_for_ui(&self, fnt: &FntFile, modern: bool) -> bool {
+        self.build_identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches(fnt.source_identity(), modern))
+    }
+
     pub(crate) fn capture_observation(&self) -> BitFontCaptureObservation<'_> {
         BitFontCaptureObservation {
             source_identity: self.source_identity.as_ref(),
@@ -610,6 +644,7 @@ impl BitFont {
 
         Self {
             source_identity: None,
+            build_identity: None,
             atlas_texture: Some(
                 batch.create_texture_on_device(device, queue, &rgba, atlas_w, atlas_h, None),
             ),
@@ -645,7 +680,12 @@ impl BitFont {
         fnt: &FntFile,
         modern: bool,
     ) -> Self {
-        #[cfg(any(target_os = "ios", target_os = "macos", target_os = "android", target_arch = "wasm32"))]
+        #[cfg(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "android",
+            target_arch = "wasm32"
+        ))]
         if modern {
             if let Some(mut rasterizer) = UiGlyphRasterizer::new(fnt.bitmap_rows) {
                 log::info!("WERHD UI font faces: {:?}", rasterizer.face_names());
@@ -654,9 +694,20 @@ impl BitFont {
             }
             log::warn!("WERHD UI font unavailable; retaining GAME.FNT glyphs");
         }
-        #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android", target_arch = "wasm32")))]
+        #[cfg(not(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "android",
+            target_arch = "wasm32"
+        )))]
         let _ = modern;
-        Self::from_fnt(device, queue, batch, fnt)
+        let mut font = Self::from_fnt(device, queue, batch, fnt);
+        if modern {
+            // Do not remember a failed/unsupported modern request as a hit:
+            // later attempts should still be allowed to obtain modern glyphs.
+            font.build_identity = None;
+        }
+        font
     }
 
     fn from_fnt_with_rasterizer(
@@ -826,6 +877,7 @@ impl BitFont {
             } else {
                 fnt.source_identity().cloned()
             },
+            build_identity: FntBuildIdentity::new(fnt.source_identity(), modern),
             atlas_texture: Some(atlas_texture),
             glyphs,
             missing_glyph,
@@ -839,6 +891,10 @@ impl BitFont {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bit_font_reuse_tests.rs"]
+mod reuse_tests;
 
 fn write_5x7_glyph_bitmap(
     rgba: &mut [u8],
@@ -1283,6 +1339,7 @@ pub(crate) mod tests {
         }
         BitFont {
             source_identity: None,
+            build_identity: None,
             atlas_texture: None,
             glyphs,
             missing_glyph: Some(GlyphEntry {

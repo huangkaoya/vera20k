@@ -22,6 +22,9 @@ use super::{App, AppState, GameScreen, GpuContext};
 mod network_launch;
 
 thread_local! {
+    static BROWSER_CANVAS: RefCell<Option<HtmlCanvasElement>> = const { RefCell::new(None) };
+    static RUNTIME_FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LOADING_TRACE: RefCell<super::browser_loading::BrowserLoadingTrace> = RefCell::new(super::browser_loading::BrowserLoadingTrace::default());
     static STARTED: Cell<bool> = const { Cell::new(false) };
     static DIAGNOSTICS_ENABLED: Cell<bool> = const { Cell::new(false) };
     // Presentation-only derived state for resource activation. Reading it must
@@ -181,6 +184,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     let event_loop = EventLoop::new().map_err(|error| JsValue::from_str(&error.to_string()))?;
     canvas.set_attribute("tabindex", "0")?;
     canvas.set_attribute("data-werhd-stage", "starting")?;
+    BROWSER_CANVAS.with(|current| *current.borrow_mut() = Some(canvas.clone()));
     let mut app = App::default();
     app.browser = Some(BrowserState {
         canvas,
@@ -205,6 +209,11 @@ pub fn diagnostics() -> JsValue {
         // Pointer admission is consumed synchronously by trusted mouse events.
         // Keep it current even while the heavier acceptance snapshot is throttled.
         snapshot["pointerCaptureAllowed"] = json!(super::input::cursor::browser::policy());
+        snapshot["mapLoading"] = LOADING_TRACE.with(|trace| trace.borrow().snapshot());
+        if let Some(error) = RUNTIME_FAILURE.with(|error| error.borrow().clone()) {
+            snapshot["stage"] = json!("error");
+            snapshot["error"] = json!(error);
+        }
         js_sys::JSON::parse(&snapshot.to_string()).unwrap_or(JsValue::NULL)
     })
 }
@@ -215,6 +224,82 @@ pub fn pointer_capture_allowed() -> bool {
 
 pub fn menu_active() -> bool {
     MENU_ACTIVE.with(Cell::get)
+}
+
+// These checkpoints are independent of the optional, throttled sim snapshot.
+// A synchronous loader or first-frame failure must retain its exact last stage.
+pub(crate) fn begin_map_loading() {
+    LOADING_TRACE.with(|trace| trace.borrow_mut().begin(js_sys::Date::now()));
+    publish_loading_stage("map-loading");
+}
+
+pub(crate) fn loading_stage(stage: &'static str) {
+    if RUNTIME_FAILURE.with(|failure| failure.borrow().is_some()) {
+        return;
+    }
+    LOADING_TRACE.with(|trace| trace.borrow_mut().mark(stage, js_sys::Date::now()));
+    publish_loading_stage(stage);
+}
+
+fn publish_loading_stage(stage: &str) {
+    BROWSER_CANVAS.with(|canvas| {
+        if let Some(canvas) = canvas.borrow().as_ref() {
+            let _ = canvas.set_attribute("data-werhd-load-stage", stage);
+        }
+    });
+}
+
+pub(crate) fn loading_stage_is(stage: &str) -> bool {
+    LOADING_TRACE.with(|trace| trace.borrow().stage() == stage)
+}
+
+pub(crate) fn first_battle_submitted(queue: &wgpu::Queue) {
+    if !loading_stage_is("first-render") {
+        return;
+    }
+    loading_stage("first-submit");
+    let generation = LOADING_TRACE.with(|trace| trace.borrow().generation());
+    queue.on_submitted_work_done(move || {
+        if RUNTIME_FAILURE.with(|failure| failure.borrow().is_some()) {
+            return;
+        }
+        LOADING_TRACE.with(|trace| trace.borrow_mut().complete(generation, js_sys::Date::now()));
+        // An earlier world's completion must not overwrite a new load's stage.
+        if loading_stage_is("battle-ready") {
+            publish_loading_stage("battle-ready");
+        }
+    });
+}
+
+pub(crate) fn report_runtime_failure(message: String) {
+    let message = crate::web_entry::browser_message(message);
+    let first = RUNTIME_FAILURE.with(|failure| {
+        let Ok(mut failure) = failure.try_borrow_mut() else {
+            return false;
+        };
+        if failure.is_some() {
+            return false;
+        }
+        *failure = Some(message.clone());
+        true
+    });
+    if !first {
+        return;
+    }
+    LOADING_TRACE.with(|trace| {
+        if let Ok(mut trace) = trace.try_borrow_mut() {
+            trace.fail();
+        }
+    });
+    BROWSER_CANVAS.with(|canvas| {
+        if let Some(canvas) = canvas.borrow().as_ref() {
+            // Write the detail first so observers see one complete failure.
+            let _ = canvas.set_attribute("data-werhd-error", &message);
+            let _ = canvas.set_attribute("data-werhd-stage", "error");
+        }
+    });
+    web_sys::console::error_1(&JsValue::from_str(&message));
+    wake();
 }
 
 fn set_stage(browser: &BrowserState, stage: &str, error: Option<&str>) {
@@ -348,6 +433,14 @@ impl App {
     }
 
     pub(super) fn poll_browser_initialization(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if let Some(error) = RUNTIME_FAILURE.with(|failure| failure.borrow().clone()) {
+            self.startup_failure = Some(error);
+            if let Some(state) = self.state.as_ref() {
+                state.platform.window.set_cursor_visible(true);
+            }
+            event_loop.exit();
+            return false;
+        }
         if self.state.is_some() {
             return true;
         }
@@ -448,7 +541,9 @@ impl App {
                     .is_some_and(|state| state.frontend.screen == GameScreen::MainMenu),
             );
         });
-        if !DIAGNOSTICS_ENABLED.with(Cell::get) {
+        if RUNTIME_FAILURE.with(|failure| failure.borrow().is_some())
+            || !DIAGNOSTICS_ENABLED.with(Cell::get)
+        {
             return;
         }
         let Some(browser) = self.browser.as_mut() else {

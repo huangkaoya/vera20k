@@ -806,6 +806,8 @@ pub(crate) fn accept_network_loading_progress(
 }
 
 pub(crate) fn begin_loading(state: &mut AppState, request: LoadingRequest) {
+    #[cfg(target_arch = "wasm32")]
+    crate::app::browser::begin_map_loading();
     state
         .frontend
         .multiplayer_shell_runtime
@@ -2119,6 +2121,8 @@ pub(crate) fn after_loading_frame_presented(state: &mut AppState) {
                 &mut result,
                 &timed_out,
             );
+            #[cfg(target_arch = "wasm32")]
+            crate::app::browser::loading_stage("world-install");
             log::debug!(target: "vera20k::loading_attempt", "install_begin");
             super::transitions::finish_fresh_scenario_read(state, *result);
             for destroyed in disconnected {

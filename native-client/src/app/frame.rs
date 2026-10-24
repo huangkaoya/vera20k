@@ -285,6 +285,12 @@ impl App {
         let shell_capture_owns_simulation = shell_capture
             .as_deref()
             .is_some_and(|capture| capture.owns_simulation_steps(state));
+        #[cfg(target_arch = "wasm32")]
+        if state.frontend.screen == GameScreen::InGame
+            && crate::app::browser::loading_stage_is("world-installed")
+        {
+            crate::app::browser::loading_stage("first-sim");
+        }
         if Self::service_match_runtime(
             state,
             event_loop,
@@ -619,6 +625,10 @@ impl App {
                 );
             }
             GameScreen::InGame => {
+                #[cfg(target_arch = "wasm32")]
+                if crate::app::browser::loading_stage_is("first-sim") {
+                    crate::app::browser::loading_stage("first-render");
+                }
                 //53B460 copies the already-composed surface, before this
                 //frame's world replaces it. The effect owns the retained copy.
                 let chrono_tactical = crate::app::input::camera::tactical_viewport_px(state);
@@ -800,6 +810,10 @@ impl App {
             .queue
             .submit(std::iter::once(encoder.finish()));
         output.present();
+        #[cfg(target_arch = "wasm32")]
+        if game_render_output.is_some() {
+            crate::app::browser::first_battle_submitted(&state.renderer.gpu.queue);
+        }
         // wgpu 27 requires released surface references before reconfiguration;
         // the diagnostic action below may resize the window.
         // https://docs.rs/wgpu/27.0.1/wgpu/struct.Surface.html#method.configure
