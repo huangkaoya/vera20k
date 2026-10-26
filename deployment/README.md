@@ -115,7 +115,33 @@ Wrangler command from this directory with the same explicit profile. A named
 profile does not itself prove permission to publish: the real R2 upload, Worker
 deployment and public hostname checks remain separate acceptance steps.
 
-## Production topology and verification
+## Static emergency mode executed on 2026-10-24
+
+The local configuration now has `routes: []`, `workers_dev: false` and
+`preview_urls: false`. This prevents a later deployment from reopening the
+native Worker's `wan.youlidefuchou.com/*`, workers.dev or version-preview
+entry points. The previous configuration is backed up at
+`../../output/youlidefuchou-static-20261024/native-wrangler.before.jsonc`.
+The game, resource catalog, R2 binding and Durable Object implementation are
+unchanged; their public native endpoints are intentionally unavailable in
+this mode.
+
+Production has been switched to the original static `youlidefuchou-wan`
+Pages deployment for `wan`, the new pure static `youlidefuchou-static` Pages
+project for the root domain and `www`, and the existing `res`/`map` R2 custom
+domains. The zone Worker routes are empty. The native Worker's workers.dev
+and preview endpoints are confirmed disabled by API readback. The landing
+Worker's root and `www` bindings were removed before attaching those domains
+to Pages. The landing Pages deployment is
+`ac24773d-cfd0-4e4f-9c04-231e3c7ff3d8` (`uses_functions=false`), uploaded
+through QQ Browser. At cutover the root domain was active and `www` was
+pending activation. Complete public/browser acceptance belongs to the
+recovery task; historical native checks below do not prove current static
+gameplay availability. Do not run the native transport
+probe against the static fallback expecting its dynamic APIs or WebSocket
+endpoint to succeed.
+
+## Historical production topology and verification (2026-10-22)
 
 Production was connected on 2026-10-22:
 

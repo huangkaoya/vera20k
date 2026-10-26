@@ -4,9 +4,22 @@
 
 之前只接 sim、另用 TypeScript/Canvas 画图的版本保留为历史原型，见 [Canvas 原型说明](docs/canvas-prototype.md)。本版本使用独立的原生指令协议，不混用历史原型或 WERHD 的战斗协议。
 
+## 独立维护与源码分支
+
+这是基于 [YuriPlanet/vera20k](https://github.com/YuriPlanet/vera20k) 独立维护的网页衍生版本，不代表上游官方版本、认可或支持。上游版权与 GPLv3 许可保留在 [LICENSE](LICENSE) 和 [native-client/LICENSE-GPL](native-client/LICENSE-GPL) 中。
+
+完整网页源码及编译脚本发布在 [huangkaoya/vera20k 的 feature/vera-native-web 分支](https://github.com/huangkaoya/vera20k/tree/feature/vera-native-web)。该分支保留本网页项目独立的 Git 历史和目录布局；Rust 客户端位于 `native-client/`。它用于维护和获取网页源码，与 fork 的原生移动端分支分别维护。
+
+```sh
+git clone --branch feature/vera-native-web --single-branch https://github.com/huangkaoya/vera20k.git werhd-web
+cd werhd-web
+```
+
+随后按下方步骤编译。仓库提供源码、依赖锁文件和浏览器补丁；运行所需的商业游戏数据由使用者自行合法准备。编译生成的 JS/WASM、游戏数据包、签名材料和本机配置不提交到此源码分支。网页包的构建、上传和线上运行应分别验证；推送源码不会自动更新已发布的 Toy 或网站。
+
 ## 本地运行
 
-需要 Node.js 22.12+、Python 3、Rust stable、`wasm32-unknown-unknown` target，以及支持 WebGPU 的桌面浏览器。所有构建输出均在本仓库内。
+需要 Node.js 22.12+、Python 3.11+、Rust stable、`wasm32-unknown-unknown` target，以及支持 WebGPU 的桌面浏览器。所有构建输出均在本仓库内。
 
 ```sh
 npm ci
